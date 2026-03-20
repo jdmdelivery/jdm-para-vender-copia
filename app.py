@@ -144,7 +144,7 @@ class Store:
     __slots__ = (
         "users", "organizations", "clients", "loans", "payments", "loan_arrears",
         "cash_reports", "audit_log", "route_expenses", "initial_discounts", "gps_positions",
-        "weekly_closures", "deposit_history", "closure_history", "_seq",
+        "weekly_closures", "deposit_history", "closure_history", "starting_bank", "_seq",
     )
 
     def __init__(self):
@@ -162,7 +162,22 @@ class Store:
         self.weekly_closures = {}
         self.deposit_history = []
         self.closure_history = []
-        self._seq = {"users": 1, "clients": 0, "loans": 0, "payments": 0, "arrears": 0, "cash": 0, "re": 0, "disc": 0, "cierre": 0, "audit": 0}
+        # Banco inicial del sistema (solo para demo en memoria).
+        # El banco real se calcula como: starting_bank + suma de cash_reports.amount.
+        self.starting_bank = 50000.0
+        self._seq = {
+            "users": 1,
+            "clients": 0,
+            "loans": 0,
+            "payments": 0,
+            "arrears": 0,
+            "cash": 0,
+            "route_expenses": 0,
+            "re": 0,
+            "disc": 0,
+            "cierre": 0,
+            "audit": 0,
+        }
         self._seed()
 
     def nid(self, key):
@@ -307,6 +322,53 @@ def clients_for_user(org_id, user):
     if user.get("role") == "cobrador" and not is_cartera_admin(user):
         rows = [c for c in rows if c.get("created_by") == user["id"]]
     return rows
+
+
+def bank_org_id(org_id=None):
+    return org_id if org_id is not None else session.get("org_id") or ORG_ID
+
+
+def get_bank_available(org_id=None):
+    oid = bank_org_id(org_id)
+    total = float(getattr(store, "starting_bank", 0.0) or 0.0)
+    for cr in store.cash_reports.values():
+        if cr.get("organization_id") == oid:
+            total += float(cr.get("amount") or 0)
+    # Evitar valores tipo -0.00 por redondeos.
+    if abs(total) < 1e-9:
+        total = 0.0
+    return round(total, 2)
+
+
+def apply_cash_movement(movement_type, amount, note, user_id=None, org_id=None):
+    """
+    Aplica un movimiento al banco (memoria) y valida que nunca quede negativo.
+    movement_type: string informativo (deposito_banco, prestamo_entregado, descuento_inicial, pago_prestamo, gasto_ruta, etc.)
+    """
+    oid = bank_org_id(org_id)
+    amt = float(amount or 0)
+    if abs(amt) < 1e-9:
+        return None
+
+    projected = get_bank_available(oid) + amt
+    if projected < -1e-9:
+        raise ValueError(f"Banco insuficiente. Disponible: {get_bank_available(oid)} | Requerido adicional: {abs(amt)}")
+    # Evitar -0.00
+    if abs(projected) < 1e-9:
+        projected = 0.0
+
+    rid = store.nid("cash")
+    store.cash_reports[rid] = {
+        "id": rid,
+        "user_id": user_id,
+        "date": date.today(),
+        "amount": round(amt, 2),
+        "note": note or movement_type,
+        "created_at": datetime.utcnow(),
+        "organization_id": oid,
+        "movement_type": movement_type,
+    }
+    return rid
 
 
 def loan_ids_visible(org_id, user):
@@ -529,7 +591,7 @@ def dashboard():
     extra_ops = ""
     if user.get("role") in ("admin", "supervisor"):
         extra_ops = (
-            '<p class="dash-h2" style="margin-top:18px">Administración</p><div class="ops-scroll">'
+            '<p class="dash-h2" style="margin-top:18px">Administración</p><div class="ops-grid">'
             + op_tile(url_for("users"), "🔑", "Usuarios", "", "")
             + op_tile(url_for("reportes"), "📈", "Reportes", "", "")
             + op_tile(url_for("audit"), "🧾", "Auditoría", "", "")
@@ -591,18 +653,14 @@ body.theme-dark .dash-h2 {{ color: #86efac; }}
 .daily-card.r {{ background: linear-gradient(135deg,#b91c1c,#f87171); }}
 .daily-card .dk {{ display:block; font-size:10px; opacity:.95; }}
 .daily-card .dv {{ display:block; font-size:1.1rem; margin-top:4px; }}
-.ops-scroll {{
-  display: flex;
-  flex-direction: row;
-  flex-wrap: nowrap;
-  overflow-x: auto;
-  gap: 10px;
+.ops-grid {{
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 12px;
   padding: 8px 4px 14px;
-  -webkit-overflow-scrolling: touch;
 }}
 .op-tile {{
-  flex: 0 0 100px;
-  width: 100px;
+  width: 100%;
   min-height: 118px;
   border-radius: 16px;
   padding: 10px 6px;
@@ -614,9 +672,19 @@ body.theme-dark .dash-h2 {{ color: #86efac; }}
   display: flex;
   flex-direction: column;
   align-items: center;
-  justify-content: flex-start;
+  justify-content: center;
   box-shadow: 0 6px 16px rgba(0,0,0,.18);
   position: relative;
+  box-sizing: border-box;
+  transition: transform .12s ease, opacity .12s ease;
+}}
+.op-tile:hover {{
+  transform: translateY(-2px);
+  opacity: .98;
+}}
+.op-tile:focus {{
+  outline: 2px solid rgba(255,255,255,.75);
+  outline-offset: 2px;
 }}
 .op-tile:nth-child(6n+1) {{ background: linear-gradient(180deg,#2563eb,#3b82f6); }}
 .op-tile:nth-child(6n+2) {{ background: linear-gradient(180deg,#15803d,#22c55e); }}
@@ -668,7 +736,7 @@ body.theme-dark .dash-h2 {{ color: #86efac; }}
   <div class="daily-row">{daily_row}</div>
 
   <p class="dash-h2">Operaciones</p>
-  <div class="ops-scroll">{ops}</div>
+  <div class="ops-grid">{ops}</div>
 
   <p class="dash-h2">Control</p>
   <div class="ctrl-stack">{ctrl}</div>
@@ -947,35 +1015,99 @@ def new_loan():
         client_id = request.form.get("client_id", type=int)
         amount = request.form.get("amount", type=float)
         rate = request.form.get("rate", type=float) or 0
+        upfront_percent = request.form.get("upfront_percent", type=float) or 0
+        upfront_percent = max(0.0, min(float(upfront_percent), 100.0))
         freq = request.form.get("frequency") or "semanal"
         start_str = (request.form.get("start_date") or "").strip()
         term_count = request.form.get("term_count", type=int) or 1
         if not client_id or amount is None or not start_str:
             flash("Complete cliente, monto y fecha.", "danger")
             return redirect(url_for("new_loan"))
+        if amount <= 0:
+            flash("El monto debe ser mayor que 0.", "danger")
+            return redirect(url_for("new_loan"))
+        if rate < 0:
+            flash("La tasa no puede ser negativa.", "danger")
+            return redirect(url_for("new_loan"))
+        if term_count < 1:
+            flash("Cuotas inválidas.", "danger")
+            return redirect(url_for("new_loan"))
         start_date = datetime.strptime(start_str, "%Y-%m-%d").date()
         next_payment_date = start_date + timedelta(days=7)
+
+        discount_amount = round(amount * upfront_percent / 100.0, 2)
+        monto_entregado = round(amount - discount_amount, 2)
+        if monto_entregado < 0:
+            monto_entregado = 0.0
+
         total_interest = round((amount * rate / 100) * term_count, 2)
-        total_to_pay = round(amount + total_interest, 2)
+        total_to_pay = round(monto_entregado + total_interest, 2)
         installment_amount = round(total_to_pay / max(term_count, 1), 2)
+
+        discount_cash_id = None
+        disbursement_cash_id = None
+
+        # 1) Descuento inicial entra al sistema y SUMA al banco.
+        # 2) Se entrega al cliente SOLO el monto neto (amount - descuento) y RESTA del banco.
+        try:
+            if discount_amount > 0:
+                discount_cash_id = apply_cash_movement(
+                    movement_type="descuento_inicial",
+                    amount=discount_amount,
+                    note=f"Descuento inicial préstamo cliente #{client_id}",
+                    user_id=user["id"],
+                    org_id=org_id,
+                )
+            if monto_entregado > 0:
+                disbursement_cash_id = apply_cash_movement(
+                    movement_type="prestamo_entregado",
+                    amount=-monto_entregado,
+                    note=f"Préstamo entregado cliente #{client_id}",
+                    user_id=user["id"],
+                    org_id=org_id,
+                )
+        except ValueError as e:
+            flash(str(e), "danger")
+            return redirect(url_for("new_loan"))
+
         lid = store.nid("loans")
         store.loans[lid] = {
-            "id": lid, "client_id": client_id, "amount": amount, "rate": rate, "frequency": freq,
-            "start_date": start_date, "next_payment_date": next_payment_date, "created_by": user["id"],
-            "remaining": amount, "remaining_capital": amount, "total_interest_paid": 0,
-            "status": "ACTIVO", "term_count": term_count, "organization_id": org_id,
-            "total_interest": total_interest, "total_to_pay": total_to_pay, "upfront_percent": 0,
+            "id": lid,
+            "client_id": client_id,
+            "amount": amount,  # capital aprobado
+            "rate": rate,
+            "frequency": freq,
+            "start_date": start_date,
+            "next_payment_date": next_payment_date,
+            "created_by": user["id"],
+            "remaining": monto_entregado,  # capital pendiente (neto entregado)
+            "remaining_capital": monto_entregado,
+            # IDs del libro de movimientos para poder corregir descuento.
+            "discount_cash_report_id": discount_cash_id,
+            "disbursement_cash_report_id": disbursement_cash_id,
+            "total_interest_paid": 0,
+            "status": "ACTIVO",
+            "term_count": term_count,
+            "organization_id": org_id,
+            "total_interest": total_interest,
+            "total_to_pay": total_to_pay,
+            "upfront_percent": upfront_percent,
             "installment_amount": installment_amount,
-            "signature_b64": None, "id_photo_b64": None, "id_photo_back_b64": None,
+            "signature_b64": None,
+            "id_photo_b64": None,
+            "id_photo_back_b64": None,
         }
         flash("Préstamo creado.", "success")
         return redirect(url_for("loan_detail", loan_id=lid))
     opts = "".join(f"<option value='{c['id']}'{' selected' if request.args.get('client_id', type=int)==c['id'] else ''}>{c['first_name']}</option>" for c in clist)
     body = (
-        f'<div class="card"><h2>Nuevo préstamo</h2><form method="post">'
+        f'<div class="card"><h2>Nuevo préstamo</h2>'
+        f'<p style="margin-top:6px; opacity:.9;"><b>Banco disponible:</b> {fmt_money(get_bank_available(org_id))}</p>'
+        f'<form method="post">'
         f'<label>Cliente</label><select name="client_id" required>{opts}</select>'
         f'<label>Monto</label><input name="amount" type="number" step="0.01" required>'
         f'<label>Tasa %</label><input name="rate" type="number" step="0.01" value="10">'
+        f'<label>Descuento inicial (%)</label><input name="upfront_percent" type="number" step="0.01" value="0" min="0" max="100">'
         f'<label>Frecuencia</label><select name="frequency"><option>semanal</option><option>diario</option><option>quincenal</option><option>mensual</option></select>'
         f'<label>Inicio</label><input name="start_date" type="date" value="{date.today().isoformat()}" required>'
         f'<label>Cuotas</label><input name="term_count" type="number" value="10" min="1">'
@@ -1020,16 +1152,204 @@ def loan_detail(loan_id):
     if not L:
         flash("No encontrado.", "danger")
         return redirect(url_for("loans"))
+    client_id = L.get("client_id")
+    client = store.clients.get(client_id, {})
     pays = [p for p in store.payments.values() if p.get("loan_id") == loan_id]
-    pr = "".join(f"<tr><td>{p.get('date')}</td><td>{fmt_money(p.get('amount'))}</td><td>{p.get('type')}</td></tr>" for p in pays)
-    body = (
-        f'<div class="card"><h2>Préstamo #{loan_id}</h2><p>Estado: {L.get("status")} · Restante: {fmt_money(L.get("remaining"))}</p>'
-        f'<div class="table-scroll"><table><tr><th>Fecha</th><th>Monto</th><th>Tipo</th></tr>{pr}</table></div>'
-        f'<a class="btn btn-primary" href="{url_for("new_payment", loan_id=loan_id)}">Registrar pago</a> '
-        f'<a class="btn btn-secondary" href="{url_for("edit_loan", loan_id=loan_id)}">Editar</a>'
-        f'<form method="post" action="{url_for("delete_loan", loan_id=loan_id)}" style="display:inline;margin-left:8px" onsubmit="return confirm(\'¿Eliminar préstamo?\');">'
-        f'<button class="btn btn-secondary" type="submit">Eliminar</button></form></div>'
+
+    # =========================
+    # Métricas/Resumen
+    # =========================
+    capital_aprobado = float(L.get("amount") or 0)
+    upfront_percent = float(L.get("upfront_percent") or 0)
+    descuento_inicial = round(capital_aprobado * upfront_percent / 100.0, 2)
+    monto_entregado = round(capital_aprobado - descuento_inicial, 2)
+    rate = float(L.get("rate") or 0)
+    interes_total = round(float(L.get("total_interest") or 0), 2)
+    total_a_pagar = round(float(L.get("total_to_pay") or (capital_aprobado + interes_total)), 2)
+
+    # Cuotas estimadas
+    term_count = int(L.get("term_count") or 1)
+    pagos_cuotas = [p for p in pays if (p.get("type") or "").lower() == "cuota"]
+    pagadas = len(pagos_cuotas)
+    restantes = max(term_count - pagadas, 0)
+    cuota_label = L.get("frequency") or "semanal"
+
+    # Siguiente pago (simplificado)
+    next_pago = L.get("next_payment_date") or date.today()
+    def fmt_date(d):
+        return d.strftime("%d/%m/%Y") if hasattr(d, "strftime") else str(d)
+    next_pago_disp = fmt_date(next_pago)
+
+    estado_pago = "Pendiente"
+    if str(L.get("status") or "").lower() == "cerrado" or float(L.get("remaining") or 0) <= 0:
+        estado_pago = "Cerrado"
+
+    # Etiqueta % sin decimales cuando sea entero (ej: 0% en vez de 0.0%)
+    if abs(upfront_percent - round(upfront_percent)) < 1e-9:
+        upfront_pct_label = f"{int(round(upfront_percent))}%"
+    else:
+        upfront_pct_label = f"{upfront_percent:.1f}%"
+
+    # Nombre legible para frecuencia
+    freq = str(L.get("frequency") or "").strip().lower()
+    if "quinc" in freq:
+        freq_label = "quincena"
+    elif "seman" in freq:
+        freq_label = "semana"
+    elif "diar" in freq:
+        freq_label = "día"
+    elif "mens" in freq:
+        freq_label = "mes"
+    else:
+        freq_label = freq or "cuota"
+
+    # Monto programado de la cuota (para que salga aun si no hay pagos)
+    scheduled_payment = float(L.get("installment_amount") or 0)
+    if scheduled_payment <= 0 and term_count:
+        scheduled_payment = float(total_a_pagar) / float(term_count)
+
+    # Historial tabla
+    hist_rows = ""
+    for idx, p in enumerate(sorted(pays, key=lambda x: (x.get("date") or date.min)), start=1):
+        hist_rows += (
+            f"<tr>"
+            f"<td>{idx}</td>"
+            f"<td>{fmt_money(p.get('amount'))}</td>"
+            f"<td>{fmt_money(p.get('capital'))}</td>"
+            f"<td>{fmt_money(p.get('interest'))}</td>"
+            f"<td>{p.get('date')}</td>"
+            f"</tr>"
+        )
+
+    if not hist_rows:
+        hist_rows = (
+            "<tr><td colspan='5' style='opacity:.85; text-align:center;'>Sin pagos</td></tr>"
+        )
+
+    # =========================
+    # WhatsApp
+    # =========================
+    phone = (client.get("phone") or "").strip()
+    wa_target = phone if phone else ADMIN_WHATSAPP
+    wa_text = (
+        f"Hola {client.get('first_name') or 'cliente'} 👋\n"
+        f"Le recordamos su próximo pago del préstamo #{loan_id}.\n"
+        f"Fecha: {next_pago}\n"
+        f"Estado: {estado_pago}"
     )
+    from urllib.parse import quote_plus
+    wa_link = f"https://wa.me/{wa_target}?text={quote_plus(wa_text)}"
+
+    body = f"""
+<style>
+.loan-wrap {{ padding: 8px 0; }}
+.loan-title {{ margin: 0 0 8px 0; font-size: 1.35rem; font-weight: 900; }}
+.loan-sub {{ opacity: .9; margin: 0 0 12px 0; font-size: 13px; }}
+.loan-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }}
+.loan-card {{
+  border-radius: 16px; padding: 12px 10px; color: #fff; box-shadow: 0 8px 20px rgba(0,0,0,.10);
+  min-height: 76px; box-sizing: border-box;
+}}
+.loan-k {{ display:block; font-size: 10px; font-weight: 900; opacity: .95; text-transform: uppercase; letter-spacing: .04em; margin-bottom: 6px; }}
+.loan-v {{ display:block; font-size: 16px; font-weight: 1000; line-height: 1.2; }}
+.loan-actions {{ display: flex; gap: 10px; flex-wrap: wrap; margin: 12px 0 10px 0; }}
+.loan-actions .btn {{ flex: 1 1 160px; }}
+.loan-section {{ margin-top: 14px; }}
+.loan-table th, .loan-table td {{ padding: 10px 8px; }}
+.loan-details summary {{ font-weight: 900; cursor: pointer; }}
+.loan-details details {{ margin-top: 10px; }}
+.loan-pill {{ display:inline-block; padding: 3px 10px; border-radius: 999px; background: rgba(255,255,255,.18); font-weight: 800; font-size: 11px; margin-left: 8px; }}
+</style>
+
+<div class="card loan-wrap">
+  <h2 class="loan-title">📄 Préstamo #{loan_id}</h2>
+  <p class="loan-sub">
+    Cliente: <b>{client.get('first_name') or '—'}</b>
+    <span class="loan-pill">Estado: {estado_pago}</span>
+  </p>
+
+  <div class="loan-actions">
+    <a class="btn btn-secondary" href="{wa_link}" target="_blank" rel="noopener">📲 Recordar por WhatsApp</a>
+    <a class="btn btn-primary" href="{url_for('new_payment', loan_id=loan_id)}">➕ Registrar pago</a>
+    <a class="btn btn-secondary" href="{url_for('edit_loan', loan_id=loan_id)}">✏️ Editar</a>
+  </div>
+
+  <div class="loan-section">
+    <details class="loan-details" open>
+      <summary>✅ Resumen</summary>
+      <div class="loan-grid" style="margin-top:10px;">
+        <div class="loan-card" style="background: linear-gradient(135deg,#15803d,#22c55e);">
+          <span class="loan-k">Capital aprobado</span><span class="loan-v">{fmt_money(capital_aprobado)}</span>
+        </div>
+        <div class="loan-card" style="background: linear-gradient(135deg,#7c3aed,#a855f7);">
+          <span class="loan-k">Descuento inicial ({upfront_pct_label})</span><span class="loan-v">-{fmt_money(descuento_inicial)}</span>
+        </div>
+        <div class="loan-card" style="background: linear-gradient(135deg,#0d9488,#14b8a6);">
+          <span class="loan-k">Monto entregado</span><span class="loan-v">{fmt_money(monto_entregado)}</span>
+        </div>
+        <div class="loan-card" style="background: linear-gradient(135deg,#1d4ed8,#3b82f6);">
+          <span class="loan-k">Interés total ({rate:.1f}%)</span><span class="loan-v">{fmt_money(interes_total)}</span>
+        </div>
+        <div class="loan-card" style="background: linear-gradient(135deg,#b91c1c,#ef4444); grid-column: span 1;">
+          <span class="loan-k">Total a pagar</span><span class="loan-v">{fmt_money(total_a_pagar)}</span>
+        </div>
+      </div>
+    </details>
+  </div>
+
+  <div class="loan-section">
+    <details class="loan-details" open>
+      <summary>💰 Pagos</summary>
+      <div class="loan-grid" style="margin-top:10px;">
+        <div class="loan-card" style="background: linear-gradient(135deg,#4f8df7,#3b82f6);">
+          <span class="loan-k">Pago por {freq_label}</span>
+          <span class="loan-v">{fmt_money(scheduled_payment)}</span>
+        </div>
+        <div class="loan-card" style="background: linear-gradient(135deg,#16a34a,#22c55e);">
+          <span class="loan-k">Cuotas</span>
+          <span class="loan-v">{pagadas} de {term_count}</span>
+          <span style="display:block; font-size:12px; margin-top:6px; opacity:.95; font-weight:900;">
+            {pagadas} pagadas • {restantes} restantes
+          </span>
+        </div>
+      </div>
+    </details>
+  </div>
+
+  <div class="loan-section">
+    <details class="loan-details" open>
+      <summary>📅 Calendario de pagos</summary>
+      <div style="margin-top:10px;">
+        <div class="card" style="margin:0; padding:12px;">
+          <div style="font-weight:900; margin-bottom:6px;">Cuota 1</div>
+          <div><b>⏳ {next_pago_disp}</b></div>
+          <div style="margin-top:6px; opacity:.95;">
+            Monto: <b>{fmt_money(L.get('installment_amount'))}</b>
+          </div>
+          <div style="margin-top:6px; opacity:.95;">
+            Estado: <b>{estado_pago}</b>
+          </div>
+        </div>
+      </div>
+    </details>
+  </div>
+
+  <div class="loan-section">
+    <details class="loan-details">
+      <summary>📜 Historial de pagos</summary>
+      <div class="table-scroll" style="margin-top:10px;">
+        <table class="loan-table">
+          <tr>
+            <th>#</th><th>Monto</th><th>Capital</th><th>Interés</th><th>Fecha</th>
+          </tr>
+          {hist_rows}
+        </table>
+      </div>
+    </details>
+  </div>
+
+</div>
+"""
     return page(body)
 
 
@@ -1046,6 +1366,20 @@ def new_payment(loan_id):
         if amt is None or amt <= 0:
             flash("Monto inválido.", "danger")
             return redirect(url_for("new_payment", loan_id=loan_id))
+
+        # Registrar movimiento en el banco (siempre suma).
+        try:
+            apply_cash_movement(
+                movement_type="pago_prestamo",
+                amount=amt,
+                note=f"Pago préstamo #{loan_id}",
+                user_id=current_user()["id"],
+                org_id=session.get("org_id"),
+            )
+        except ValueError as e:
+            flash(str(e), "danger")
+            return redirect(url_for("loan_detail", loan_id=loan_id))
+
         pid = store.nid("payments")
         store.payments[pid] = {
             "id": pid, "loan_id": loan_id, "amount": amt, "type": typ, "date": date.today(),
@@ -1108,8 +1442,10 @@ def bank_home():
         adm = f'<form method="post" action="{url_for("admin_clear_all")}" onsubmit="return confirm(\'¿Resetear datos?\');" style="margin-top:12px"><button class="btn btn-secondary" type="submit">Reiniciar datos demo</button></form>'
     body = (
         f'<h2 style="text-align:center">🏦 Banco</h2><style>'
-        f'.bank-menu{{display:grid;grid-template-columns:repeat(2,1fr);gap:12px}}'
-        f'.bank-tile{{display:block;text-align:center;padding:16px;border-radius:16px;color:#fff;font-weight:800;text-decoration:none}}'
+        f'.bank-menu{{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;align-items:stretch;padding:8px 4px 14px}}'
+        f'.bank-tile{{display:flex;align-items:center;justify-content:center;text-align:center;padding:16px 12px;min-height:56px;border-radius:16px;color:#fff;font-weight:900;text-decoration:none;box-shadow:0 10px 24px rgba(0,0,0,.14);transition:transform .12s ease,opacity .12s ease;box-sizing:border-box}}'
+        f'.bank-tile:hover{{transform:translateY(-2px);opacity:.98}}'
+        f'.bank-tile:focus{{outline:2px solid rgba(255,255,255,.85);outline-offset:2px}}'
         f'.blue{{background:#4f8df7}} .red{{background:#f87171}} .orange{{background:#fb923c}} .purple{{background:#a855f7}} .indigo{{background:#6366f1}}'
         f'</style><div class="bank-menu">{tiles}</div>'
         f'<a class="btn btn-primary" style="display:block;margin-top:12px;text-align:center" href="{url_for("collector_map")}">Mapa cobrador</a>{adm}'
@@ -1158,10 +1494,30 @@ def audit():
 @login_required
 @role_required("admin", "supervisor")
 def reportes():
+    ensure_org()
+    oid = session.get("org_id")
+    total_gastos_ruta = round(
+        sum(float(e.get("amount") or 0) for e in store.route_expenses.values() if e.get("organization_id") == oid),
+        2,
+    )
+    banco_disp = get_bank_available(oid)
+    descuento_income = round(
+        sum(
+            float(cr.get("amount") or 0)
+            for cr in store.cash_reports.values()
+            if cr.get("organization_id") == oid and cr.get("movement_type") == "descuento_inicial"
+        ),
+        2,
+    )
     body = (
-        f'<div class="card"><h2>Reportes</h2>'
+        f'<div class="card"><h2>📊 Reportes</h2>'
         f'<a class="btn btn-secondary" href="{url_for("reportes_cobradores")}">Por cobrador</a> '
         f'<a class="btn btn-secondary" href="{url_for("dashboard")}">Dashboard</a>'
+        f'<div style="margin-top:12px">'
+        f'<p><b>Banco disponible:</b> {fmt_money(banco_disp)}</p>'
+        f'<p><b>Gastos de ruta (total):</b> {fmt_money(total_gastos_ruta)}</p>'
+        f'<p><b>Ingreso por descuentos iniciales:</b> {fmt_money(descuento_income)}</p>'
+        f'</div>'
         f"<p>Préstamos: {len(store.loans)} · Clientes: {len(store.clients)}</p></div>"
     )
     return page(body)
@@ -1293,14 +1649,43 @@ def bank_daily_list():
 @app.route("/bank/expenses", methods=["GET", "POST"])
 @login_required
 def bank_expenses():
-    return stub_page("Gastos de ruta")
+    ensure_org()
+    oid = session.get("org_id")
+    rows = "".join(
+        f"<tr><td>{e.get('route') or '—'}</td><td>{e.get('amount') and fmt_money(e.get('amount')) or ''}</td>"
+        f"<td>{e.get('note') or ''}</td><td>{e.get('created_at') or ''}</td>"
+        f"<td><form method='post' action='{url_for('delete_route_expense', expense_id=e['id'])}' onsubmit=\"return confirm('¿Eliminar gasto?');\">"
+        f"<button class='btn btn-secondary' type='submit'>Borrar</button></form></td></tr>"
+        for e in reversed(list(store.route_expenses.values()))
+        if e.get("organization_id") == oid
+    )
+    if not rows:
+        rows = "<tr><td colspan=5 style='opacity:.85'>Sin gastos aún</td></tr>"
+    body = (
+        f'<div class="card"><h2>🧾 Gastos de ruta</h2>'
+        f'<form method="post" action="{url_for("add_route_expense")}">'
+        f'<label>Ruta</label><input name="route" placeholder="Ej. Ruta 1">'
+        f'<label>Monto</label><input name="amount" type="number" step="0.01" required>'
+        f'<label>Nota</label><input name="note" placeholder="Ej. Transporte / comida"></form>'
+        f'<button class="btn btn-primary" type="submit">Registrar gasto</button>'
+        f'<div class="table-scroll" style="margin-top:12px"><table><tr><th>Ruta</th><th>Monto</th><th>Nota</th><th>Fecha</th><th></th></tr>{rows}</table></div>'
+        f"{nav_subfooter()}</div>"
+    )
+    return page(body)
 
 
 @app.route("/bank/expenses/delete/<int:expense_id>", methods=["POST"])
 @login_required
 def delete_route_expense(expense_id):
+    exp = store.route_expenses.get(expense_id)
+    if not exp:
+        flash("Gasto no encontrado.", "danger")
+        return redirect(url_for("bank_expenses"))
+    cash_id = exp.get("cash_report_id")
+    if cash_id is not None:
+        store.cash_reports.pop(cash_id, None)
     store.route_expenses.pop(expense_id, None)
-    flash("Gasto eliminado.", "info")
+    flash("Gasto eliminado y banco actualizado.", "success")
     return redirect(url_for("bank_expenses"))
 
 
@@ -1313,14 +1698,215 @@ def edit_expense(expense_id):
 @app.route("/route/expenses/new", methods=["POST"])
 @login_required
 def add_route_expense():
-    flash("Gasto registrado (memoria).", "success")
+    ensure_org()
+    org_id = session.get("org_id")
+    route = (request.form.get("route") or "").strip()
+    note = (request.form.get("note") or "").strip() or "Gasto de ruta"
+    exp_amount = request.form.get("amount", type=float)
+    if exp_amount is None or exp_amount <= 0:
+        flash("Monto inválido.", "danger")
+        return redirect(url_for("bank_expenses"))
+
+    # Movimiento negativo del banco (gasto).
+    try:
+        cash_id = apply_cash_movement(
+            movement_type="gasto_ruta",
+            amount=-exp_amount,
+            note=f"Gasto de ruta ({route or '—'})",
+            user_id=current_user()["id"],
+            org_id=org_id,
+        )
+    except ValueError as e:
+        flash(str(e), "danger")
+        return redirect(url_for("bank_expenses"))
+
+    eid = store.nid("route_expenses")
+    store.route_expenses[eid] = {
+        "id": eid,
+        "route": route,
+        "expense_type": "gasto_ruta",
+        "amount": round(float(exp_amount), 2),
+        "note": note,
+        "user_id": current_user()["id"],
+        "created_at": datetime.utcnow(),
+        "organization_id": org_id,
+        "cash_report_id": cash_id,
+    }
+    flash("Gasto registrado. Banco actualizado.", "success")
     return redirect(url_for("bank_expenses"))
 
 
 @app.route("/bank/discount/delete/<int:discount_id>", methods=["POST"])
 @login_required
 def delete_discount(discount_id):
-    flash("Descuento eliminado (memoria).", "info")
+    ensure_org()
+    oid = session.get("org_id")
+
+    # El descuento se guarda como movement_type="descuento_inicial" en cash_reports.
+    # También guardamos el cash_report_id en el préstamo para poder corregir totales.
+    target = None
+    for L in store.loans.values():
+        if L.get("organization_id") == oid and L.get("discount_cash_report_id") == discount_id:
+            target = L
+            break
+    if not target:
+        flash("Descuento no encontrado.", "danger")
+        return redirect(url_for("bank_acta"))
+
+    amount_total = float(target.get("amount") or 0)
+    old_upfront_percent = float(target.get("upfront_percent") or 0)
+    old_discount_amount = round(amount_total * old_upfront_percent / 100.0, 2)
+    if old_discount_amount < 0:
+        old_discount_amount = 0.0
+
+    # Validación contable: el banco cambia en 2*(nuevo_desc - viejo_desc).
+    current_bank = get_bank_available(oid)
+    final_bank = current_bank - 2 * old_discount_amount
+    if final_bank < -1e-9:
+        flash("No se puede eliminar el descuento: banco insuficiente.", "danger")
+        return redirect(url_for("bank_acta"))
+
+    client_id = target.get("client_id")
+    user_id = current_user()["id"]
+
+    # Revertir movimientos existentes.
+    store.cash_reports.pop(discount_id, None)
+    old_disbursement_id = target.get("disbursement_cash_report_id")
+    if old_disbursement_id is not None:
+        store.cash_reports.pop(old_disbursement_id, None)
+
+    # Actualizar préstamo: descuento => 0 (monto entregado = amount_total).
+    old_net_initial = float(target.get("remaining_capital") or 0)
+    new_upfront_percent = 0.0
+    new_net_initial = round(amount_total - (amount_total * new_upfront_percent / 100.0), 2)
+    delta = new_net_initial - old_net_initial
+
+    target["upfront_percent"] = new_upfront_percent
+    target["remaining_capital"] = new_net_initial
+    target["remaining"] = max(0.0, float(target.get("remaining") or 0) + delta)
+
+    total_interest = round(float(target.get("total_interest") or 0), 2)
+    term_count = int(target.get("term_count") or 1)
+    target["total_to_pay"] = round(new_net_initial + total_interest, 2)
+    target["installment_amount"] = round(target["total_to_pay"] / max(term_count, 1), 2)
+
+    target["discount_cash_report_id"] = None
+    target["disbursement_cash_report_id"] = None
+
+    # Crear movimiento de entrega con descuento=0.
+    if amount_total > 0:
+        try:
+            new_disbursement_id = apply_cash_movement(
+                movement_type="prestamo_entregado",
+                amount=-amount_total,
+                note=f"Préstamo entregado cliente #{client_id} (sin descuento)",
+                user_id=user_id,
+                org_id=oid,
+            )
+        except ValueError as e:
+            flash(str(e), "danger")
+            return redirect(url_for("bank_acta"))
+        target["disbursement_cash_report_id"] = new_disbursement_id
+
+    if float(target.get("remaining") or 0) <= 0:
+        target["status"] = "cerrado"
+
+    flash("Descuento inicial eliminado y banco actualizado.", "success")
+    return redirect(url_for("bank_acta"))
+
+
+@app.route("/bank/discount/edit/<int:discount_id>", methods=["POST"])
+@login_required
+def edit_discount(discount_id):
+    ensure_org()
+    oid = session.get("org_id")
+
+    target = None
+    for L in store.loans.values():
+        if L.get("organization_id") == oid and L.get("discount_cash_report_id") == discount_id:
+            target = L
+            break
+    if not target:
+        flash("Préstamo/Descuento no encontrado.", "danger")
+        return redirect(url_for("bank_acta"))
+
+    new_upfront_percent = request.form.get("upfront_percent", type=float)
+    if new_upfront_percent is None:
+        flash("Por favor ingrese un %.", "danger")
+        return redirect(url_for("bank_acta"))
+    new_upfront_percent = max(0.0, min(float(new_upfront_percent), 100.0))
+
+    amount_total = float(target.get("amount") or 0)
+    old_upfront_percent = float(target.get("upfront_percent") or 0)
+    old_discount_amount = round(amount_total * old_upfront_percent / 100.0, 2)
+    new_discount_amount = round(amount_total * new_upfront_percent / 100.0, 2)
+    old_net_initial = float(target.get("remaining_capital") or 0)
+    new_net_initial = round(amount_total - new_discount_amount, 2)
+    if new_net_initial < 0:
+        new_net_initial = 0.0
+
+    if abs(new_discount_amount - old_discount_amount) < 1e-9:
+        flash("No hay cambios en el descuento.", "info")
+        return redirect(url_for("bank_acta"))
+
+    # Validación contable: banco cambia en 2*(nuevo_desc - viejo_desc).
+    current_bank = get_bank_available(oid)
+    final_bank = current_bank + 2 * (new_discount_amount - old_discount_amount)
+    if final_bank < -1e-9:
+        flash("No se puede editar el descuento: banco insuficiente.", "danger")
+        return redirect(url_for("bank_acta"))
+
+    client_id = target.get("client_id")
+    user_id = current_user()["id"]
+
+    # Revertir movimientos existentes.
+    store.cash_reports.pop(discount_id, None)
+    old_disbursement_id = target.get("disbursement_cash_report_id")
+    if old_disbursement_id is not None:
+        store.cash_reports.pop(old_disbursement_id, None)
+
+    # Actualizar campos del préstamo.
+    delta = new_net_initial - old_net_initial
+    target["upfront_percent"] = new_upfront_percent
+    target["remaining_capital"] = new_net_initial
+    target["remaining"] = max(0.0, float(target.get("remaining") or 0) + delta)
+
+    total_interest = round(float(target.get("total_interest") or 0), 2)
+    term_count = int(target.get("term_count") or 1)
+    target["total_to_pay"] = round(new_net_initial + total_interest, 2)
+    target["installment_amount"] = round(target["total_to_pay"] / max(term_count, 1), 2)
+
+    target["discount_cash_report_id"] = None
+    target["disbursement_cash_report_id"] = None
+
+    # Aplicar nuevos movimientos al banco.
+    try:
+        if new_discount_amount > 0:
+            target["discount_cash_report_id"] = apply_cash_movement(
+                movement_type="descuento_inicial",
+                amount=new_discount_amount,
+                note=f"Descuento inicial préstamo cliente #{client_id} (editado)",
+                user_id=user_id,
+                org_id=oid,
+            )
+        if new_net_initial > 0:
+            target["disbursement_cash_report_id"] = apply_cash_movement(
+                movement_type="prestamo_entregado",
+                amount=-new_net_initial,
+                note=f"Préstamo entregado cliente #{client_id} (neto editado)",
+                user_id=user_id,
+                org_id=oid,
+            )
+    except ValueError as e:
+        flash(str(e), "danger")
+        return redirect(url_for("bank_acta"))
+
+    if float(target.get("remaining") or 0) <= 0:
+        target["status"] = "cerrado"
+    else:
+        target["status"] = target.get("status") if target.get("status") != "cerrado" else "ACTIVO"
+
+    flash("Descuento inicial editado y banco actualizado.", "success")
     return redirect(url_for("bank_acta"))
 
 
@@ -1352,7 +1938,126 @@ def bank_delivery_delete(delivery_id):
 @app.route("/bank/acta", methods=["GET", "POST"])
 @login_required
 def bank_acta():
-    return stub_page("Acta / descuento inicial")
+    ensure_org()
+    oid = session.get("org_id")
+    # ============================================================
+    # Vista tipo "Acta global" (alineada al otro sistema)
+    # - Caja global: depósitos + banco inicial (sin incluir préstamos/pagos)
+    # - Descuento total: movimientos "descuento_inicial"
+    # - Gastos realizados: movimientos "gasto_ruta"
+    # - Disponible: saldo real del banco (starting_bank + todos los cash_reports)
+    # ============================================================
+    caja_global = float(getattr(store, "starting_bank", 0.0) or 0.0) + sum(
+        float(cr.get("amount") or 0)
+        for cr in store.cash_reports.values()
+        if cr.get("organization_id") == oid and cr.get("movement_type") == "deposito_banco"
+    )
+    descuento_total = round(
+        sum(
+            float(cr.get("amount") or 0)
+            for cr in store.cash_reports.values()
+            if cr.get("organization_id") == oid and cr.get("movement_type") == "descuento_inicial"
+        ),
+        2,
+    )
+    gastos_realizados = round(
+        sum(
+            abs(float(cr.get("amount") or 0))
+            for cr in store.cash_reports.values()
+            if cr.get("organization_id") == oid and cr.get("movement_type") == "gasto_ruta"
+        ),
+        2,
+    )
+    disponible = get_bank_available(oid)
+
+    def fmt_dt(dt):
+        if not dt:
+            return ""
+        try:
+            return dt.strftime("%d/%m/%Y %I:%M %p")
+        except Exception:
+            return str(dt)
+
+    # Listar descuentos registrados como movimientos del libro.
+    discount_moves = sorted(
+        (
+            cr
+            for cr in store.cash_reports.values()
+            if cr.get("organization_id") == oid and cr.get("movement_type") == "descuento_inicial"
+        ),
+        key=lambda x: x.get("created_at") or datetime.min,
+        reverse=True,
+    )
+
+    rows = ""
+    for cr in discount_moves[:200]:
+        discount_id = cr.get("id")
+        loan = None
+        for L in store.loans.values():
+            if L.get("organization_id") == oid and L.get("discount_cash_report_id") == discount_id:
+                loan = L
+                break
+        client = store.clients.get((loan or {}).get("client_id"), {}) if loan else {}
+        user_id = cr.get("user_id")
+        cobrador = store.users.get(user_id, {}).get("username") or "—"
+        ruta = client.get("route") or "—"
+        monto = float(cr.get("amount") or 0)
+
+        del_form = (
+            f"<form method='post' action='{url_for('delete_discount', discount_id=discount_id)}' "
+            f"onsubmit=\"return confirm('¿Eliminar este descuento y ajustar el banco?');\" style='margin:0'>"
+            f"<button class='btn btn-secondary' type='submit' title='Eliminar'>🗑</button></form>"
+        )
+
+        rows += (
+            "<tr>"
+            f"<td>{fmt_dt(cr.get('created_at'))}</td>"
+            f"<td>{cobrador}</td>"
+            f"<td>{ruta}</td>"
+            f"<td style='text-align:right'>{fmt_money(-monto)}</td>"
+            f"<td>{del_form}</td>"
+            "</tr>"
+        )
+
+    if not rows:
+        rows = "<tr><td colspan='5' style='opacity:.85; text-align:center'>Sin descuentos registrados</td></tr>"
+
+    body = f"""
+<div class="card" style="padding:16px;">
+  <h2 style="margin:0 0 12px 0;">🧾 Acta global</h2>
+  <style>
+    .acta-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin:0 0 14px 0}}
+    .acta-pill{{border-radius:16px;padding:12px 12px;color:#fff;box-shadow:0 6px 16px rgba(0,0,0,.10);min-height:82px}}
+    .acta-k{{display:block;font-size:12px;font-weight:900;opacity:.95;text-transform:uppercase;letter-spacing:.03em;margin-bottom:6px}}
+    .acta-v{{display:block;font-size:16px;font-weight:1000;line-height:1.15}}
+    table td,table th{{vertical-align:middle}}
+  </style>
+  <div class="acta-grid">
+    <div class="acta-pill" style="background:linear-gradient(135deg,#0d9488,#14b8a6)"><span class="acta-k">Caja global</span><span class="acta-v">{fmt_money(caja_global)}</span></div>
+    <div class="acta-pill" style="background:linear-gradient(135deg,#15803d,#22c55e)"><span class="acta-k">Descuento total</span><span class="acta-v">{fmt_money(descuento_total)}</span></div>
+    <div class="acta-pill" style="background:linear-gradient(135deg,#c2410c,#fb923c)"><span class="acta-k">Gastos realizados</span><span class="acta-v">{fmt_money(gastos_realizados)}</span></div>
+    <div class="acta-pill" style="background:linear-gradient(135deg,#334155,#0f172a)"><span class="acta-k">Disponible</span><span class="acta-v">{fmt_money(disponible)}</span></div>
+  </div>
+
+  <div style="margin-top:8px;">
+    <h3 style="margin:0 0 10px 0;">Descuentos registrados</h3>
+    <div class="table-scroll">
+      <table>
+        <tr>
+          <th>Fecha</th>
+          <th>Cobrador</th>
+          <th>Ruta</th>
+          <th>Monto</th>
+          <th></th>
+        </tr>
+        {rows}
+      </table>
+    </div>
+  </div>
+</div>
+{nav_subfooter()}
+"""
+    return page(body)
 
 
 @app.route("/bank/routes", methods=["GET", "POST"])
@@ -1560,20 +2265,120 @@ def cobro_sabado():
 @login_required
 def bank_resumen():
     ensure_org()
-    k = compute_financial_kpis(session.get("org_id"), current_user())
+    oid = session.get("org_id")
+    k = compute_financial_kpis(oid, current_user())
+    banco_disp = get_bank_available(oid)
+    total_gastos_ruta = round(
+        sum(
+            float(e.get("amount") or 0)
+            for e in store.route_expenses.values()
+            if e.get("organization_id") == oid
+        ),
+        2,
+    )
     body = (
-        f'<div class="card"><h2>📊 Resumen financiero</h2>'
-        f"<ul style='line-height:1.9'>"
-        f"<li>Capital prestado: <b>{fmt_money(k['capital_prestado'])}</b></li>"
-        f"<li>Capital cobrado: <b>{fmt_money(k['capital_cobrado'])}</b></li>"
-        f"<li>Capital pendiente (activos): <b>{fmt_money(k['capital_pendiente'])}</b></li>"
-        f"<li>Interés total: <b>{fmt_money(k['interes_total'])}</b></li>"
-        f"<li>Interés cobrado: <b>{fmt_money(k['interes_cobrado'])}</b></li>"
-        f"<li>Interés pendiente: <b>{fmt_money(k['interes_pendiente'])}</b></li>"
-        f"<li><b>Total por cobrar: {fmt_money(k['total_por_cobrar'])}</b></li>"
-        f"<li>Cobrado hoy: <b>{fmt_money(k['cobrado_hoy'])}</b> · Interés hoy: <b>{fmt_money(k['interes_hoy'])}</b></li>"
-        f"<li>Préstamos atrasados: <b>{k['atrasados']}</b></li>"
-        f"</ul>{nav_subfooter()}</div>"
+        f"""
+<div class="card" style="padding:16px;">
+  <h2 style="margin:0 0 10px 0;">📊 Resumen financiero</h2>
+
+  <style>
+    .res-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      gap: 12px;
+      margin: 10px 0 18px 0;
+    }}
+    .res-card {{
+      border-radius: 16px;
+      padding: 12px 10px;
+      color: #fff;
+      box-shadow: 0 6px 16px rgba(0,0,0,.14);
+      min-height: 86px;
+    }}
+    .res-k {{
+      display:block;
+      font-size: 10px;
+      font-weight: 800;
+      opacity: .95;
+      text-transform: uppercase;
+      letter-spacing: .04em;
+      margin-bottom: 6px;
+    }}
+    .res-v {{
+      display:block;
+      font-size: 16px;
+      font-weight: 900;
+      line-height: 1.2;
+    }}
+    .res-daily-title {{
+      font-size: 14px;
+      font-weight: 900;
+      margin: 6px 0 10px 0;
+      color: #14532d;
+    }}
+    body.theme-dark .res-daily-title {{ color: #86efac; }}
+  </style>
+
+  <div class="res-grid">
+    <div class="res-card" style="background: linear-gradient(135deg,#0d9488,#14b8a6);">
+      <span class="res-k">Capital prestado</span>
+      <span class="res-v">{fmt_money(k['capital_prestado'])}</span>
+    </div>
+    <div class="res-card" style="background: linear-gradient(135deg,#15803d,#22c55e);">
+      <span class="res-k">Capital cobrado</span>
+      <span class="res-v">{fmt_money(k['capital_cobrado'])}</span>
+    </div>
+    <div class="res-card" style="background: linear-gradient(135deg,#1d4ed8,#3b82f6);">
+      <span class="res-k">Capital pendiente</span>
+      <span class="res-v">{fmt_money(k['capital_pendiente'])}</span>
+    </div>
+    <div class="res-card" style="background: linear-gradient(135deg,#7c3aed,#a855f7);">
+      <span class="res-k">Interés total</span>
+      <span class="res-v">{fmt_money(k['interes_total'])}</span>
+    </div>
+    <div class="res-card" style="background: linear-gradient(135deg,#166534,#4ade80);">
+      <span class="res-k">Interés cobrado</span>
+      <span class="res-v">{fmt_money(k['interes_cobrado'])}</span>
+    </div>
+    <div class="res-card" style="background: linear-gradient(135deg,#c2410c,#fb923c);">
+      <span class="res-k">Interés pendiente</span>
+      <span class="res-v">{fmt_money(k['interes_pendiente'])}</span>
+    </div>
+    <div class="res-card" style="background: linear-gradient(135deg,#b91c1c,#ef4444);">
+      <span class="res-k">Total por cobrar</span>
+      <span class="res-v">{fmt_money(k['total_por_cobrar'])}</span>
+    </div>
+
+    <div class="res-card" style="background: linear-gradient(135deg,#0f172a,#334155);">
+      <span class="res-k">Banco disponible</span>
+      <span class="res-v">{fmt_money(banco_disp)}</span>
+    </div>
+
+    <div class="res-card" style="background: linear-gradient(135deg,#ef4444,#f59e0b);">
+      <span class="res-k">Gastos de ruta</span>
+      <span class="res-v">{fmt_money(total_gastos_ruta)}</span>
+    </div>
+  </div>
+
+  <div class="res-daily-title">Métricas diarias</div>
+  <div class="res-grid" style="margin-bottom:0;">
+    <div class="res-card" style="background: linear-gradient(135deg,#4f8df7,#3b82f6);">
+      <span class="res-k">Cobrado hoy</span>
+      <span class="res-v">{fmt_money(k['cobrado_hoy'])}</span>
+    </div>
+    <div class="res-card" style="background: linear-gradient(135deg,#7c3aed,#a78bfa);">
+      <span class="res-k">Interés hoy</span>
+      <span class="res-v">{fmt_money(k['interes_hoy'])}</span>
+    </div>
+    <div class="res-card" style="background: linear-gradient(135deg,#fb923c,#f59e0b);">
+      <span class="res-k">Atrasados</span>
+      <span class="res-v">{k['atrasados']}</span>
+    </div>
+  </div>
+
+  <div style="margin-top:14px;">{nav_subfooter()}</div>
+</div>
+"""
     )
     return page(body)
 
@@ -1673,17 +2478,19 @@ def agregar_dinero_banco():
         if amt is None or amt <= 0:
             flash("Monto inválido.", "danger")
             return redirect(url_for("agregar_dinero_banco"))
-        rid = store.nid("cash")
-        store.cash_reports[rid] = {
-            "id": rid,
-            "user_id": current_user()["id"],
-            "date": date.today(),
-            "amount": amt,
-            "note": note,
-            "created_at": datetime.utcnow(),
-            "organization_id": org_id,
-            "movement_type": "deposito_banco",
-        }
+        rid = None
+        try:
+            rid = apply_cash_movement(
+                movement_type="deposito_banco",
+                amount=amt,
+                note=note,
+                user_id=current_user()["id"],
+                org_id=org_id,
+            )
+        except ValueError as e:
+            flash(str(e), "danger")
+            return redirect(url_for("agregar_dinero_banco"))
+
         store.deposit_history.append(
             {"id": rid, "amount": amt, "note": note, "at": datetime.utcnow()}
         )
