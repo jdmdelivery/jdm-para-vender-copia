@@ -200,7 +200,7 @@ BASE_STYLE = """
 <style>
 *,*::before,*::after{box-sizing:border-box}
 html,body{width:100%;max-width:100%;overflow-x:hidden;margin:0;padding:0}
-body{margin:0;font-family:system-ui,sans-serif}
+body{margin:0;font-family:system-ui,sans-serif;min-height:100dvh;-webkit-text-size-adjust:100%}
 body.theme-light{background:#ecfdf3;color:#022c22}
 body.theme-dark{background:linear-gradient(135deg,#06131a,#022c22,#111827);color:#f9fafb}
 header.topbar{display:flex;align-items:center;justify-content:center;padding:14px;background:linear-gradient(135deg,#166534,#22c55e);color:#fff;position:relative;box-shadow:0 10px 28px rgba(0,0,0,.25)}
@@ -217,6 +217,18 @@ body.theme-dark th{background:rgba(30,64,175,.25)}
 .btn-secondary{background:#e5e7eb;color:#0f172a}
 body.theme-dark .btn-secondary{background:#334155;color:#e5e7eb}
 .table-scroll{overflow-x:auto}
+form{width:100%}
+form label{display:block;font-weight:900;font-size:12px;opacity:.92}
+form input,form select,form textarea{width:100%;max-width:100%;padding:10px 12px;border-radius:12px;border:1px solid rgba(148,163,184,.35);background:#fff;font-size:14px}
+form textarea{min-height:96px;resize:vertical}
+a,button{-webkit-tap-highlight-color:transparent}
+@media(max-width:420px){
+  .container{padding:8px}
+  .card{padding:12px;margin-bottom:10px}
+  header.topbar{padding:12px}
+  .topbar-title{font-size:16px}
+  th,td{padding:7px 8px}
+}
 </style>
 """
 
@@ -227,6 +239,9 @@ TPL_LAYOUT = """
   <meta charset="utf-8">
   <title>{{ app_brand }}</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0, user-scalable=yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="mobile-web-app-capable" content="yes">
   <link rel="manifest" href="/manifest.json">
   <meta name="theme-color" content="#16a34a">
   """ + BASE_STYLE + """
@@ -492,16 +507,74 @@ def stub_page(title, extra=""):
 
 def loans_for_user(org_id, user):
     rows = [L for L in store.loans.values() if L.get("organization_id") == org_id]
-    if user.get("role") == "cobrador" and not is_cartera_admin(user):
+    if is_cajero_role(user) and not is_cartera_admin(user):
         rows = [L for L in rows if L.get("created_by") == user["id"]]
     return rows
 
 
 def clients_for_user(org_id, user):
     rows = [c for c in store.clients.values() if c.get("organization_id") == org_id]
-    if user.get("role") == "cobrador" and not is_cartera_admin(user):
+    if is_cajero_role(user) and not is_cartera_admin(user):
         rows = [c for c in rows if c.get("created_by") == user["id"]]
     return rows
+
+
+def user_is_cobrador_limited(user):
+    """
+    Un cobrador (collector) no debe ver datos de otros usuarios.
+    Excepción: cartera admin (CARTERA_ADMIN_USER_ID) y super_admin.
+    """
+    role = (user.get("role") or "").strip().lower()
+    return bool(user) and role in ("cobrador", "cajero") and not is_cartera_admin(user) and role != "super_admin"
+
+
+def can_admin_actions(user):
+    """
+    Admin-level: puede hacer cualquier operación crítica.
+    Mapeo actual (por compatibilidad con roles ya existentes):
+    - `admin` y `supervisor`: admin-level
+    - `super_admin`: también admin-level (panel global)
+    - `is_cartera_admin(user)`: excepción histórica del sistema
+    """
+    if not user:
+        return False
+    role = (user.get("role") or "").strip().lower()
+    return role in ("admin", "supervisor", "super_admin") or is_cartera_admin(user)
+
+
+def is_cajero_role(user):
+    role = (user.get("role") or "").strip().lower()
+    return role in ("cobrador", "cajero")
+
+
+def scope_owns_loan(user, loan):
+    if not user_is_cobrador_limited(user):
+        return True
+    return bool(loan) and loan.get("created_by") == user.get("id")
+
+
+def scope_owns_client(user, client):
+    if not user_is_cobrador_limited(user):
+        return True
+    return bool(client) and client.get("created_by") == user.get("id")
+
+
+def scope_owns_payment(user, payment):
+    if not user_is_cobrador_limited(user):
+        return True
+    return bool(payment) and payment.get("created_by") == user.get("id")
+
+
+def scope_owns_cash_report(user, cash_report):
+    if not user_is_cobrador_limited(user):
+        return True
+    return bool(cash_report) and cash_report.get("user_id") == user.get("id")
+
+
+def scope_owns_route_expense(user, route_expense):
+    if not user_is_cobrador_limited(user):
+        return True
+    return bool(route_expense) and route_expense.get("user_id") == user.get("id")
 
 
 def bank_org_id(org_id=None):
@@ -881,7 +954,7 @@ def api_notification_check():
         1 for L in store.loans.values()
         if L.get("organization_id") == org_id and str(L.get("status", "")).upper() == "ACTIVO" and L.get("next_payment_date") == date.today()
     )
-    if user and user.get("role") == "cobrador" and not is_cartera_admin(user):
+    if user_is_cobrador_limited(user):
         morosos = sum(
             1 for A in store.loan_arrears.values()
             if not A.get("paid") and store.loans.get(A.get("loan_id"), {}).get("created_by") == user["id"]
@@ -1147,7 +1220,7 @@ def employees():
     rows = "".join(
         f"<tr><td>{u['username']}</td><td>{u.get('phone') or '—'}</td><td>{u['role']}</td></tr>"
         for u in store.users.values()
-        if u.get("organization_id") == org_id and u.get("role") == "cobrador"
+        if u.get("organization_id") == org_id and is_cajero_role(u)
     )
     body = (
         f'<div class="card"><h2>👥 Empleados / cobradores</h2>'
@@ -1181,12 +1254,12 @@ def new_user():
             return redirect(url_for("new_user"))
         org_id = session.get("org_id")
         uid = store.nid("users")
-        status = ACCOUNT_PENDING if role == "cobrador" else ACCOUNT_ACTIVE
+        status = ACCOUNT_PENDING if role in ("cobrador", "cajero") else ACCOUNT_ACTIVE
 
-        # Fechas de acceso (solo cobradores). Se guardan incluso si queda pendiente.
+        # Fechas de acceso (solo cobradores/cajeros). Se guardan incluso si queda pendiente.
         fecha_inicio = None
         fecha_fin = None
-        if role == "cobrador":
+        if role in ("cobrador", "cajero"):
             raw_inicio = (request.form.get("fecha_inicio") or "").strip()
             raw_fin = (request.form.get("fecha_fin") or "").strip()
             today = date.today()
@@ -1222,9 +1295,9 @@ def new_user():
         f'<label>Usuario</label><input name="username" required>'
         f'<label>Contraseña</label><input type="password" name="password" required>'
         f'<label>Teléfono</label><input name="phone">'
-        f'<label>Rol</label><select name="role"><option value="cobrador">Cobrador (queda pendiente)</option><option value="supervisor">Supervisor</option></select>'
-        f'<label>Fecha inicio (cobradores)</label><input name="fecha_inicio" type="date" value="{date.today().strftime("%Y-%m-%d")}">'
-        f'<label>Fecha fin (cobradores)</label><input name="fecha_fin" type="date" value="{(date.today()+timedelta(days=30)).strftime("%Y-%m-%d")}">'
+        f'<label>Rol</label><select name="role"><option value="cobrador">Cobrador (queda pendiente)</option><option value="cajero">Cajero (queda pendiente)</option><option value="supervisor">Supervisor</option></select>'
+        f'<label>Fecha inicio (cobradores/cajeros)</label><input name="fecha_inicio" type="date" value="{date.today().strftime("%Y-%m-%d")}">'
+        f'<label>Fecha fin (cobradores/cajeros)</label><input name="fecha_fin" type="date" value="{(date.today()+timedelta(days=30)).strftime("%Y-%m-%d")}">'
         f'<label>PIN admin</label><input name="pin" required>'
         f'<button class="btn btn-primary" type="submit">Crear</button></form></div>'
     )
@@ -1310,9 +1383,15 @@ def clients():
         f"<td><a class='btn btn-secondary' href='{url_for('client_detail', client_id=c['id'])}'>Ver</a></td></tr>"
         for c in rows
     )
+    new_client_btn = (
+        f'<a class="btn btn-primary" href="{url_for("new_client")}">Nuevo cliente</a>'
+        if can_admin_actions(user)
+        else ""
+    )
     body = (
         f'<div class="card"><h2>Clientes</h2><div class="table-scroll"><table><tr><th>Nombre</th><th>Tel</th><th></th></tr>{t}</table></div>'
-        f'<a class="btn btn-primary" href="{url_for("new_client")}">Nuevo cliente</a></div>'
+        + new_client_btn
+        + "</div>"
     )
     return page(body)
 
@@ -1322,6 +1401,9 @@ def clients():
 def new_client():
     user = current_user()
     ensure_org()
+    if not can_admin_actions(user):
+        flash("Acción restringida: solo admin puede crear clientes.", "danger")
+        return redirect(url_for("clients"))
     if request.method == "POST":
         first = (request.form.get("first_name") or "").strip()
         if not first:
@@ -1363,8 +1445,13 @@ def edit_client(client_id):
         flash("No encontrado.", "danger")
         return redirect(url_for("clients"))
     user = current_user()
-    if user["role"] == "cobrador" and c.get("created_by") != user["id"] and not is_cartera_admin(user):
+    ensure_org()
+    oid = session.get("org_id")
+    if c.get("organization_id") != oid:
         flash("Sin acceso.", "danger")
+        return redirect(url_for("clients"))
+    if not can_admin_actions(user):
+        flash("Acción restringida: solo admin puede editar clientes.", "danger")
         return redirect(url_for("clients"))
     if request.method == "POST":
         c["first_name"] = (request.form.get("first_name") or "").strip()
@@ -1392,9 +1479,21 @@ def edit_client(client_id):
 @app.route("/clients/<int:client_id>/delete", methods=["POST"])
 @login_required
 def delete_client(client_id):
+    ensure_org()
+    oid = session.get("org_id")
+    c = store.clients.get(client_id)
+    if not c or c.get("organization_id") != oid:
+        flash("Cliente no encontrado.", "danger")
+        return redirect(url_for("clients"))
+    u = current_user()
+    if not can_admin_actions(u):
+        flash("Acción restringida: solo admin puede eliminar clientes.", "danger")
+        return redirect(url_for("clients"))
+
     store.clients.pop(client_id, None)
-    for lid in [x for x, L in store.loans.items() if L.get("client_id") == client_id]:
-        store.loans.pop(lid, None)
+    for lid, L in list(store.loans.items()):
+        if L.get("organization_id") == oid and L.get("client_id") == client_id:
+            store.loans.pop(lid, None)
     flash("Cliente eliminado.", "success")
     return redirect(url_for("clients"))
 
@@ -1408,8 +1507,8 @@ def client_detail(client_id):
         flash("No encontrado.", "danger")
         return redirect(url_for("clients"))
     user = current_user()
-    can_admin = user.get("role") == "admin" or is_cartera_admin(user)
-    if user["role"] == "cobrador" and c.get("created_by") != user["id"] and not is_cartera_admin(user):
+    can_admin = can_admin_actions(user)
+    if is_cajero_role(user) and c.get("created_by") != user["id"] and not is_cartera_admin(user):
         flash("Sin acceso.", "danger")
         return redirect(url_for("clients"))
     org_id = session.get("org_id")
@@ -1688,30 +1787,10 @@ def client_detail(client_id):
     full_name = f"{c.get('first_name') or ''} {c.get('last_name') or ''}".strip() or f"Cliente #{client_id}"
     avatar_letter = (c.get("first_name") or full_name[:1] or "?").strip()[:1].upper()
 
-    header = (
-        f"""
-        <div class="client-hero client-card data-animate" data-animate="1">
-          <div class="client-hero-left">
-            <div class="client-avatar" aria-hidden="true">{html.escape(avatar_letter)}</div>
-            <div>
-              <div class="client-name">{html.escape(full_name)}</div>
-              <div class="client-lines">
-                <div class="client-line"><span class="ic" aria-hidden="true">
-                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 16.92v3a2 2 0 0 1-2.18 2A19.8 19.8 0 0 1 3 5.18 2 2 0 0 1 5.11 3h3a2 2 0 0 1 2 1.72c.12.86.31 1.7.57 2.5a2 2 0 0 1-.45 2.11L9.09 10.91a16 16 0 0 0 4 4l1.58-1.12a2 2 0 0 1 2.11-.45c.8.26 1.64.45 2.5.57A2 2 0 0 1 22 16.92z"/></svg>
-                </span><span class="txt"><b>Tel:</b> {html.escape(str(c.get('phone') or '—'))}</span></div>
-                <div class="client-line"><span class="ic" aria-hidden="true">
-                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 21s-7-4.35-7-11a7 7 0 0 1 14 0c0 6.65-7 11-7 11z"/><circle cx="12" cy="10" r="2"/></svg>
-                </span><span class="txt"><b>Dirección:</b> {html.escape(str(c.get('address') or '—'))}</span></div>
-                <div class="client-line"><span class="ic" aria-hidden="true">
-                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15V3a2 2 0 0 0-2-2H7a2 2 0 0 0-2 2v18a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2z"/><path d="M3 15h18"/><path d="M8 7h5"/><path d="M8 11h7"/></svg>
-                </span><span class="txt"><b>Documento:</b> {html.escape(str(c.get('document_id') or '—'))}</span></div>
-                <div class="client-line"><span class="ic" aria-hidden="true">
-                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 17l6-6 4 4 8-8"/><path d="M14 5h7v7"/></svg>
-                </span><span class="txt"><b>Ruta:</b> {html.escape(str(c.get('route') or '—'))}</span></div>
-              </div>
-            </div>
-          </div>
-
+    # Acciones solo para admin (cajero/cobrador no debe ver operaciones críticas).
+    client_actions_html = ""
+    if can_admin:
+        client_actions_html = f"""
           <div class="client-actions">
             <div class="client-cta-row">
               <a class="btn btn-secondary btn-action" href="{url_for("edit_client", client_id=client_id)}">
@@ -1737,11 +1816,54 @@ def client_detail(client_id):
               </form>
             </div>
           </div>
+        """
+    else:
+        client_actions_html = (
+            '<div class="client-actions">'
+            '<div style="opacity:.85;font-weight:900;font-size:13px;">'
+            'Solo admin puede editar/eliminar o mover clientes.'
+            '</div>'
+            '</div>'
+        )
+
+    header = (
+        f"""
+        <div class="client-hero client-card data-animate" data-animate="1">
+          <div class="client-hero-left">
+            <div class="client-avatar" aria-hidden="true">{html.escape(avatar_letter)}</div>
+            <div>
+              <div class="client-name">{html.escape(full_name)}</div>
+              <div class="client-lines">
+                <div class="client-line"><span class="ic" aria-hidden="true">
+                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 16.92v3a2 2 0 0 1-2.18 2A19.8 19.8 0 0 1 3 5.18 2 2 0 0 1 5.11 3h3a2 2 0 0 1 2 1.72c.12.86.31 1.7.57 2.5a2 2 0 0 1-.45 2.11L9.09 10.91a16 16 0 0 0 4 4l1.58-1.12a2 2 0 0 1 2.11-.45c.8.26 1.64.45 2.5.57A2 2 0 0 1 22 16.92z"/></svg>
+                </span><span class="txt"><b>Tel:</b> {html.escape(str(c.get('phone') or '—'))}</span></div>
+                <div class="client-line"><span class="ic" aria-hidden="true">
+                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 21s-7-4.35-7-11a7 7 0 0 1 14 0c0 6.65-7 11-7 11z"/><circle cx="12" cy="10" r="2"/></svg>
+                </span><span class="txt"><b>Dirección:</b> {html.escape(str(c.get('address') or '—'))}</span></div>
+                <div class="client-line"><span class="ic" aria-hidden="true">
+                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15V3a2 2 0 0 0-2-2H7a2 2 0 0 0-2 2v18a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2z"/><path d="M3 15h18"/><path d="M8 7h5"/><path d="M8 11h7"/></svg>
+                </span><span class="txt"><b>Documento:</b> {html.escape(str(c.get('document_id') or '—'))}</span></div>
+                <div class="client-line"><span class="ic" aria-hidden="true">
+                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 17l6-6 4 4 8-8"/><path d="M14 5h7v7"/></svg>
+                </span><span class="txt"><b>Ruta:</b> {html.escape(str(c.get('route') or '—'))}</span></div>
+              </div>
+            </div>
+          </div>
+
+          {client_actions_html}
         </div>
         """
     )
 
     new_loan_href = url_for("new_loan") + "?client_id=" + str(client_id)
+    new_loan_btn_html = ""
+    if can_admin:
+        new_loan_btn_html = (
+            "<a class=\"btn btn-primary btn-action\" href=\"" + new_loan_href + "\">"
+            "<span class=\"btn-ic\" aria-hidden=\"true\">"
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\" width=\"18\" height=\"18\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M12 5v14\"/><path d=\"M5 12h14\"/></svg>"
+            "</span>Nuevo préstamo</a>"
+        )
     toggle_href = url_for("toggle_theme")
     theme_now = get_theme()
     toggle_label = "Claro" if theme_now == "dark" else "Oscuro"
@@ -1768,10 +1890,7 @@ def client_detail(client_id):
         + "<span class=\"btn-ic\" aria-hidden=\"true\">"
         + "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\" width=\"18\" height=\"18\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z\"/></svg>"
         + "</span>" + toggle_label + "</a>"
-        + "<a class=\"btn btn-primary btn-action\" href=\"" + new_loan_href + "\">"
-        + "<span class=\"btn-ic\" aria-hidden=\"true\">"
-        + "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\" width=\"18\" height=\"18\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M12 5v14\"/><path d=\"M5 12h14\"/></svg>"
-        + "</span>Nuevo préstamo</a>"
+        + new_loan_btn_html
         + "</div>"
         + "<div class=\"table-scroll\" style=\"margin-top:12px;\">"
         + "<table class=\"client-table\">"
@@ -1992,7 +2111,7 @@ def loans():
 <div class="loans-page-wrap">
   <h1 class="loans-page-title">📋 Lista de Préstamos</h1>
   <div class="loans-toolbar">
-    <a class="btn-loan-new" href="{url_for("new_loan")}">👤➕ Nuevo préstamo</a>
+    {('<a class="btn-loan-new" href="' + url_for("new_loan") + '">👤➕ Nuevo préstamo</a>') if can_admin_actions(user) else ''}
     {filter_block}
   </div>
   <div class="loans-summary">
@@ -2015,6 +2134,9 @@ def loans():
 def new_loan():
     ensure_org()
     user = current_user()
+    if not can_admin_actions(user):
+        flash("Acción restringida: solo admin puede crear préstamos.", "danger")
+        return redirect(url_for("loans"))
     org_id = session.get("org_id")
     clist = clients_for_user(org_id, user)
     if request.method == "POST":
@@ -2198,14 +2320,22 @@ def edit_loan(loan_id):
 @app.route("/loan/<int:loan_id>")
 @login_required
 def loan_detail(loan_id):
+    ensure_org()
+    oid = session.get("org_id")
     L = store.loans.get(loan_id)
     if not L:
         flash("No encontrado.", "danger")
         return redirect(url_for("loans"))
+    if L.get("organization_id") != oid:
+        flash("Sin acceso.", "danger")
+        return redirect(url_for("loans"))
+    u = current_user()
+    if not scope_owns_loan(u, L):
+        flash("Sin acceso.", "danger")
+        return redirect(url_for("loans"))
     client_id = L.get("client_id")
     client = store.clients.get(client_id, {})
     pays = [p for p in store.payments.values() if p.get("loan_id") == loan_id]
-    u = current_user()
     can_admin = u.get("role") == "admin" or is_cartera_admin(u)
     edit_btn = (
         f'<a class="btn btn-secondary" href="{url_for("edit_loan", loan_id=loan_id)}">✏️ Editar</a>'
@@ -2501,9 +2631,18 @@ def loan_detail(loan_id):
 @app.route("/payment/new/<int:loan_id>", methods=["GET", "POST"])
 @login_required
 def new_payment(loan_id):
+    ensure_org()
+    oid = session.get("org_id")
     L = store.loans.get(loan_id)
     if not L:
         flash("Préstamo no encontrado.", "danger")
+        return redirect(url_for("loans"))
+    if L.get("organization_id") != oid:
+        flash("Sin acceso.", "danger")
+        return redirect(url_for("loans"))
+    u = current_user()
+    if not scope_owns_loan(u, L):
+        flash("Sin acceso.", "danger")
         return redirect(url_for("loans"))
     # Monto recomendado para "cuota" (para precargar el formulario).
     term_count = int(L.get("term_count") or 1)
@@ -2644,7 +2783,7 @@ def print_payment(payment_id):
         return "Préstamo no encontrado", 404
     if L.get("organization_id") != oid:
         return "Sin acceso.", 403
-    if user.get("role") == "cobrador" and not is_cartera_admin(user) and L.get("created_by") != user.get("id"):
+    if user_is_cobrador_limited(user) and L.get("created_by") != user.get("id"):
         return "Sin acceso.", 403
 
     cid = L.get("client_id")
@@ -2823,16 +2962,20 @@ def undo_payment(loan_id):
 def bank_home():
     ensure_org()
     user = current_user()
-    tiles = (
+    adminish = can_admin_actions(user)
+    tiles_base = (
         f'<a href="{url_for("bank_daily_list")}" class="bank-tile blue">🗓️ Lista diaria</a>'
+        f'<a href="{url_for("bank_late")}" class="bank-tile orange">🔥 Atrasos</a>'
+    )
+    tiles_admin = (
         f'<a href="{url_for("bank_delivery")}" class="bank-tile green2">💰 Entrega</a>'
         f'<a href="{url_for("bank_expenses")}" class="bank-tile red">📓 Gastos</a>'
         f'<a href="{url_for("bank_acta")}" class="bank-tile yellow">💸 Descuento inicial</a>'
         f'<a href="{url_for("bank_routes_list")}" class="bank-tile teal">🏦 Capital por ruta</a>'
         f'<a href="{url_for("bank_advance")}" class="bank-tile lavender">💵 Adelantos</a>'
         f'<a href="{url_for("bank_legal_list")}" class="bank-tile purple">📜 Documento legal</a>'
-        f'<a href="{url_for("bank_late")}" class="bank-tile orange">🔥 Atrasos</a>'
-    )
+    ) if adminish else ""
+    tiles = tiles_base + tiles_admin
     bottom = (
         f'<a href="{url_for("collector_map")}" class="bank-tile bank-tile-full teal2">📍 Ver ubicación cobrador</a>'
     )
@@ -3386,7 +3529,7 @@ def super_admin_panel():
         role = (role or "").strip().lower()
         if role == "admin":
             return '<span class="sa-pill sa-ink">admin</span>'
-        if role == "cobrador":
+        if role in ("cobrador", "cajero"):
             return '<span class="sa-pill sa-amber">cobrador</span>'
         return f'<span class="sa-pill sa-muted">{esc(role)}</span>'
 
@@ -3399,7 +3542,7 @@ def super_admin_panel():
         pending_c = sum(
             1
             for u in store.users.values()
-            if u.get("role") == "cobrador"
+            if u.get("role") in ("cobrador", "cajero")
             and u.get("organization_id") == aid
             and u.get("account_status") == ACCOUNT_PENDING
         )
@@ -3976,31 +4119,369 @@ def super_admin_stats():
 def reportes():
     ensure_org()
     oid = session.get("org_id")
-    total_gastos_ruta = round(
-        sum(float(e.get("amount") or 0) for e in store.route_expenses.values() if e.get("organization_id") == oid),
-        2,
-    )
+    today = date.today()
+
+    def parse_date(raw):
+        raw = (raw or "").strip()
+        if not raw:
+            return None
+        try:
+            return datetime.strptime(raw, "%Y-%m-%d").date()
+        except ValueError:
+            return None
+
+    dt_from = parse_date(request.args.get("desde"))
+    dt_to = parse_date(request.args.get("hasta"))
+    if dt_from is None and dt_to is None:
+        dt_from = today - timedelta(days=29)
+        dt_to = today
+
+    # Helpers para bucket por día o mes.
+    days_span = (dt_to - dt_from).days if (dt_from and dt_to) else 0
+    bucket_by = "day" if days_span <= 31 else "month"
+
+    def bucket_key_day(d):
+        return d.isoformat()
+
+    def bucket_key_month(d):
+        return f"{d.year}-{d.month:02d}"
+
+    def bkey(d):
+        return bucket_key_day(d) if bucket_by == "day" else bucket_key_month(d)
+
+    def build_series(map_amounts, labels):
+        return [round(float(map_amounts.get(lb) or 0), 2) for lb in labels]
+
+    # Alcance por tenant (org)
+    loans_tenant = [L for L in store.loans.values() if L.get("organization_id") == oid]
+    clients_tenant = [c for c in store.clients.values() if c.get("organization_id") == oid]
+    total_prestamos = len(loans_tenant)
+    total_clientes = len(clients_tenant)
+
+    # Banco (actual)
     banco_disp = get_bank_available(oid)
-    descuento_income = round(
+
+    # Gastos de ruta en rango por fecha
+    route_expenses = [
+        e
+        for e in store.route_expenses.values()
+        if e.get("organization_id") == oid
+        and e.get("created_at") is not None
+        and (dt_from <= e.get("created_at").date() <= dt_to)
+    ]
+    gastos_ruta_total = round(sum(float(e.get("amount") or 0) for e in route_expenses), 2)
+
+    # Descuentos iniciales en rango por fecha
+    descuento_income_total = round(
         sum(
             float(cr.get("amount") or 0)
             for cr in store.cash_reports.values()
-            if cr.get("organization_id") == oid and cr.get("movement_type") == "descuento_inicial"
+            if cr.get("organization_id") == oid
+            and cr.get("movement_type") == "descuento_inicial"
+            and cr.get("date") is not None
+            and (dt_from <= cr.get("date") <= dt_to)
         ),
         2,
     )
-    body = (
-        f'<div class="card"><h2>📊 Reportes</h2>'
-        f'<a class="btn btn-secondary" href="{url_for("reportes_cobradores")}">Por cobrador</a> '
-        f'<a class="btn btn-secondary" href="{url_for("dashboard")}">Dashboard</a>'
-        f'<div style="margin-top:12px">'
-        f'<p><b>Banco disponible:</b> {fmt_money(banco_disp)}</p>'
-        f'<p><b>Gastos de ruta (total):</b> {fmt_money(total_gastos_ruta)}</p>'
-        f'<p><b>Ingreso por descuentos iniciales:</b> {fmt_money(descuento_income)}</p>'
-        f'</div>'
-        f"<p>Préstamos: {len(store.loans)} · Clientes: {len(store.clients)}</p></div>"
+
+    # Serie labels (día o mes) dentro del rango
+    labels = []
+    if bucket_by == "day":
+        d = dt_from
+        while d <= dt_to:
+            labels.append(bkey(d))
+            d += timedelta(days=1)
+    else:
+        y, m = dt_from.year, dt_from.month
+        cur = date(y, m, 1)
+        while cur <= dt_to:
+            labels.append(bkey(cur))
+            # siguiente mes
+            if cur.month == 12:
+                cur = date(cur.year + 1, 1, 1)
+            else:
+                cur = date(cur.year, cur.month + 1, 1)
+
+    ingresos_by_bucket = {}
+    for cr in store.cash_reports.values():
+        if (
+            cr.get("organization_id") == oid
+            and cr.get("movement_type") == "descuento_inicial"
+            and cr.get("date") is not None
+            and dt_from <= cr.get("date") <= dt_to
+        ):
+            ingresos_by_bucket[bkey(cr.get("date"))] = ingresos_by_bucket.get(bkey(cr.get("date")), 0) + float(
+                cr.get("amount") or 0
+            )
+
+    gastos_by_bucket = {}
+    for e in route_expenses:
+        d = e.get("created_at").date()
+        gastos_by_bucket[bkey(d)] = gastos_by_bucket.get(bkey(d), 0) + float(e.get("amount") or 0)
+
+    # Préstamos entregados vs cobros (pagos) por bucket.
+    prestamos_by_bucket = {}
+    for cr in store.cash_reports.values():
+        if (
+            cr.get("organization_id") == oid
+            and cr.get("movement_type") == "prestamo_entregado"
+            and cr.get("date") is not None
+            and dt_from <= cr.get("date") <= dt_to
+        ):
+            prestamos_by_bucket[bkey(cr.get("date"))] = prestamos_by_bucket.get(bkey(cr.get("date")), 0) + float(
+                cr.get("amount") or 0
+            )
+
+    # Cobros: pagos de préstamos dentro del rango del tenant.
+    cobros_by_bucket = {}
+    def loan_org_ok(loan_id):
+        L = store.loans.get(loan_id) if loan_id is not None else None
+        return bool(L and L.get("organization_id") == oid)
+
+    for p in store.payments.values():
+        pd = p.get("date")
+        if pd is None:
+            continue
+        if not (dt_from <= pd <= dt_to):
+            continue
+        if not loan_org_ok(p.get("loan_id")):
+            continue
+        cobros_by_bucket[bkey(pd)] = cobros_by_bucket.get(bkey(pd), 0) + float(p.get("amount") or 0)
+
+    ingresos_series = build_series(ingresos_by_bucket, labels)
+    gastos_series = build_series(gastos_by_bucket, labels)
+    prestamos_series = build_series(prestamos_by_bucket, labels)
+    cobros_series = build_series(cobros_by_bucket, labels)
+
+    charts_js = """
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script>
+function money(v){
+  const n = Number(v || 0);
+  return 'RD$ ' + n.toLocaleString('es-DO', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+const labels = LABELS;
+const ingresos = INGRESOS;
+const gastos = GASTOS;
+const prestamos = PRESTAMOS;
+const cobros = COBROS;
+
+function build(){
+  const incomeCtx = document.getElementById('chartIngresosGastos');
+  const loansCtx = document.getElementById('chartPrestamosCobros');
+  if(incomeCtx){
+    new Chart(incomeCtx, {
+      type: 'line',
+      data: {
+        labels: labels,
+        datasets: [{
+          label: 'Ingresos (descuento inicial)',
+          data: ingresos,
+          borderColor: 'rgba(37,99,235,1)',
+          backgroundColor: 'rgba(37,99,235,.15)',
+          tension: 0.3,
+          fill: true,
+          pointRadius: 2
+        },{
+          label: 'Gastos de ruta',
+          data: gastos,
+          borderColor: 'rgba(239,68,68,1)',
+          backgroundColor: 'rgba(239,68,68,.12)',
+          tension: 0.3,
+          fill: true,
+          pointRadius: 2
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: { legend: { display: true } },
+        scales: { y: { beginAtZero: true, ticks: { callback: (v)=>money(v) } } }
+      }
+    });
+  }
+  if(loansCtx){
+    new Chart(loansCtx, {
+      type: 'bar',
+      data: {
+        labels: labels,
+        datasets: [{
+          label: 'Préstamos (entregados)',
+          data: prestamos,
+          backgroundColor: 'rgba(99,102,241,.35)',
+          borderColor: 'rgba(99,102,241,1)',
+          borderWidth: 1
+        },{
+          label: 'Cobros (pagos)',
+          data: cobros,
+          backgroundColor: 'rgba(16,185,129,.25)',
+          borderColor: 'rgba(16,185,129,1)',
+          borderWidth: 1
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: { legend: { display: true } },
+        scales: { y: { beginAtZero: true, ticks: { callback: (v)=>money(v) } } }
+      }
+    });
+  }
+}
+window.addEventListener('load', build);
+</script>
+"""
+    charts_js = (
+        charts_js.replace("LABELS", json.dumps(labels))
+        .replace("INGRESOS", json.dumps(ingresos_series))
+        .replace("GASTOS", json.dumps(gastos_series))
+        .replace("PRESTAMOS", json.dumps(prestamos_series))
+        .replace("COBROS", json.dumps(cobros_series))
     )
-    return page(body)
+
+    # Mini-modo dark visual para las tarjetas del dashboard.
+    dashboard_css = """
+<style>
+  .rep-wrap{max-width:1080px;margin:0 auto;padding:12px 0 26px}
+  .rep-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap}
+  .rep-title{font-size:20px;font-weight:1000;margin:0}
+  .rep-sub{opacity:.88;font-weight:800;font-size:13px;margin-top:6px}
+  .rep-actions{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+
+  .rep-grid{display:grid;grid-template-columns:repeat(12,1fr);gap:12px;margin-top:12px}
+  .rep-card{grid-column: span 12; background:rgba(255,255,255,.92);border:1px solid rgba(148,163,184,.25);border-radius:18px;box-shadow:0 10px 24px rgba(0,0,0,.06);padding:14px;transition: transform .14s ease, box-shadow .14s ease}
+  .rep-card:hover{transform: translateY(-2px);box-shadow:0 14px 34px rgba(0,0,0,.09)}
+  body.theme-dark .rep-card{background:rgba(15,23,42,.92);border-color:rgba(148,163,184,.18);box-shadow:0 14px 34px rgba(0,0,0,.32)}
+
+  @media(min-width:720px){.rep-card{grid-column: span 6}}
+  @media(min-width:980px){.rep-card{grid-column: span 4}}
+
+  .rep-card-top{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}
+  .rep-ico{width:40px;height:40px;border-radius:14px;display:flex;align-items:center;justify-content:center;background:rgba(148,163,184,.18);border:1px solid rgba(148,163,184,.25);color:#0f172a}
+  body.theme-dark .rep-ico{color:#e5e7eb}
+  .rep-k{opacity:.8;font-weight:900;font-size:12px;margin-top:4px}
+  .rep-v{font-size:28px;font-weight:1000;margin-top:6px;letter-spacing:-.02em}
+
+  .tone-green{background:rgba(16,185,129,.12)!important;border-color:rgba(16,185,129,.25)!important}
+  .tone-red{background:rgba(239,68,68,.10)!important;border-color:rgba(239,68,68,.22)!important}
+  .tone-blue{background:rgba(37,99,235,.10)!important;border-color:rgba(37,99,235,.22)!important}
+  .tone-purple{background:rgba(124,58,237,.10)!important;border-color:rgba(124,58,237,.22)!important}
+
+  .rep-charts{display:grid;grid-template-columns:1fr;gap:12px;margin-top:14px}
+  @media(min-width:920px){.rep-charts{grid-template-columns:1fr 1fr}}
+  .rep-chart-card{background:rgba(255,255,255,.92);border:1px solid rgba(148,163,184,.25);border-radius:18px;box-shadow:0 10px 24px rgba(0,0,0,.06);padding:14px}
+  body.theme-dark .rep-chart-card{background:rgba(15,23,42,.92);border-color:rgba(148,163,184,.18);box-shadow:0 14px 34px rgba(0,0,0,.32)}
+  .rep-chart-title{font-weight:1000;margin:0 0 10px 0;font-size:14px}
+  .rep-canvas-wrap{height:260px}
+
+  .rep-filter{display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap;justify-content:flex-end}
+  .rep-filter label{font-weight:900;font-size:12px;opacity:.9}
+  .rep-input{padding:10px 10px;border-radius:12px;border:1px solid rgba(148,163,184,.35);background:rgba(255,255,255,.8);color:#0f172a;font-weight:800}
+  body.theme-dark .rep-input{background:rgba(2,6,23,.55);color:#e5e7eb}
+
+  .rep-badge-soft{display:inline-flex;align-items:center;gap:8px;border-radius:999px;padding:6px 10px;border:1px solid rgba(148,163,184,.25);background:rgba(255,255,255,.55);font-weight:1000;opacity:.95}
+  body.theme-dark .rep-badge-soft{background:rgba(2,6,23,.35)}
+
+  [data-rep-anim]{opacity:0;transform: translateY(10px);transition: opacity .35s ease, transform .35s ease}
+  [data-rep-anim].in{opacity:1;transform: translateY(0)}
+</style>
+"""
+    # Botones modernos con íconos.
+    html = (
+        dashboard_css
+        + "<div class='rep-wrap'>"
+        + "<div class='rep-head'>"
+        + "<div>"
+        + "<h2 class='rep-title'>📊 Reportes</h2>"
+        + "<div class='rep-sub'>Dashboard financiero con filtros y gráficos</div>"
+        + "</div>"
+        + "<div class='rep-actions'>"
+        + "<div class='rep-filter no-print'>"
+        + "<form method='get' style='display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end'>"
+        + "<div>"
+        + "<label>Desde</label>"
+        + f"<input class='rep-input' type='date' name='desde' value='{(dt_from.isoformat() if dt_from else '')}'>"
+        + "</div>"
+        + "<div>"
+        + "<label>Hasta</label>"
+        + f"<input class='rep-input' type='date' name='hasta' value='{(dt_to.isoformat() if dt_to else '')}'>"
+        + "</div>"
+        + "<button class='btn btn-primary btn-action' type='submit'><span class='btn-ic' aria-hidden='true'>"
+        + "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' width='18' height='18' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M21 10c0 8-6 13-9 13s-9-5-9-13a9 9 0 0 1 18 0z'/><circle cx='12' cy='10' r='2'/></svg>"
+        + "</span>Filtrar</button>"
+        + "</form>"
+        + "</div>"
+        + f"<a class='btn btn-secondary btn-action' href='{url_for('reportes_cobradores')}'>Por cobrador</a>"
+        + f"<a class='btn btn-secondary btn-action' href='{url_for('dashboard')}'>Dashboard</a>"
+        + "</div>"
+        + "</div>"
+        + "<div class='rep-grid'>"
+        + "<div class='rep-card tone-green' data-rep-anim='1'>"
+        + "<div class='rep-card-top'>"
+        + "<div>"
+        + "<div class='rep-k'>Banco disponible</div>"
+        + f"<div class='rep-v'>{fmt_money(banco_disp)}</div>"
+        + "</div>"
+        + "<div class='rep-ico'>💚</div>"
+        + "</div>"
+        + "</div>"
+        + "<div class='rep-card tone-red' data-rep-anim='1'>"
+        + "<div class='rep-card-top'>"
+        + "<div>"
+        + "<div class='rep-k'>Gastos de ruta</div>"
+        + f"<div class='rep-v'>{fmt_money(gastos_ruta_total)}</div>"
+        + "</div>"
+        + "<div class='rep-ico'>🚗</div>"
+        + "</div>"
+        + "</div>"
+        + "<div class='rep-card tone-blue' data-rep-anim='1'>"
+        + "<div class='rep-card-top'>"
+        + "<div>"
+        + "<div class='rep-k'>Ingreso por descuentos</div>"
+        + f"<div class='rep-v'>{fmt_money(descuento_income_total)}</div>"
+        + "</div>"
+        + "<div class='rep-ico'>💳</div>"
+        + "</div>"
+        + "</div>"
+        + "<div class='rep-card tone-purple' data-rep-anim='1'>"
+        + "<div class='rep-card-top'>"
+        + "<div>"
+        + "<div class='rep-k'>Total préstamos</div>"
+        + f"<div class='rep-v'>{total_prestamos}</div>"
+        + "</div>"
+        + "<div class='rep-ico'>📄</div>"
+        + "</div>"
+        + "</div>"
+        + "<div class='rep-card' data-rep-anim='1' style='grid-column:span 12;background:rgba(255,255,255,.92)'>"
+        + "<div class='rep-card-top'>"
+        + "<div>"
+        + "<div class='rep-k'>Total clientes</div>"
+        + f"<div class='rep-v'>{total_clientes}</div>"
+        + "</div>"
+        + "<div class='rep-ico'>👥</div>"
+        + "</div>"
+        + "</div>"
+        + "</div>"
+        + "<div class='rep-charts'>"
+        + "<div class='rep-chart-card' data-rep-anim='1'>"
+        + "<div class='rep-chart-title'>Ingresos vs Gastos (rango)</div>"
+        + "<div class='rep-canvas-wrap'><canvas id='chartIngresosGastos'></canvas></div>"
+        + "</div>"
+        + "<div class='rep-chart-card' data-rep-anim='1'>"
+        + "<div class='rep-chart-title'>Préstamos vs Cobros (rango)</div>"
+        + "<div class='rep-canvas-wrap'><canvas id='chartPrestamosCobros'></canvas></div>"
+        + "</div>"
+        + "</div>"
+        + charts_js
+        + "<script>"
+        + "document.addEventListener('DOMContentLoaded',()=>{"
+        + "document.querySelectorAll('[data-rep-anim]').forEach(el=>el.classList.add('in'));"
+        + "});"
+        + "</script>"
+        + nav_subfooter()
+        + "</div>"
+    )
+    return page(html)
 
 
 @app.route("/reportes/cobradores", methods=["GET", "POST"])
@@ -4104,10 +4585,26 @@ def collector_map():
             ]
         collectors.sort(key=lambda u: str(u.get("name") or u.get("username") or "").lower())
         rows = ""
+        markers = []
         for c in collectors:
             p = store.gps_positions.get(c.get("id"))
             lat = p.get("lat") if p else None
             lng = p.get("lng") if p else None
+            try:
+                lat_f = float(lat) if lat is not None else None
+                lng_f = float(lng) if lng is not None else None
+            except Exception:
+                lat_f, lng_f = None, None
+
+            if lat_f is not None and lng_f is not None:
+                markers.append(
+                    {
+                        "name": c.get("name") or c.get("username") or f"#{c.get('id')}",
+                        "lat": lat_f,
+                        "lng": lng_f,
+                        "ts": (p.get("ts").isoformat() if p and p.get("ts") else None),
+                    }
+                )
             rows += (
                 "<tr>"
                 f"<td>{html.escape(str(c.get('name') or c.get('username') or '—'))}</td>"
@@ -4129,8 +4626,26 @@ def collector_map():
             f"{table}"
         )
     else:
-        extra = f"<p>{('Última posición registrada: ' + str(me_pos.get('ts')) ) if me_pos else 'Sin posición (activa GPS en el navegador).'} </p>" \
+        extra = (
+            f"<p>{('Última posición registrada: ' + str(me_pos.get('ts')) ) if me_pos else 'Sin posición (activa GPS en el navegador).'} </p>"
             f"<p style='margin-top:6px;opacity:.9;font-size:14px'>Abre el mapa para registrar tu ubicación automáticamente.</p>"
+        )
+        markers = []
+        if me_pos:
+            try:
+                lat_f = float(me_pos.get("lat"))
+                lng_f = float(me_pos.get("lng"))
+            except Exception:
+                lat_f = lng_f = None
+            if lat_f is not None and lng_f is not None:
+                markers.append(
+                    {
+                        "name": user.get("name") or user.get("username") or "Yo",
+                        "lat": lat_f,
+                        "lng": lng_f,
+                        "ts": (me_pos.get("ts").isoformat() if me_pos.get("ts") else None),
+                    }
+                )
 
     js = """
     <script>
@@ -4166,12 +4681,56 @@ def collector_map():
     </script>
     """
 
+    markers_json = json.dumps(markers or [])
+    map_ui = (
+        "<link rel='stylesheet' href='https://unpkg.com/leaflet@1.9.4/dist/leaflet.css' />"
+        "<div id='collectorMap' style='height:360px;border-radius:16px;overflow:hidden;border:1px solid rgba(148,163,184,.35);box-shadow:0 10px 24px rgba(0,0,0,.06);'></div>"
+    )
+    map_js = """
+    <script>
+      const markers = MARKERS_JSON;
+      function fmtTsISO(ts){
+        if(!ts) return '—';
+        try{
+          const d = new Date(ts);
+          return d.toLocaleString('es-DO');
+        }catch(e){ return ts; }
+      }
+      function initMap(){
+        if(typeof L === 'undefined') return;
+        const defaultCenter = [18.4861, -69.9312]; // RD (aprox.)
+        const has = Array.isArray(markers) && markers.length > 0;
+        const center = has ? [markers[0].lat, markers[0].lng] : defaultCenter;
+        const map = L.map('collectorMap').setView(center, has ? 12 : 6);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+          maxZoom: 18,
+          attribution: '&copy; OpenStreetMap'
+        }).addTo(map);
+        if(!has) return;
+        markers.forEach(m => {
+          if(m && typeof m.lat === 'number' && typeof m.lng === 'number'){
+            const popup = `<b>${m.name || '—'}</b><br/>` +
+              `Lat: ${m.lat}<br/>Lng: ${m.lng}<br/>` +
+              `Actualizado: ${fmtTsISO(m.ts)}`;
+            L.marker([m.lat, m.lng]).addTo(map).bindPopup(popup);
+          }
+        });
+      }
+      window.addEventListener('load', initMap);
+    </script>
+    <script src='https://unpkg.com/leaflet@1.9.4/dist/leaflet.js'></script>
+    """
+    map_js = map_js.replace("MARKERS_JSON", markers_json)
+
     body = (
         "<div class='card'>"
         "<h2>Mapa cobrador</h2>"
-        f"{extra}"
-        f"{js}"
-        "</div>"
+        + "<div style='display:flex;gap:14px;flex-wrap:wrap;align-items:flex-start'>"
+        + "<div style='flex:1 1 520px;min-width:320px'>" + map_ui + map_js + "</div>"
+        + "<div style='flex:0 1 380px;min-width:300px'>" + extra + "</div>"
+        + "</div>"
+        + js
+        + "</div>"
     )
     return page(body)
 
@@ -4247,6 +4806,9 @@ def bank_legal_list():
     ensure_org()
     oid = session.get("org_id")
     user = current_user()
+    if not can_admin_actions(user):
+        flash("Acción restringida: solo admin puede ver documentos legales.", "danger")
+        return redirect(url_for("bank_home"))
     rows = []
 
     for L in sorted(loans_for_user(oid, user), key=lambda x: -x.get("id", 0))[:200]:
@@ -4293,9 +4855,8 @@ def view_legal_document(loan_id):
     if not loan or loan.get("organization_id") != oid:
         flash("Préstamo no encontrado.", "danger")
         return redirect(url_for("bank_legal_list"))
-    # Control de acceso para cobradores.
-    if current_user().get("role") == "cobrador" and not (is_cartera_admin(current_user()) or loan.get("created_by") == current_user()["id"]):
-        flash("Sin acceso.", "danger")
+    if not can_admin_actions(current_user()):
+        flash("Acción restringida: solo admin puede ver documentos legales.", "danger")
         return redirect(url_for("bank_legal_list"))
 
     client = store.clients.get(loan.get("client_id"), {})
@@ -4591,9 +5152,9 @@ def upload_id_front(loan_id):
     if not loan or loan.get("organization_id") != oid:
         flash("Préstamo no encontrado.", "danger")
         return redirect(url_for("bank_legal_list"))
-    if current_user().get("role") == "cobrador" and not (is_cartera_admin(current_user()) or loan.get("created_by") == current_user()["id"]):
-        flash("Sin acceso.", "danger")
-        return redirect(url_for("bank_legal_list"))
+    if not can_admin_actions(current_user()):
+        flash("Acción restringida: solo admin puede gestionar documentos legales.", "danger")
+        return redirect(url_for("bank_home"))
 
     f = request.files.get("id_front")
     if not f:
@@ -4620,9 +5181,9 @@ def upload_id_back(loan_id):
     if not loan or loan.get("organization_id") != oid:
         flash("Préstamo no encontrado.", "danger")
         return redirect(url_for("bank_legal_list"))
-    if current_user().get("role") == "cobrador" and not (is_cartera_admin(current_user()) or loan.get("created_by") == current_user()["id"]):
-        flash("Sin acceso.", "danger")
-        return redirect(url_for("bank_legal_list"))
+    if not can_admin_actions(current_user()):
+        flash("Acción restringida: solo admin puede gestionar documentos legales.", "danger")
+        return redirect(url_for("bank_home"))
 
     f = request.files.get("id_back")
     if not f:
@@ -4653,9 +5214,9 @@ def sign_legal_document(loan_id):
             flash("Préstamo no encontrado.", "danger")
             return redirect(url_for("bank_legal_list"))
 
-        if current_user().get("role") == "cobrador" and not (is_cartera_admin(current_user()) or loan.get("created_by") == current_user()["id"]):
-            flash("Sin acceso.", "danger")
-            return redirect(url_for("bank_legal_list"))
+        if not can_admin_actions(current_user()):
+            flash("Acción restringida: solo admin puede firmar documentos legales.", "danger")
+            return redirect(url_for("bank_home"))
 
         sig = request.form.get("signature_b64")
         if not sig or not str(sig).startswith("data:"):
@@ -4676,6 +5237,9 @@ def bank_advance():
     ensure_org()
     oid = session.get("org_id")
     user = current_user()
+    if not can_admin_actions(user):
+        flash("Acción restringida: solo admin puede ver/gestionar adelantos.", "danger")
+        return redirect(url_for("bank_home"))
     can_del = user.get("role") == "admin" or is_cartera_admin(user)
 
     def payment_ts(p):
@@ -4827,13 +5391,22 @@ def bank_daily_list():
 def bank_expenses():
     ensure_org()
     oid = session.get("org_id")
+    u = current_user()
+    if not can_admin_actions(u):
+        flash("Acción restringida: solo admin puede registrar gastos de ruta.", "danger")
+        return redirect(url_for("bank_home"))
+    restrict = False
 
     kind_options = "".join(
         f'<option value="{k}">{ico} {lbl}</option>' for k, (lbl, ico) in ROUTE_EXPENSE_KINDS.items()
     )
 
     expense_list = sorted(
-        (e for e in store.route_expenses.values() if e.get("organization_id") == oid),
+        (
+            e
+            for e in store.route_expenses.values()
+            if e.get("organization_id") == oid and (not restrict or e.get("user_id") == u.get("id"))
+        ),
         key=lambda x: x.get("created_at") or datetime.min,
         reverse=True,
     )
@@ -4931,6 +5504,15 @@ def delete_route_expense(expense_id):
     if not exp:
         flash("Gasto no encontrado.", "danger")
         return redirect(url_for("bank_expenses"))
+    ensure_org()
+    oid = session.get("org_id")
+    if exp.get("organization_id") != oid:
+        flash("Sin acceso.", "danger")
+        return redirect(url_for("bank_expenses"))
+    u = current_user()
+    if not can_admin_actions(u):
+        flash("Acción restringida: solo admin puede eliminar gastos de ruta.", "danger")
+        return redirect(url_for("bank_expenses"))
     cash_id = exp.get("cash_report_id")
     if cash_id is not None:
         store.cash_reports.pop(cash_id, None)
@@ -4947,6 +5529,10 @@ def edit_expense(expense_id):
     exp = store.route_expenses.get(expense_id)
     if not exp or exp.get("organization_id") != oid:
         flash("Gasto no encontrado.", "danger")
+        return redirect(url_for("bank_expenses"))
+    u = current_user()
+    if not can_admin_actions(u):
+        flash("Acción restringida: solo admin puede editar gastos de ruta.", "danger")
         return redirect(url_for("bank_expenses"))
 
     if request.method == "POST":
@@ -5021,6 +5607,9 @@ def edit_expense(expense_id):
 def add_route_expense():
     ensure_org()
     org_id = session.get("org_id")
+    if not can_admin_actions(current_user()):
+        flash("Acción restringida: solo admin puede registrar gastos de ruta.", "danger")
+        return redirect(url_for("bank_home"))
     route = (request.form.get("route") or "").strip()
     note = (request.form.get("note") or "").strip()
     kind = (request.form.get("tipo") or "otros").strip().lower()
@@ -5078,6 +5667,10 @@ def delete_discount(discount_id):
             break
     if not target:
         flash("Descuento no encontrado.", "danger")
+        return redirect(url_for("bank_acta"))
+    u = current_user()
+    if not can_admin_actions(u):
+        flash("Acción restringida: solo admin puede eliminar descuentos.", "danger")
         return redirect(url_for("bank_acta"))
 
     amount_total = float(target.get("amount") or 0)
@@ -5155,6 +5748,10 @@ def edit_discount(discount_id):
             break
     if not target:
         flash("Préstamo/Descuento no encontrado.", "danger")
+        return redirect(url_for("bank_acta"))
+    u = current_user()
+    if not can_admin_actions(u):
+        flash("Acción restringida: solo admin puede editar descuentos.", "danger")
         return redirect(url_for("bank_acta"))
 
     new_upfront_percent = request.form.get("upfront_percent", type=float)
@@ -5250,7 +5847,7 @@ def bank_delivery():
     oid = session.get("org_id")
     user = current_user()
     puede_registrar_entrega = user.get("role") in ("admin", "supervisor") or is_cartera_admin(user)
-    puede_registrar_devolucion = user.get("role") in ("admin", "supervisor", "cobrador") or is_cartera_admin(user)
+    puede_registrar_devolucion = user.get("role") in ("admin", "supervisor", "cobrador", "cajero") or is_cartera_admin(user)
 
     if request.method == "POST":
         form_type = (request.form.get("form_type") or "entrega").strip().lower()
@@ -5263,7 +5860,7 @@ def bank_delivery():
             amt = request.form.get("amount", type=float)
             note = (request.form.get("note") or "").strip()
             cob = store.users.get(collector_id) if collector_id else None
-            if not cob or cob.get("organization_id") != oid or cob.get("role") != "cobrador":
+            if not cob or cob.get("organization_id") != oid or cob.get("role") not in ("cobrador", "cajero"):
                 flash("Seleccione un cobrador válido.", "danger")
                 return redirect(url_for("bank_delivery"))
             if amt is None or amt <= 0:
@@ -5292,14 +5889,14 @@ def bank_delivery():
             amt = request.form.get("amount", type=float)
             note = (request.form.get("note") or "").strip()
 
-            # Un cobrador solo puede registrar devolución a su nombre (si no es admin/outsider).
-            if user.get("role") == "cobrador" and not is_cartera_admin(user):
+            # Un cobrador/cajero solo puede registrar devolución a su nombre (si no es admin/outsider).
+            if is_cajero_role(user) and not is_cartera_admin(user):
                 collector_id = user["id"]
             else:
                 collector_id = request.form.get("collector_id", type=int)
 
             cob = store.users.get(collector_id) if collector_id else None
-            if not cob or cob.get("organization_id") != oid or cob.get("role") != "cobrador":
+            if not cob or cob.get("organization_id") != oid or cob.get("role") not in ("cobrador", "cajero"):
                 flash("Seleccione un cobrador válido.", "danger")
                 return redirect(url_for("bank_delivery"))
             if amt is None or amt <= 0:
@@ -5334,7 +5931,7 @@ def bank_delivery():
         key=lambda x: x.get("created_at") or datetime.min,
         reverse=True,
     )
-    if user.get("role") == "cobrador" and not is_cartera_admin(user):
+    if is_cajero_role(user) and not is_cartera_admin(user):
         entregas = [e for e in entregas if e.get("collector_id") == user["id"]]
 
     devoluciones = sorted(
@@ -5346,11 +5943,11 @@ def bank_delivery():
         key=lambda x: x.get("created_at") or datetime.min,
         reverse=True,
     )
-    if user.get("role") == "cobrador" and not is_cartera_admin(user):
+    if is_cajero_role(user) and not is_cartera_admin(user):
         devoluciones = [d for d in devoluciones if d.get("collector_id") == user["id"]]
 
     cobradores = sorted(
-        [u for u in store.users.values() if u.get("organization_id") == oid and u.get("role") == "cobrador"],
+        [u for u in store.users.values() if u.get("organization_id") == oid and is_cajero_role(u)],
         key=lambda u: (u.get("name") or u.get("username") or "").lower(),
     )
     opts = "".join(
@@ -5486,6 +6083,11 @@ def bank_delivery_delete(delivery_id):
 def bank_acta():
     ensure_org()
     oid = session.get("org_id")
+    u = current_user()
+    if not can_admin_actions(u):
+        flash("Acción restringida: solo admin puede ver/gestionar el acta (descuentos).", "danger")
+        return redirect(url_for("bank_home"))
+    restrict = False
     # ============================================================
     # Vista tipo "Acta global" (alineada al otro sistema)
     # - Caja global: depósitos + banco inicial (sin incluir préstamos/pagos)
@@ -5496,13 +6098,17 @@ def bank_acta():
     caja_global = float(getattr(store, "starting_banks", {}).get(oid, 0.0) or 0.0) + sum(
         float(cr.get("amount") or 0)
         for cr in store.cash_reports.values()
-        if cr.get("organization_id") == oid and cr.get("movement_type") == "deposito_banco"
+        if cr.get("organization_id") == oid
+        and cr.get("movement_type") == "deposito_banco"
+        and (not restrict or cr.get("user_id") == u.get("id"))
     )
     descuento_total = round(
         sum(
             float(cr.get("amount") or 0)
             for cr in store.cash_reports.values()
-            if cr.get("organization_id") == oid and cr.get("movement_type") == "descuento_inicial"
+            if cr.get("organization_id") == oid
+            and cr.get("movement_type") == "descuento_inicial"
+            and (not restrict or cr.get("user_id") == u.get("id"))
         ),
         2,
     )
@@ -5510,7 +6116,9 @@ def bank_acta():
         sum(
             abs(float(cr.get("amount") or 0))
             for cr in store.cash_reports.values()
-            if cr.get("organization_id") == oid and cr.get("movement_type") == "gasto_ruta"
+            if cr.get("organization_id") == oid
+            and cr.get("movement_type") == "gasto_ruta"
+            and (not restrict or cr.get("user_id") == u.get("id"))
         ),
         2,
     )
@@ -5529,7 +6137,9 @@ def bank_acta():
         (
             cr
             for cr in store.cash_reports.values()
-            if cr.get("organization_id") == oid and cr.get("movement_type") == "descuento_inicial"
+            if cr.get("organization_id") == oid
+            and cr.get("movement_type") == "descuento_inicial"
+            and (not restrict or cr.get("user_id") == u.get("id"))
         ),
         key=lambda x: x.get("created_at") or datetime.min,
         reverse=True,
@@ -5543,6 +6153,8 @@ def bank_acta():
             if L.get("organization_id") == oid and L.get("discount_cash_report_id") == discount_id:
                 loan = L
                 break
+        if restrict and loan and loan.get("created_by") != u.get("id"):
+            continue
         client = store.clients.get((loan or {}).get("client_id"), {}) if loan else {}
         user_id = cr.get("user_id")
         cobrador = store.users.get(user_id, {}).get("username") or "—"
@@ -5612,47 +6224,337 @@ def bank_routes_list():
     ensure_org()
     oid = session.get("org_id")
     user = current_user()
+    if not can_admin_actions(user):
+        flash("Acción restringida: solo admin puede ver Capital por ruta.", "danger")
+        return redirect(url_for("bank_home"))
+    # Filtros (query params)
+    ruta_q = (request.args.get("ruta") or "").strip()
+    prestamista_q = request.args.get("prestamista", type=int)
+
     by_route = {}
+    prestamista_ids = set()
+
     for L in loans_for_user(oid, user):
         if str(L.get("status", "")).upper() != "ACTIVO":
             continue
         c = store.clients.get(L.get("client_id"), {})
         ruta = (c.get("route") or "").strip() or "Sin ruta"
+        cb = L.get("created_by")
+        if cb:
+            prestamista_ids.add(cb)
+
+        if ruta_q and ruta_q != ruta:
+            continue
+        if prestamista_q is not None and prestamista_q != cb:
+            continue
+
         if ruta not in by_route:
             by_route[ruta] = {"remaining": 0.0, "n": 0, "cids": set()}
+
         by_route[ruta]["remaining"] += float(L.get("remaining") or 0)
         by_route[ruta]["n"] += 1
-        cb = L.get("created_by")
         if cb:
             by_route[ruta]["cids"].add(cb)
 
-    tr = ""
-    for ruta in sorted(by_route.keys(), key=lambda x: x.lower()):
-        info = by_route[ruta]
-        names = []
-        for uid in info["cids"]:
-            u = store.users.get(uid, {})
-            names.append(u.get("name") or u.get("username") or str(uid))
-        pres = html.escape(", ".join(sorted(names)) if names else "—")
-        tr += (
-            f"<tr><td>{html.escape(ruta)}</td><td style='text-align:center'>{info['n']}</td>"
-            f"<td style='text-align:right;font-weight:800;color:#15803d'>{html.escape(fmt_money(info['remaining']))}</td>"
-            f"<td>{pres}</td></tr>"
-        )
-
-    total_rest = sum(float(x["remaining"]) for x in by_route.values())
+    total_rest = round(sum(float(x["remaining"]) for x in by_route.values()), 2)
     total_n = sum(int(x["n"]) for x in by_route.values())
 
+    rutas_sorted = sorted(by_route.keys(), key=lambda x: x.lower())
+
+    # Clasificación por tier (alto/medio/bajo) según capital relativo.
+    max_cap = max((float(by_route[r]["remaining"]) for r in rutas_sorted), default=0.0)
+    def tier(rem):
+        if max_cap <= 0:
+            return "low"
+        ratio = rem / max_cap
+        if ratio >= 0.66:
+            return "high"
+        if ratio >= 0.33:
+            return "mid"
+        return "low"
+
+    # Opciones filtro
+    route_options_html = "".join(
+        f"<option value='{html.escape(r)}'{(' selected' if ruta_q == r else '') if ruta_q else (' selected' if False else '')}>{html.escape(r)}</option>"
+        for r in rutas_sorted
+    )
+
+    prest_options = []
+    for uid in sorted(prestamista_ids):
+        u = store.users.get(uid, {})
+        nm = html.escape(u.get("name") or u.get("username") or str(uid))
+        prest_options.append((uid, nm))
+    prest_options_html = "".join(
+        f"<option value='{uid}'{(' selected' if prestamista_q == uid else '')}>{nm}</option>"
+        for uid, nm in prest_options
+    )
+
+    style_block = """
+<style>
+  .routes-wrap{max-width:1080px;margin:0 auto;padding:12px 0 26px}
+  .routes-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap;margin-bottom:14px}
+  .routes-title{font-size:20px;font-weight:1000;margin:0}
+  .routes-sub{opacity:.88;font-weight:800;font-size:13px;margin-top:6px}
+
+  .routes-actions{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+  .btn-ghost{
+    display:inline-flex;align-items:center;gap:8px;padding:10px 12px;border-radius:14px;
+    border:1px solid rgba(148,163,184,.35);
+    background:rgba(255,255,255,.7);
+    text-decoration:none;color:#0f172a;font-weight:1000;
+    transition: transform .12s ease, box-shadow .12s ease, filter .12s ease;
+  }
+  body.theme-dark .btn-ghost{background:rgba(2,6,23,.55);border-color:rgba(148,163,184,.22);color:#e5e7eb}
+  .btn-ghost:hover{transform: translateY(-1px);box-shadow:0 10px 24px rgba(0,0,0,.08);filter:brightness(1.02)}
+  .btn-ghost:active{transform: translateY(0) scale(.99)}
+
+  .routes-grid-metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin:12px 0 16px}
+  .m-card{
+    border-radius:18px;border:1px solid rgba(148,163,184,.25);
+    box-shadow:0 10px 24px rgba(0,0,0,.06);
+    padding:14px;transition: transform .14s ease, box-shadow .14s ease;
+    background: rgba(255,255,255,.92);
+  }
+  body.theme-dark .m-card{background:rgba(15,23,42,.92);border-color:rgba(148,163,184,.18);box-shadow:0 14px 34px rgba(0,0,0,.32)}
+  .m-card:hover{transform: translateY(-2px);box-shadow:0 14px 34px rgba(0,0,0,.10)}
+  .m-top{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}
+  .m-k{opacity:.85;font-weight:900;font-size:12px}
+  .m-v{font-weight:1000;font-size:28px;margin-top:8px}
+  .m-ic{width:40px;height:40px;border-radius:14px;display:flex;align-items:center;justify-content:center}
+  .tone-green{background:linear-gradient(135deg, rgba(16,185,129,.20), rgba(16,185,129,.08))}
+  .tone-red{background:linear-gradient(135deg, rgba(239,68,68,.20), rgba(239,68,68,.08))}
+  .tone-blue{background:linear-gradient(135deg, rgba(37,99,235,.20), rgba(37,99,235,.08))}
+  .tone-purple{background:linear-gradient(135deg, rgba(124,58,237,.20), rgba(124,58,237,.08))}
+
+  .routes-filter{
+    display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;justify-content:flex-end;
+    margin: 6px 0 14px;
+  }
+  .routes-filter label{font-size:12px;font-weight:1000;opacity:.9}
+  .routes-input{
+    padding:10px 10px;border-radius:12px;border:1px solid rgba(148,163,184,.35);
+    background:rgba(255,255,255,.85);color:#0f172a;font-weight:800;
+  }
+  body.theme-dark .routes-input{background:rgba(2,6,23,.55);color:#e5e7eb}
+  .routes-form-btn{
+    display:inline-flex;align-items:center;gap:8px;padding:10px 12px;border-radius:14px;
+    border:none;font-weight:1000;cursor:pointer;background:rgba(16,185,129,.14);color:#047857;
+  }
+  body.theme-dark .routes-form-btn{background:rgba(16,185,129,.12);color:#34d399}
+  .routes-form-btn:hover{filter:brightness(1.04)}
+
+  .routes-cards-grid{
+    display:grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 12px;
+    margin-top: 14px;
+  }
+
+  .route-card{
+    border-radius:18px;
+    border:1px solid rgba(148,163,184,.25);
+    background: rgba(255,255,255,.92);
+    box-shadow:0 10px 24px rgba(0,0,0,.06);
+    padding:14px;
+    transition: transform .14s ease, box-shadow .14s ease, filter .14s ease;
+    position:relative;
+    overflow:hidden;
+  }
+  body.theme-dark .route-card{background:rgba(15,23,42,.92);border-color:rgba(148,163,184,.18);box-shadow:0 14px 34px rgba(0,0,0,.32)}
+  .route-card:hover{transform: translateY(-2px);box-shadow:0 14px 34px rgba(0,0,0,.10);filter:brightness(1.02)}
+  .rc-head{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;margin-bottom:10px}
+  .rc-name{font-weight:1000;font-size:15px}
+  .rc-n{opacity:.88;font-weight:900;font-size:12px;margin-top:4px}
+  .rc-amt{font-weight:1000;font-size:22px;margin-top:6px}
+  .rc-amt.pos{color:#16a34a}
+  .rc-amt.mid{color:#2563eb}
+  .rc-amt.low{color:#a16207}
+  .rc-by{opacity:.9;font-weight:900;font-size:12px;margin-top:10px}
+
+  .chart-card{
+    margin-top: 14px;
+    border-radius:18px;
+    border:1px solid rgba(148,163,184,.25);
+    background:rgba(255,255,255,.92);
+    box-shadow:0 10px 24px rgba(0,0,0,.06);
+    padding:14px;
+  }
+  body.theme-dark .chart-card{background:rgba(15,23,42,.92);border-color:rgba(148,163,184,.18);box-shadow:0 14px 34px rgba(0,0,0,.32)}
+
+  .chart-title{font-weight:1000;margin:0 0 10px 0;font-size:14px}
+
+  [data-r-anim]{opacity:0;transform: translateY(10px);transition: opacity .35s ease, transform .35s ease}
+  [data-r-anim].in{opacity:1;transform: translateY(0)}
+
+</style>
+"""
+
+    # Tarjetas por ruta
+    cards_html = ""
+    bar_labels = []
+    bar_values = []
+    bar_colors = []
+
+    for r in rutas_sorted:
+        info = by_route[r]
+        rem = float(info["remaining"])
+        cb_names = []
+        for uid in info["cids"]:
+            u = store.users.get(uid, {})
+            cb_names.append(u.get("name") or u.get("username") or str(uid))
+        pres = html.escape(", ".join(sorted(cb_names)) if cb_names else "—")
+        tier_v = tier(rem)
+        if tier_v == "high":
+            tone_bg = "rgba(16,185,129,.12)"
+            tone_border = "rgba(16,185,129,.35)"
+            amt_class = "pos"
+            icon_color = "#047857"
+            bar_color = "rgba(16,185,129,.55)"
+        elif tier_v == "mid":
+            tone_bg = "rgba(37,99,235,.10)"
+            tone_border = "rgba(37,99,235,.32)"
+            amt_class = "mid"
+            icon_color = "#1d4ed8"
+            bar_color = "rgba(37,99,235,.50)"
+        else:
+            tone_bg = "rgba(245,158,11,.14)"
+            tone_border = "rgba(245,158,11,.35)"
+            amt_class = "low"
+            icon_color = "#a16207"
+            bar_color = "rgba(245,158,11,.50)"
+
+        cards_html += (
+            "<div class='route-card' data-r-anim='1' "
+            f"style='background:{tone_bg}; border-color:{tone_border}'>"
+            "<div class='rc-head'>"
+            f"<div>"
+            f"<div class='rc-name'>🗺️ {html.escape(r)}</div>"
+            f"<div class='rc-n'>📌 {info['n']} préstamos activos</div>"
+            "</div>"
+            "<div style='width:40px;height:40px;border-radius:14px;display:flex;align-items:center;justify-content:center;"
+            "background:rgba(255,255,255,.55); border:1px solid rgba(148,163,184,.25)'>"
+            f"<span style='color:{icon_color}'>💵</span></div>"
+            "</div>"
+            f"<div class='rc-amt {amt_class}'>{html.escape(fmt_money(rem))}</div>"
+            f"<div class='rc-by'>👤 {pres}</div>"
+            "</div>"
+        )
+
+        bar_labels.append(r)
+        bar_values.append(round(rem, 2))
+        bar_colors.append(bar_color)
+
+    # Totales
+    active_routes = len(rutas_sorted)
+
+    # Gráfica por ruta
+    chart_block = ""
+    if rutas_sorted:
+        labels_json = json.dumps(bar_labels)
+        values_json = json.dumps(bar_values)
+        colors_json = json.dumps(bar_colors)
+        chart_block = (
+            "<div class='chart-card' data-r-anim='1'>"
+            "<div class='chart-title'>📊 Capital por ruta</div>"
+            "<div style='height:260px'><canvas id='routesChart'></canvas></div>"
+            "<script src='https://cdn.jsdelivr.net/npm/chart.js'></script>"
+            "<script>"
+            "const labels = LABELS;"
+            "const values = VALUES;"
+            "const colors = COLORS;"
+            "const ctx = document.getElementById('routesChart');"
+            "if(ctx){"
+            "new Chart(ctx,{type:'bar',data:{labels:labels,datasets:[{label:'Capital activo',data:values,"
+            "backgroundColor:colors,borderColor:colors,borderWidth:1}]},options:{responsive:true,maintainAspectRatio:false,"
+            "plugins:{legend:{display:false}},scales:{y:{beginAtZero:true}}}});"
+            "}"
+            "</script>"
+            "</div>"
+        ).replace("LABELS", labels_json).replace("VALUES", values_json).replace("COLORS", colors_json)
+    else:
+        chart_block = "<div class='chart-card' data-r-anim='1'><div class='chart-title'>📊 Capital por ruta</div><div style='opacity:.85;font-weight:900'>Sin datos</div></div>"
+
+    # HTML filtro
+    filtro_html = (
+        "<form method='get' class='routes-filter no-print'>"
+        "<div>"
+        "<label>Ruta</label>"
+        "<select name='ruta' class='routes-input'>"
+        f"<option value=''>-- Todas --</option>{route_options_html}"
+        "</select>"
+        "</div>"
+        "<div>"
+        "<label>Cobrador</label>"
+        "<select name='prestamista' class='routes-input'>"
+        "<option value=''>-- Todos --</option>" + prest_options_html +
+        "</select>"
+        "</div>"
+        "<button class='routes-form-btn' type='submit'>"
+        "<span style='display:inline-flex;align-items:center;justify-content:center'>🔎</span>Filtrar"
+        "</button>"
+        "</form>"
+    )
+
+    # Tarjetas arriba (totales)
+    # Colors: capital total -> verde/azul/amarillo según tier sobre el máximo global.
+    overall_tier = tier(total_rest)
+    if overall_tier == "high":
+        tone_class = "tone-green"
+    elif overall_tier == "mid":
+        tone_class = "tone-blue"
+    else:
+        tone_class = "tone-red"
+
+    bank_btns = (
+        "<div class='routes-actions no-print'>"
+        f"<a class='btn-ghost' href='{url_for('dashboard')}'><span aria-hidden='true'>📊</span>Dashboard</a>"
+        f"<a class='btn-ghost' href='{url_for('bank_home')}'><span aria-hidden='true'>🏦</span>Banco</a>"
+        "</div>"
+    )
+
+    # Mensaje si no hay rutas
+    empty_cards = (
+        "<div class='route-card' data-r-anim='1'>"
+        "<div class='rc-name'>Sin préstamos activos con ruta</div>"
+        "<div class='rc-n'>Cambia filtros o crea nuevos préstamos.</div>"
+        "</div>"
+    )
+
+    cards_section = cards_html if cards_html else empty_cards
+
     body = (
-        f'<div class="card" style="padding:16px;background:#ecfdf5;border:1px solid rgba(22,163,74,.18)">'
-        f'<h2 style="margin:0 0 8px 0;color:#14532d">🏦 Capital por ruta</h2>'
-        f'<p style="margin:0 0 14px 0;font-size:14px">Saldo vivo (<b>capital pendiente</b>) agrupado por la ruta del cliente.</p>'
-        f'<p style="margin:0 0 12px 0"><b>Total préstamos activos:</b> {total_n} · '
-        f"<b>Capital activo total:</b> {html.escape(fmt_money(total_rest))}</p>"
-        f'<div class="table-scroll"><table>'
-        f"<tr><th>Ruta</th><th># Préstamos</th><th>Capital activo</th><th>Prestamistas</th></tr>"
-        f"{tr or '<tr><td colspan=4 style=\"text-align:center;opacity:.85\">Sin préstamos activos con ruta</td></tr>'}"
-        f"</table></div>{nav_subfooter()}</div>"
+        style_block
+        + "<div class='routes-wrap'>"
+        + "<div class='routes-head'>"
+        + "<div>"
+        + "<div class='routes-title'>🏦 Capital por ruta</div>"
+        + "<div class='routes-sub'>Saldo vivo agrupado por la ruta del cliente, con métricas y gráfica.</div>"
+        + "</div>"
+        + bank_btns
+        + "</div>"
+        + f"{filtro_html}"
+        + "<div class='routes-grid-metrics'>"
+        + "<div class='m-card tone-blue' data-r-anim='1'>"
+        + "<div class='m-top'><div><div class='m-k'>Total préstamos activos</div><div class='m-v'>" + str(total_n) + "</div></div>"
+        + "<div class='m-ic'>🧾</div></div></div>"
+        + "<div class='m-card tone-green' data-r-anim='1'>"
+        + "<div class='m-top'><div><div class='m-k'>Capital total activo</div><div class='m-v'>" + html.escape(fmt_money(total_rest)) + "</div></div>"
+        + "<div class='m-ic'>💵</div></div></div>"
+        + "<div class='m-card tone-purple' data-r-anim='1'>"
+        + "<div class='m-top'><div><div class='m-k'>Rutas activas</div><div class='m-v'>" + str(active_routes) + "</div></div>"
+        + "<div class='m-ic'>🗺️</div></div></div>"
+        + "</div>"
+        + "<div class='routes-cards-grid'>"
+        + cards_section
+        + "</div>"
+        + chart_block
+        + "<script>"
+        + "document.addEventListener('DOMContentLoaded',function(){"
+        + "document.querySelectorAll('[data-r-anim]').forEach(function(el){el.classList.add('in');});"
+        + "});"
+        + "</script>"
+        + nav_subfooter()
+        + "</div>"
     )
     return page(body)
 
@@ -6041,6 +6943,7 @@ def cierre_semanal():
     ensure_org()
     org_id = session.get("org_id")
     user = current_user()
+    restrict = user_is_cobrador_limited(user)
     mode = (request.args.get("mode") or "").strip().lower()
     is_print = mode in ("print", "pdf", "imprimir")
     is_58mm = mode in ("58mm", "58", "t59", "recibo-58mm")
@@ -6062,10 +6965,22 @@ def cierre_semanal():
         and week_start <= p.get("date") <= week_end
         and loan_org_ok(p.get("loan_id"))
         and (p.get("status") or "OK") != "ANULADO"
+        and (not restrict or p.get("created_by") == user.get("id"))
     ]
     payments_week.sort(key=lambda p: (p.get("created_by") or 0, p.get("id") or 0))
 
-    total_cobrado = round(sum(float(p.get("amount") or 0) for p in payments_week), 2)
+    total_amount_week = round(sum(float(p.get("amount") or 0) for p in payments_week), 2)
+    # Separar correctamente:
+    # - capital recuperado (payment.capital)
+    # - interés ganado (payment.interest)
+    capital_cobrado = round(sum(float(p.get("capital") or 0) for p in payments_week), 2)
+    interes_cobrado = round(sum(float(p.get("interest") or 0) for p in payments_week), 2)
+
+    # Fallback mínimo si la data antigua no trae capital/interest.
+    # (En esta app la lógica debería guardar ambos, pero protegemos para evitar valores inflados.)
+    if capital_cobrado == 0 and interes_cobrado == 0 and total_amount_week:
+        capital_cobrado = round(total_amount_week * 0.5, 2)
+        interes_cobrado = round(total_amount_week - capital_cobrado, 2)
 
     # =========================
     # Pagos agrupados por cliente
@@ -6160,6 +7075,7 @@ def cierre_semanal():
         and cr.get("movement_type") == "prestamo_entregado"
         and cr.get("date") is not None
         and week_start <= cr.get("date") <= week_end
+        and (not restrict or cr.get("user_id") == user.get("id"))
     ]
     prestamos_entregados.sort(key=lambda cr: (cr.get("user_id") or 0, cr.get("id") or 0))
 
@@ -6218,6 +7134,7 @@ def cierre_semanal():
         and cr.get("movement_type") == "descuento_inicial"
         and cr.get("date") is not None
         and week_start <= cr.get("date") <= week_end
+        and (not restrict or cr.get("user_id") == user.get("id"))
     ]
     descuentos_total = round(sum(float(cr.get("amount") or 0) for cr in descuentos), 2)
     descuentos_rows = ""
@@ -6241,6 +7158,7 @@ def cierre_semanal():
         if e.get("organization_id") == org_id
         and e.get("created_at") is not None
         and week_start <= e.get("created_at").date() <= week_end
+        and (not restrict or e.get("user_id") == user.get("id"))
     ]
     gastos_rows = ""
     gastos_total = round(sum(float(e.get("amount") or 0) for e in gastos), 2)
@@ -6258,7 +7176,9 @@ def cierre_semanal():
     if not gastos_rows:
         gastos_rows = "<tr><td colspan=2 style='opacity:.78'>Sin gastos</td></tr>"
 
-    balance_negocio = round(total_cobrado - prestado_total - gastos_total, 2)
+    # Ganancia real del negocio:
+    # Ganancia = Interés cobrado - Gastos
+    ganancias_reales = round(interes_cobrado - gastos_total, 2)
 
     report_brand_name = "JDM Cash Now"
     logo_svg = (
@@ -6271,9 +7191,9 @@ def cierre_semanal():
     )
 
     chart_vals = {
-        "total_cobrado": total_cobrado,
-        "total_prestado": prestado_total,
-        "ganancias": balance_negocio,
+        "capital_cobrado": capital_cobrado,
+        "interes_cobrado": interes_cobrado,
+        "ganancias_reales": ganancias_reales,
     }
     chart_vals_json = json.dumps(chart_vals)
     charts_js = (
@@ -6283,10 +7203,10 @@ def cierre_semanal():
         "const ctx = document.getElementById('cierreChart');"
         "if(ctx){"
         "const data = {"
-        "labels:['Total cobrado','Total prestado','Ganancias'],"
-        "datasets:[{label:'RD$',data:[chartVals.total_cobrado,chartVals.total_prestado,chartVals.ganancias],"
-        "backgroundColor:['rgba(34,197,94,.35)','rgba(59,130,246,.35)','rgba(99,102,241,.35)'],"
-        "borderColor:['rgba(34,197,94,1)','rgba(59,130,246,1)','rgba(99,102,241,1)'],"
+        "labels:['Capital cobrado','Interés cobrado','Ganancias'],"
+        "datasets:[{label:'RD$',data:[chartVals.capital_cobrado,chartVals.interes_cobrado,chartVals.ganancias_reales],"
+        "backgroundColor:['rgba(34,197,94,.35)','rgba(59,130,246,.35)','rgba(239,68,68,.35)'],"
+        "borderColor:['rgba(34,197,94,1)','rgba(59,130,246,1)','rgba(239,68,68,1)'],"
         "borderWidth:1}]};"
         "new Chart(ctx,{type:'bar',data:data,options:{responsive:true,maintainAspectRatio:false,"
         "plugins:{legend:{display:false}},scales:{y:{beginAtZero:true}}}});"
@@ -6357,9 +7277,9 @@ def cierre_semanal():
             + "<div style='font-weight:1000;opacity:.95; padding:0 0 8px 0'>Pagos por cliente</div>"
             + client_print_html
             + "<div style='margin-top:10px;border-top:1px solid rgba(148,163,184,.35);padding-top:10px'>"
-            + f"<div style='display:flex;justify-content:space-between'><span style='opacity:.85;font-weight:900'>Total cobrado</span><b>{fmt_money(total_cobrado)}</b></div>"
-            + f"<div style='display:flex;justify-content:space-between;margin-top:6px'><span style='opacity:.85;font-weight:900'>Prestado</span><b>{fmt_money(prestado_total)}</b></div>"
-            + f"<div style='display:flex;justify-content:space-between;margin-top:6px'><span style='opacity:.85;font-weight:900'>Ganancias</span><b>{fmt_money(balance_negocio)}</b></div>"
+            + f"<div style='display:flex;justify-content:space-between'><span style='opacity:.85;font-weight:900'>Capital cobrado</span><b>{fmt_money(capital_cobrado)}</b></div>"
+            + f"<div style='display:flex;justify-content:space-between;margin-top:6px'><span style='opacity:.85;font-weight:900'>Interés cobrado</span><b>{fmt_money(interes_cobrado)}</b></div>"
+            + f"<div style='display:flex;justify-content:space-between;margin-top:6px'><span style='opacity:.85;font-weight:900'>Ganancia real</span><b>{fmt_money(ganancias_reales)}</b></div>"
             + "</div>"
             + f"<div style='margin-top:10px;opacity:.85;font-size:11px'>Fecha reporte: {date.today().isoformat()}</div>"
             + "<script>window.print();</script>"
@@ -6399,10 +7319,10 @@ def cierre_semanal():
             + "<div class='cierre-card'>"
             + "<div class='cierre-title'>📊 Totales</div>"
             + f"<div style='padding:10px 12px;background:rgba(236,253,245,.55);border:1px solid rgba(148,163,184,.25);border-radius:14px'>"
-            + f"<div style='display:flex;justify-content:space-between'><span style='opacity:.88'>Total cobrado</span><b>{fmt_money(total_cobrado)}</b></div>"
-            + f"<div style='display:flex;justify-content:space-between;margin-top:6px'><span style='opacity:.88'>Prestado</span><b>{fmt_money(prestado_total)}</b></div>"
+            + f"<div style='display:flex;justify-content:space-between'><span style='opacity:.88'>Capital cobrado</span><b>{fmt_money(capital_cobrado)}</b></div>"
+            + f"<div style='display:flex;justify-content:space-between;margin-top:6px'><span style='opacity:.88'>Interés cobrado</span><b>{fmt_money(interes_cobrado)}</b></div>"
             + f"<div style='display:flex;justify-content:space-between;margin-top:6px'><span style='opacity:.88'>Gastos</span><b>{fmt_money(gastos_total)}</b></div>"
-            + f"<div style='display:flex;justify-content:space-between;margin-top:6px'><span style='opacity:.88'>Ganancias</span><b>{fmt_money(balance_negocio)}</b></div>"
+            + f"<div style='display:flex;justify-content:space-between;margin-top:6px'><span style='opacity:.88'>Ganancia real</span><b>{fmt_money(ganancias_reales)}</b></div>"
             + "</div>"
             + "<hr class='cierre-sectionhr'/>"
             + "<div class='cierre-title'>Gráficas</div>"
@@ -6456,10 +7376,10 @@ def cierre_semanal():
         + "<div class='cierre-card'>"
         + "<div class='cierre-title'>📊 Totales</div>"
         + f"<div style='padding:10px 12px;background:rgba(236,253,245,.55);border:1px solid rgba(148,163,184,.25);border-radius:14px'>"
-        + f"<div style='display:flex;justify-content:space-between'><span style='opacity:.88'>Total cobrado</span><b>{fmt_money(total_cobrado)}</b></div>"
-        + f"<div style='display:flex;justify-content:space-between;margin-top:6px'><span style='opacity:.88'>Prestado</span><b>{fmt_money(prestado_total)}</b></div>"
-        + f"<div style='display:flex;justify-content:space-between;margin-top:6px'><span style='opacity:.88'>Gastos</span><b>{fmt_money(gastos_total)}</b></div>"
-        + f"<div style='display:flex;justify-content:space-between;margin-top:6px'><span style='opacity:.88'>Ganancias</span><b>{fmt_money(balance_negocio)}</b></div>"
+            + f"<div style='display:flex;justify-content:space-between'><span style='opacity:.88'>Capital cobrado</span><b>{fmt_money(capital_cobrado)}</b></div>"
+            + f"<div style='display:flex;justify-content:space-between;margin-top:6px'><span style='opacity:.88'>Interés cobrado</span><b>{fmt_money(interes_cobrado)}</b></div>"
+            + f"<div style='display:flex;justify-content:space-between;margin-top:6px'><span style='opacity:.88'>Gastos</span><b>{fmt_money(gastos_total)}</b></div>"
+            + f"<div style='display:flex;justify-content:space-between;margin-top:6px'><span style='opacity:.88'>Ganancia real</span><b>{fmt_money(ganancias_reales)}</b></div>"
         + "</div>"
         + "<div style='height:18px'></div>"
         + "<div class='cierre-title'>📈 Gráficas</div>"
@@ -6556,7 +7476,12 @@ def borrar_cierre(cierre_id):
 def agregar_dinero_banco():
     ensure_org()
     org_id = session.get("org_id")
+    u = current_user()
+    if not can_admin_actions(u):
+        flash("Acción restringida: solo admin puede agregar dinero al banco.", "danger")
+        return redirect(url_for("bank_home"))
     if request.method == "POST":
+        u = current_user()
         amt = request.form.get("amount", type=float)
         note = (request.form.get("note") or "Depósito banco").strip()
         if amt is None or amt <= 0:
@@ -6576,7 +7501,14 @@ def agregar_dinero_banco():
             return redirect(url_for("agregar_dinero_banco"))
 
         store.deposit_history.append(
-            {"id": rid, "organization_id": org_id, "amount": amt, "note": note, "at": datetime.utcnow()}
+            {
+                "id": rid,
+                "organization_id": org_id,
+                "user_id": u.get("id"),
+                "amount": amt,
+                "note": note,
+                "at": datetime.utcnow(),
+            }
         )
         flash(f"Ingresado {fmt_money(amt)} al flujo de caja (memoria).", "success")
         return redirect(url_for("historial_depositos"))
@@ -6595,15 +7527,235 @@ def agregar_dinero_banco():
 def historial_depositos():
     ensure_org()
     oid = session.get("org_id")
-    rows = "".join(
-        f"<tr><td>{d.get('at')}</td><td>{fmt_money(d.get('amount'))}</td><td>{d.get('note') or '—'}</td></tr>"
-        for d in reversed([d for d in store.deposit_history if d.get("organization_id") == oid][-100:])
+    u = current_user()
+    restrict = user_is_cobrador_limited(u)
+    # Filtro por rango de fechas (query params)
+    def parse_date(raw):
+        raw = (raw or "").strip()
+        if not raw:
+            return None
+        try:
+            return datetime.strptime(raw, "%Y-%m-%d").date()
+        except ValueError:
+            return None
+
+    dt_from = parse_date(request.args.get("desde"))
+    dt_to = parse_date(request.args.get("hasta"))
+
+    def in_range(d_at):
+        if d_at is None:
+            return False
+        d = d_at.date() if hasattr(d_at, "date") else None
+        if d is None:
+            return False
+        if dt_from and d < dt_from:
+            return False
+        if dt_to and d > dt_to:
+            return False
+        return True
+
+    deposit_list = [
+        d
+        for d in store.deposit_history
+        if d.get("organization_id") == oid and (not restrict or d.get("user_id") == u.get("id"))
+    ]
+    if dt_from or dt_to:
+        deposit_list = [d for d in deposit_list if in_range(d.get("at"))]
+    deposit_list = list(reversed(deposit_list[-200:]))  # últimos 200 (vista)
+
+    total_depositado = round(
+        sum(float(d.get("amount") or 0) for d in deposit_list),
+        2,
     )
+    n_depositos = len(deposit_list)
+
+    def fmt_dt(dt):
+        if not dt:
+            return "—"
+        try:
+            if hasattr(dt, "strftime"):
+                return dt.strftime("%d/%m/%Y %I:%M %p")
+        except Exception:
+            pass
+        return str(dt)
+
+    style_block = """
+<style>
+  .dep-wrap{max-width:1060px;margin:0 auto;padding:12px 0 22px}
+  .dep-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap}
+  .dep-title{font-weight:1000;font-size:18px;margin:0}
+  .dep-sub{opacity:.85;font-size:13px;margin-top:6px;font-weight:800}
+  .dep-grid{display:grid;gap:12px;margin-top:12px}
+  @media(min-width:860px){.dep-grid{grid-template-columns: 1fr .85fr}}
+
+  .dep-card{
+    background: rgba(255,255,255,.92);
+    border: 1px solid rgba(148,163,184,.35);
+    border-radius: 18px;
+    box-shadow: 0 10px 24px rgba(0,0,0,.06);
+    padding: 14px;
+  }
+  body.theme-dark .dep-card{
+    background: rgba(15,23,42,.92);
+    border-color: rgba(148,163,184,.25);
+    box-shadow: 0 14px 34px rgba(0,0,0,.35);
+  }
+
+  .dep-mini{
+    display:flex;flex-direction:column;gap:8px;
+    padding:12px 12px;border-radius:16px;
+    border:1px solid rgba(148,163,184,.22);
+    background: rgba(248,250,252,.75);
+  }
+  body.theme-dark .dep-mini{background: rgba(2,6,23,.45)}
+  .dep-mini-k{font-weight:900;opacity:.9;font-size:13px;display:flex;gap:8px;align-items:center}
+  .dep-mini-v{font-weight:1000;font-size:20px;color:#0f766e}
+  body.theme-dark .dep-mini-v{color:#5eead4}
+  .dep-mini-small{font-weight:1000;font-size:12px;opacity:.85}
+
+  .dep-filter{
+    display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;justify-content:flex-end
+  }
+  .dep-filter label{font-size:12px;font-weight:900;opacity:.9}
+  .dep-input{
+    padding:10px 10px;border-radius:12px;border:1px solid rgba(148,163,184,.35);
+    background: rgba(255,255,255,.8);
+    color:#0f172a;font-weight:800;
+  }
+  body.theme-dark .dep-input{background: rgba(2,6,23,.55);color:#e5e7eb}
+  .dep-btn{display:inline-flex;align-items:center;gap:8px}
+
+  .dep-table{width:100%;border-collapse:separate;border-spacing:0;font-size:13px}
+  .dep-table th{
+    text-align:left;padding:12px 10px;
+    border-bottom:2px solid rgba(148,163,184,.25);
+    color: rgba(15,23,42,.92);
+    background: rgba(2,132,199,.06);
+    position: sticky; top: 0;
+  }
+  body.theme-dark .dep-table th{color: rgba(229,231,235,.95); background: rgba(59,130,246,.08); border-bottom-color: rgba(148,163,184,.18)}
+  .dep-table td{
+    padding:12px 10px;border-bottom:1px solid rgba(148,163,184,.16);
+    vertical-align: middle;
+  }
+  .dep-row{transition: transform .12s ease, background .12s ease}
+  .dep-row:hover{background: rgba(236,253,245,.5); transform: translateY(-1px)}
+  body.theme-dark .dep-row:hover{background: rgba(16,185,129,.10)}
+
+  .dep-amt{font-weight:1000; font-size:15px; white-space:nowrap}
+  .dep-amt.pos{color:#047857}
+  .dep-amt.neg{color:#dc2626}
+
+  .dep-empty{
+    padding:18px; border-radius:16px;
+    border:1px dashed rgba(148,163,184,.35);
+    background: rgba(248,250,252,.65);
+    text-align:center;
+    font-weight:900;
+  }
+  body.theme-dark .dep-empty{background: rgba(2,6,23,.35)}
+
+  [data-anim]{opacity:0;transform: translateY(10px);transition: opacity .35s ease, transform .35s ease}
+  [data-anim].in{opacity:1;transform: translateY(0)}
+</style>
+"""
+
+    rows = ""
+    for d in deposit_list:
+        amt = float(d.get("amount") or 0)
+        cls = "pos" if amt >= 0 else "neg"
+        rows += (
+            "<tr class='dep-row'>"
+            f"<td>{fmt_dt(d.get('at'))}</td>"
+            f"<td class='dep-amt {cls}'>{fmt_money(amt)}</td>"
+            f"<td>{html.escape(str(d.get('note') or '—'))}</td>"
+            "</tr>"
+        )
+
+    if not rows:
+        rows_html = "<tr><td colspan='3'><div class='dep-empty'>💰 No hay depósitos registrados</div></td></tr>"
+    else:
+        rows_html = rows
+
     body = (
-        f'<div class="card"><h2>Historial de depósitos</h2>'
-        f'<div class="table-scroll"><table><tr><th>Fecha</th><th>Monto</th><th>Nota</th></tr>'
-        f"{rows or '<tr><td colspan=3>Sin depósitos</td></tr>'}</table></div>{nav_subfooter()}</div>"
+        style_block
+        + "<div class='dep-wrap'>"
+        + "<div class='dep-head'>"
+        + "<div>"
+        + "<h2 class='dep-title'>🏦 Historial de depósitos</h2>"
+        + "<div class='dep-sub'>Gestión de dinero, filtros por fecha y resumen instantáneo.</div>"
+        + "</div>"
+        + "<div class='dep-filter no-print'>"
+        + "<form method='get' style='display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;justify-content:flex-end'>"
+        + "<div>"
+        + "<label>Desde</label>"
+        + f"<input class='dep-input' type='date' name='desde' value='{(dt_from.isoformat() if dt_from else '')}'>"
+        + "</div>"
+        + "<div>"
+        + "<label>Hasta</label>"
+        + f"<input class='dep-input' type='date' name='hasta' value='{(dt_to.isoformat() if dt_to else '')}'>"
+        + "</div>"
+        + "<button class='btn btn-primary dep-btn' type='submit'>"
+        + "<span class='btn-ic' aria-hidden='true'>"
+        + "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' width='18' height='18' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M21 10c0 7-9 14-9 14S3 17 3 10a9 9 0 0 1 18 0Z'/><circle cx='12' cy='10' r='3'/></svg>"
+        + "</span>Filtrar</button>"
+        + "</form>"
+        + "</div>"
+        + "</div>"
+
+        + "<div class='dep-grid'>"
+        + "<div class='dep-card' data-anim='1'>"
+        + "<div style='display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap'>"
+        + "<div style='display:flex;gap:10px;align-items:center'>"
+        + "<div style='width:34px;height:34px;border-radius:14px;background:rgba(16,185,129,.12);border:1px solid rgba(16,185,129,.30);display:flex;align-items:center;justify-content:center;color:#047857'>💰</div>"
+        + "<div><div style='font-weight:1000;font-size:14px'>Resumen</div><div style='opacity:.85;font-weight:800;font-size:12px'>Últimos depósitos (memoria)</div></div>"
+        + "</div>"
+        + "<div style='display:flex;gap:10px;flex-wrap:wrap'>"
+        + "<div class='dep-mini'>"
+        + "<div class='dep-mini-k'>Total depositado</div>"
+        + f"<div class='dep-mini-v'>{fmt_money(total_depositado)}</div>"
+        + "<div class='dep-mini-small'>Monto neto en el rango</div>"
+        + "</div>"
+        + "<div class='dep-mini'>"
+        + "<div class='dep-mini-k'>Cantidad</div>"
+        + f"<div class='dep-mini-v'>{n_depositos}</div>"
+        + "<div class='dep-mini-small'>Depósitos encontrados</div>"
+        + "</div>"
+        + "</div>"
+        + "</div>"
+        + "<div style='height:10px'></div>"
+        + "<div class='table-scroll'>"
+        + "<table class='dep-table'>"
+        + "<thead><tr><th style='width:42%'>Fecha</th><th style='width:22%'>Monto</th><th>Nota</th></tr></thead>"
+        + "<tbody>" + (rows_html if rows_html else "") + "</tbody>"
+        + "</table>"
+        + "</div>"
+        + "</div>"
+
+        + "<div class='dep-card' data-anim='1'>"
+        + "<div style='font-weight:1000;margin-bottom:8px'>Accesos</div>"
+        + "<div style='display:flex;gap:10px;flex-wrap:wrap'>"
+        + f"<a class='btn btn-secondary btn-action' href='{url_for('dashboard')}'><span class='btn-ic' aria-hidden='true'>"
+        + "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' width='18' height='18' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M3 12h18'/><path d='M5 6h14'/><path d='M5 18h14'/></svg>"
+        + "</span>Dashboard</a>"
+        + f"<a class='btn btn-primary btn-action' href='{url_for('bank_home')}'><span class='btn-ic' aria-hidden='true'>"
+        + "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' width='18' height='18' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M3 10h18'/><path d='M5 10v10'/><path d='M9 10v10'/><path d='M15 10v10'/><path d='M19 10v10'/><path d='M4 20h16'/><path d='M21 10 12 3 3 10'/></svg>"
+        + "</span>Banco</a>"
+        + "</div>"
+        + "<div style='margin-top:12px;opacity:.88;font-weight:800;font-size:13px'>Sugerencia</div>"
+        + "<div style='margin-top:8px;opacity:.85;font-weight:700;font-size:12px;line-height:1.35'>Usa el filtro por fecha para imprimir o validar el cierre de caja del periodo.</div>"
+        + "</div>"
+        + "</div>"
+
+        + "<script>"
+        + "document.addEventListener('DOMContentLoaded',function(){"
+        + "document.querySelectorAll('[data-anim]').forEach(function(el){el.classList.add('in');});"
+        + "});"
+        + "</script>"
+        + nav_subfooter()
+        + "</div>"
     )
+
     return page(body)
 
 
