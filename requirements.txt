@@ -4,3 +4,7 @@ requests
 pandas
 beautifulsoup4
 apscheduler
+lxml
+numpy
+python-dateutil
+pytz
