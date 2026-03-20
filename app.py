@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import base64
 import secrets
 from datetime import datetime, date, timedelta
 from functools import wraps
@@ -36,6 +37,24 @@ def fmt_money(val):
     except (TypeError, ValueError):
         v = 0.0
     return f"{CURRENCY} {v:,.2f}"
+
+
+def freq_interval_days(freq):
+    """
+    Intervalo aproximado (en días) por frecuencia.
+    - semanal: 7
+    - diario: 1
+    - quincenal: 15
+    - mensual: 30
+    """
+    s = str(freq or "").strip().lower()
+    if "diar" in s:
+        return 1
+    if "quinc" in s:
+        return 15
+    if "mens" in s:
+        return 30
+    return 7
 
 
 def get_theme():
@@ -1033,7 +1052,8 @@ def new_loan():
             flash("Cuotas inválidas.", "danger")
             return redirect(url_for("new_loan"))
         start_date = datetime.strptime(start_str, "%Y-%m-%d").date()
-        next_payment_date = start_date + timedelta(days=7)
+        interval_days = freq_interval_days(freq)
+        next_payment_date = start_date + timedelta(days=interval_days)
 
         discount_amount = round(amount * upfront_percent / 100.0, 2)
         monto_entregado = round(amount - discount_amount, 2)
@@ -1218,13 +1238,53 @@ def loan_detail(loan_id):
             f"<td>{fmt_money(p.get('capital'))}</td>"
             f"<td>{fmt_money(p.get('interest'))}</td>"
             f"<td>{p.get('date')}</td>"
+            f"<td><a class='btn btn-secondary' style='padding:6px 10px' href='{url_for('print_payment', payment_id=p.get('id'))}' target='_blank' rel='noopener'>Imprimir recibo</a></td>"
             f"</tr>"
         )
 
     if not hist_rows:
         hist_rows = (
-            "<tr><td colspan='5' style='opacity:.85; text-align:center;'>Sin pagos</td></tr>"
+            "<tr><td colspan='6' style='opacity:.85; text-align:center;'>Sin pagos</td></tr>"
         )
+
+    # =========================
+    # Calendario de cuotas (10/12 semanas)
+    # =========================
+    interval_days = freq_interval_days(L.get("frequency"))
+    first_due = next_pago if hasattr(next_pago, "strftime") else date.today()
+
+    cuota_items_html = ""
+    for i in range(1, term_count + 1):
+        due_i = first_due + timedelta(days=interval_days * (i - 1))
+        cuota_estado = "Pagada" if i <= pagadas else "Pendiente"
+        color = "#16a34a" if i <= pagadas else "#d97706"
+        cuota_items_html += (
+            f"<div class='card' style='margin:0; padding:12px; min-width:170px; flex:1 1 170px; background:#f8fafc;'>"
+            f"<div style='font-weight:900; margin-bottom:6px;'>Cuota {i}</div>"
+            f"<div><b>{fmt_date(due_i)}</b></div>"
+            f"<div style='margin-top:6px; opacity:.9; font-weight:900;'>Estado: <span style='color:{color}'>{cuota_estado}</span></div>"
+            f"</div>"
+        )
+
+    # Siguiente pago = primera cuota pendiente
+    if pagadas < term_count:
+        next_idx = pagadas + 1
+        next_due = first_due + timedelta(days=interval_days * (next_idx - 1))
+        next_status = "Pendiente"
+    else:
+        next_idx = term_count
+        next_due = first_due + timedelta(days=interval_days * (term_count - 1))
+        next_status = "Cerrado"
+
+    siguiente_pago_html = (
+        f"<div style='margin-top:12px;'>"
+        f"<div style='font-weight:900; margin-bottom:6px;'>Siguiente pago</div>"
+        f"<div><b>Cuota {next_idx}</b></div>"
+        f"<div style='margin-top:6px; opacity:.95;'>Fecha: <b>{fmt_date(next_due)}</b></div>"
+        f"<div style='margin-top:6px; opacity:.95;'>Monto: <b>{fmt_money(scheduled_payment)}</b></div>"
+        f"<div style='margin-top:6px; opacity:.95;'>Estado: <b style='color:#d97706'>{next_status}</b></div>"
+        f"</div>"
+    )
 
     # =========================
     # WhatsApp
@@ -1320,16 +1380,10 @@ def loan_detail(loan_id):
     <details class="loan-details" open>
       <summary>📅 Calendario de pagos</summary>
       <div style="margin-top:10px;">
-        <div class="card" style="margin:0; padding:12px;">
-          <div style="font-weight:900; margin-bottom:6px;">Cuota 1</div>
-          <div><b>⏳ {next_pago_disp}</b></div>
-          <div style="margin-top:6px; opacity:.95;">
-            Monto: <b>{fmt_money(L.get('installment_amount'))}</b>
-          </div>
-          <div style="margin-top:6px; opacity:.95;">
-            Estado: <b>{estado_pago}</b>
-          </div>
+        <div style="display:flex; flex-wrap:wrap; gap:10px; align-items:stretch;">
+          {cuota_items_html}
         </div>
+        {siguiente_pago_html}
       </div>
     </details>
   </div>
@@ -1340,7 +1394,7 @@ def loan_detail(loan_id):
       <div class="table-scroll" style="margin-top:10px;">
         <table class="loan-table">
           <tr>
-            <th>#</th><th>Monto</th><th>Capital</th><th>Interés</th><th>Fecha</th>
+            <th>#</th><th>Monto</th><th>Capital</th><th>Interés</th><th>Fecha</th><th>Recibo</th>
           </tr>
           {hist_rows}
         </table>
@@ -1360,6 +1414,13 @@ def new_payment(loan_id):
     if not L:
         flash("Préstamo no encontrado.", "danger")
         return redirect(url_for("loans"))
+    # Monto recomendado para "cuota" (para precargar el formulario).
+    term_count = int(L.get("term_count") or 1)
+    total_to_pay = float(L.get("total_to_pay") or 0)
+    scheduled_payment = float(L.get("installment_amount") or 0)
+    if scheduled_payment <= 0 and term_count:
+        scheduled_payment = total_to_pay / float(term_count)
+    scheduled_payment = round(max(scheduled_payment, 0.0), 2)
     if request.method == "POST":
         amt = request.form.get("amount", type=float)
         typ = (request.form.get("type") or "cuota").strip()
@@ -1390,11 +1451,18 @@ def new_payment(loan_id):
         L["remaining"] = max(0, rem)
         if L["remaining"] <= 0:
             L["status"] = "cerrado"
+        # Si se registra una cuota, avanzamos la próxima fecha automáticamente.
+        if str(typ or "").strip().lower() == "cuota":
+            interval_days = freq_interval_days(L.get("frequency"))
+            current_due = L.get("next_payment_date") or date.today()
+            if hasattr(current_due, "strftime"):
+                L["next_payment_date"] = current_due + timedelta(days=interval_days)
         flash("Pago registrado.", "success")
         return redirect(url_for("loan_detail", loan_id=loan_id))
     body = (
         f'<div class="card"><h2>Pago — préstamo #{loan_id}</h2><form method="post">'
-        f'<label>Monto</label><input name="amount" type="number" step="0.01" required>'
+        f'<p style="margin:6px 0 10px 0; opacity:.95;"><b>Cuota recomendada:</b> {fmt_money(scheduled_payment)}</p>'
+        f'<label>Monto</label><input name="amount" type="number" step="0.01" value="{scheduled_payment}" required>'
         f'<label>Tipo</label><select name="type"><option value="cuota">Cuota</option><option value="capital">Capital</option><option value="interes">Interés</option></select>'
         f'<button class="btn btn-primary" type="submit">Registrar</button></form></div>'
     )
@@ -1587,42 +1655,288 @@ def delete_advance(payment_id):
 @app.route("/bank/legal")
 @login_required
 def bank_legal():
-    return stub_page("Documento legal")
+    return redirect(url_for("bank_legal_list"))
 
 
 @app.route("/bank/legal/list")
 @login_required
 def bank_legal_list():
-    return stub_page("Lista documentos legales")
+    ensure_org()
+    oid = session.get("org_id")
+    user = current_user()
+    rows = []
+
+    for L in sorted(loans_for_user(oid, user), key=lambda x: -x.get("id", 0))[:200]:
+        client = store.clients.get(L.get("client_id"), {})
+        cobrador = store.users.get(L.get("created_by"), {}).get("username") or "—"
+        firmado = bool(L.get("signature_b64"))
+        status_label = "Firmado" if firmado else "Pendiente"
+        status_color = "#16a34a" if firmado else "#d97706"
+        nm = f"{client.get('first_name','')} {client.get('last_name') or ''}".strip() or f"Cliente #{client.get('id')}"
+        rows.append(
+            "<div class='legal-card' style='background:#ffffffb8;border-radius:18px;padding:12px;box-shadow:0 8px 22px rgba(0,0,0,.06);'>"
+            f"<div style='display:flex;justify-content:space-between;gap:10px;align-items:flex-start;'>"
+            f"<div style='font-weight:900;line-height:1.2'>{nm}</div>"
+            f"<div style='font-weight:900;color:{status_color}'>{status_label}</div>"
+            f"</div>"
+            f"<div style='opacity:.85;margin-top:6px;font-size:12px;'>Cobrador: {cobrador}</div>"
+            f"<div style='opacity:.85;margin-top:3px;font-size:12px;'>Prestamo: #{L.get('id')}</div>"
+            f"<div style='margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;'>"
+            f"<a class='btn btn-secondary' style='padding:7px 12px' href='{url_for('view_legal_document', loan_id=L.get('id'))}'>Ver</a>"
+            f"</div>"
+            f"</div>"
+        )
+
+    cards = "".join(rows) if rows else "<div style='opacity:.85;padding:12px'>Sin documentos legales</div>"
+    body = f"""
+<div class="card" style="padding:16px;">
+  <h2 style="margin:0 0 10px 0;">Documento legal</h2>
+  <style>
+    .legal-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;}}
+  </style>
+  <div class="legal-grid">{cards}</div>
+  {nav_subfooter()}
+</div>
+"""
+    return page(body)
 
 
 @app.route("/bank/legal/view/<int:loan_id>")
 @login_required
 def view_legal_document(loan_id):
-    return stub_page(f"Vista legal préstamo #{loan_id}")
+    ensure_org()
+    oid = session.get("org_id")
+    loan = store.loans.get(loan_id)
+    if not loan or loan.get("organization_id") != oid:
+        flash("Préstamo no encontrado.", "danger")
+        return redirect(url_for("bank_legal_list"))
+    # Control de acceso para cobradores.
+    if current_user().get("role") == "cobrador" and not (is_cartera_admin(current_user()) or loan.get("created_by") == current_user()["id"]):
+        flash("Sin acceso.", "danger")
+        return redirect(url_for("bank_legal_list"))
+
+    client = store.clients.get(loan.get("client_id"), {})
+    cobrador = store.users.get(loan.get("created_by"), {}).get("username") or "—"
+
+    def fmt_date(d):
+        return d.strftime("%d/%m/%Y") if hasattr(d, "strftime") else str(d)
+
+    capital_aprobado = float(loan.get("amount") or 0)
+    interes_total = float(loan.get("total_interest") or 0)
+    start_date = loan.get("start_date")
+    cedula = client.get("document_id") or "—"
+    cliente_nombre = f"{client.get('first_name','')} {client.get('last_name') or ''}".strip() or "—"
+
+    # Mostrar previews si ya subieron fotos/firmaron.
+    sig = loan.get("signature_b64")
+    id_front = loan.get("id_photo_b64")
+    id_back = loan.get("id_photo_back_b64")
+
+    preview_sig = (
+        f"<div style='margin-top:10px;'><img alt='Firma' style='max-width:260px;border:1px solid rgba(0,0,0,.08);border-radius:12px;background:#fff;padding:8px;' src='{sig}'/></div>"
+        if sig else ""
+    )
+
+    preview_front = (
+        f"<div style='margin-top:6px;'><img alt='ID frente' style='width:140px;height:92px;object-fit:cover;border:1px solid rgba(0,0,0,.08);border-radius:10px;background:#fff;' src='{id_front}'/></div>"
+        if id_front else ""
+    )
+    preview_back = (
+        f"<div style='margin-top:6px;'><img alt='ID atrás' style='width:140px;height:92px;object-fit:cover;border:1px solid rgba(0,0,0,.08);border-radius:10px;background:#fff;' src='{id_back}'/></div>"
+        if id_back else ""
+    )
+
+    signature_script = """
+<script>
+  const canvas = document.getElementById('sigCanvas');
+  const ctx = canvas.getContext('2d');
+  let drawing = false;
+  function pos(e){
+    const r = canvas.getBoundingClientRect();
+    const x = (e.clientX - r.left) * (canvas.width / r.width);
+    const y = (e.clientY - r.top) * (canvas.height / r.height);
+    return {x,y};
+  }
+  function resize(){
+    const ratio = window.devicePixelRatio || 1;
+    const rect = canvas.getBoundingClientRect();
+    canvas.width = Math.floor(rect.width * ratio);
+    canvas.height = Math.floor(rect.height * ratio);
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(0,0,canvas.width,canvas.height);
+    ctx.lineWidth = 3 * ratio;
+    ctx.lineCap = 'round';
+    ctx.strokeStyle = '#000';
+  }
+  window.addEventListener('resize', resize);
+  resize();
+  canvas.addEventListener('mousedown', e=>{drawing=true; const p=pos(e); ctx.beginPath(); ctx.moveTo(p.x,p.y);});
+  canvas.addEventListener('mouseup', ()=>{drawing=false; ctx.closePath();});
+  canvas.addEventListener('mousemove', e=>{if(!drawing) return; const p=pos(e); ctx.lineTo(p.x,p.y); ctx.stroke();});
+  canvas.addEventListener('touchstart', e=>{drawing=true; const t=e.touches[0]; const p=pos(t); ctx.beginPath(); ctx.moveTo(p.x,p.y); e.preventDefault();});
+  canvas.addEventListener('touchend', ()=>{drawing=false; ctx.closePath();});
+  canvas.addEventListener('touchmove', e=>{if(!drawing) return; const t=e.touches[0]; const p=pos(t); ctx.lineTo(p.x,p.y); ctx.stroke(); e.preventDefault();});
+  function clearSig(){ctx.clearRect(0,0,canvas.width,canvas.height); ctx.fillStyle='#fff'; ctx.fillRect(0,0,canvas.width,canvas.height);}
+
+  const signForm = document.querySelector(\"form[action*='/bank/legal/sign/']\");
+  if (signForm) {
+    signForm.addEventListener('submit', ()=>{document.getElementById('signature_b64').value = canvas.toDataURL('image/png');});
+  }
+</script>
+"""
+
+    body = f"""
+<div class="card" style="padding:16px;">
+  <h2 style="margin:0 0 10px 0;">Contrato de Préstamo</h2>
+  <div style="opacity:.9; font-size:13px; margin-bottom:12px;">
+    <div><b>Cliente:</b> {cliente_nombre}</div>
+    <div><b>Cédula:</b> {cedula}</div>
+    <div><b>Capital aprobado:</b> {fmt_money(capital_aprobado)}</div>
+    <div><b>Interés total:</b> {fmt_money(interes_total)}</div>
+    <div><b>Fecha inicio:</b> {fmt_date(start_date)}</div>
+    <div><b>Cobrador:</b> {cobrador}</div>
+  </div>
+
+  <div style="margin:10px 0 16px 0;border-top:1px solid rgba(148,163,184,.35);padding-top:12px;">
+    <h3 style="margin:0 0 8px 0;">📜 Compromiso de Pago</h3>
+    <p style="margin:0 0 8px 0;">
+      El cliente <b>{cliente_nombre}</b> reconoce haber recibido el capital del préstamo y se compromete de manera expresa, voluntaria e irrevocable a pagar la totalidad de la deuda a <b>JDM CASH NOW</b>, incluyendo capital, intereses, cargos y penalidades aplicables, en los plazos establecidos.
+    </p>
+    <p style="margin:0;">
+      El incumplimiento de este compromiso autoriza a <b>JDM CASH NOW</b> a iniciar las acciones legales correspondientes conforme a la ley vigente.
+    </p>
+  </div>
+
+  <div style="border-top:1px solid rgba(148,163,184,.35);padding-top:12px;">
+    <h3 style="margin:0 0 10px 0;">Cédula del cliente</h3>
+    <div style="display:flex;gap:14px;flex-wrap:wrap;align-items:flex-start;">
+      <div style="flex:1;min-width:240px;">
+        <div style="font-weight:900;margin-bottom:6px; font-size:13px;">Cédula (Frente)</div>
+        <form method="post" enctype="multipart/form-data" action="{url_for('upload_id_front', loan_id=loan_id)}">
+          <input name="id_front" type="file" accept="image/*" required>
+          <button class="btn btn-primary" style="margin-top:8px;" type="submit">Subir frente</button>
+        </form>
+        {preview_front}
+      </div>
+      <div style="flex:1;min-width:240px;">
+        <div style="font-weight:900;margin-bottom:6px; font-size:13px;">Cédula (Parte de atrás)</div>
+        <form method="post" enctype="multipart/form-data" action="{url_for('upload_id_back', loan_id=loan_id)}">
+          <input name="id_back" type="file" accept="image/*" required>
+          <button class="btn btn-primary" style="margin-top:8px;" type="submit">Subir atrás</button>
+        </form>
+        {preview_back}
+      </div>
+    </div>
+  </div>
+
+  <div style="border-top:1px solid rgba(148,163,184,.35);padding-top:12px;margin-top:14px;">
+    <h3 style="margin:0 0 10px 0;">Firma del cliente</h3>
+    <form method="post" action="{url_for('sign_legal_document', loan_id=loan_id)}">
+      <div style="background:#fff;border-radius:14px;border:1px solid rgba(0,0,0,.08);padding:10px;">
+        <div style="opacity:.9;font-size:12px;margin-bottom:8px;">Firma (dibuje con el mouse/touch)</div>
+        <canvas id="sigCanvas" style="width:100%;max-width:520px;height:120px;border:1px dashed rgba(0,0,0,.25);border-radius:12px;background:#ffffff;"></canvas>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px;">
+          <button class="btn btn-secondary" type="button" onclick="clearSig()">Limpiar</button>
+          <button class="btn btn-primary" type="submit">Guardar firma</button>
+        </div>
+      </div>
+      <input type="hidden" name="signature_b64" id="signature_b64">
+    </form>
+    {preview_sig}
+  </div>
+</div>
+{signature_script}
+{nav_subfooter()}
+"""
+    return page(body)
 
 
 @app.route("/bank/legal/upload-id-front/<int:loan_id>", methods=["POST"])
 @login_required
 def upload_id_front(loan_id):
-    flash("Subida simulada (memoria).", "info")
+    ensure_org()
+    oid = session.get("org_id")
+    loan = store.loans.get(loan_id)
+    if not loan or loan.get("organization_id") != oid:
+        flash("Préstamo no encontrado.", "danger")
+        return redirect(url_for("bank_legal_list"))
+    if current_user().get("role") == "cobrador" and not (is_cartera_admin(current_user()) or loan.get("created_by") == current_user()["id"]):
+        flash("Sin acceso.", "danger")
+        return redirect(url_for("bank_legal_list"))
+
+    f = request.files.get("id_front")
+    if not f:
+        flash("Debe seleccionar la imagen del frente.", "danger")
+        return redirect(url_for("view_legal_document", loan_id=loan_id))
+
+    raw = f.read()
+    if not raw:
+        flash("Archivo vacío.", "danger")
+        return redirect(url_for("view_legal_document", loan_id=loan_id))
+
+    b64 = base64.b64encode(raw).decode("ascii")
+    loan["id_photo_b64"] = f"data:image/png;base64,{b64}"
+    flash("ID (frente) guardada en memoria.", "success")
     return redirect(url_for("view_legal_document", loan_id=loan_id))
 
 
 @app.route("/bank/legal/upload-id-back/<int:loan_id>", methods=["POST"])
 @login_required
 def upload_id_back(loan_id):
-    flash("Subida simulada (memoria).", "info")
+    ensure_org()
+    oid = session.get("org_id")
+    loan = store.loans.get(loan_id)
+    if not loan or loan.get("organization_id") != oid:
+        flash("Préstamo no encontrado.", "danger")
+        return redirect(url_for("bank_legal_list"))
+    if current_user().get("role") == "cobrador" and not (is_cartera_admin(current_user()) or loan.get("created_by") == current_user()["id"]):
+        flash("Sin acceso.", "danger")
+        return redirect(url_for("bank_legal_list"))
+
+    f = request.files.get("id_back")
+    if not f:
+        flash("Debe seleccionar la imagen de atrás.", "danger")
+        return redirect(url_for("view_legal_document", loan_id=loan_id))
+
+    raw = f.read()
+    if not raw:
+        flash("Archivo vacío.", "danger")
+        return redirect(url_for("view_legal_document", loan_id=loan_id))
+
+    b64 = base64.b64encode(raw).decode("ascii")
+    loan["id_photo_back_b64"] = f"data:image/png;base64,{b64}"
+    flash("ID (atrás) guardada en memoria.", "success")
     return redirect(url_for("view_legal_document", loan_id=loan_id))
 
 
 @app.route("/bank/legal/sign/<int:loan_id>", methods=["GET", "POST"])
 @login_required
 def sign_legal_document(loan_id):
+    # Nota: mostramos el formulario completo en `view_legal_document`.
+    # Este endpoint solo guarda la firma al hacer POST.
     if request.method == "POST":
+        ensure_org()
+        oid = session.get("org_id")
+        loan = store.loans.get(loan_id)
+        if not loan or loan.get("organization_id") != oid:
+            flash("Préstamo no encontrado.", "danger")
+            return redirect(url_for("bank_legal_list"))
+
+        if current_user().get("role") == "cobrador" and not (is_cartera_admin(current_user()) or loan.get("created_by") == current_user()["id"]):
+            flash("Sin acceso.", "danger")
+            return redirect(url_for("bank_legal_list"))
+
+        sig = request.form.get("signature_b64")
+        if not sig or not str(sig).startswith("data:"):
+            flash("Firma inválida.", "danger")
+            return redirect(url_for("view_legal_document", loan_id=loan_id))
+
+        loan["signature_b64"] = sig
         flash("Firma guardada en memoria.", "success")
         return redirect(url_for("loan_detail", loan_id=loan_id))
-    return stub_page(f"Firmar préstamo #{loan_id}")
+
+    # GET: redirigir a la vista completa del contrato.
+    return redirect(url_for("view_legal_document", loan_id=loan_id))
 
 
 @app.route("/bank/advance", methods=["GET", "POST"])
