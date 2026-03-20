@@ -5684,10 +5684,42 @@ def cierre_semanal():
 
     prestado_total = round(sum(float(cr.get("amount") or 0) for cr in prestamos_entregados), 2)
     prestamos_rows = ""
+
+    def client_name_from_cash_note(note):
+        # Nota:
+        # "Préstamo entregado cliente #{client_id}"
+        # También puede venir con sufijos por ediciones.
+        if not note:
+            return None
+        n = str(note)
+        low = n.lower()
+        marker = "cliente #"
+        idx = low.find(marker)
+        if idx == -1:
+            return None
+        i = idx + len(marker)
+        digits = ""
+        while i < len(n) and n[i].isdigit():
+            digits += n[i]
+            i += 1
+        if not digits:
+            return None
+        try:
+            cid = int(digits)
+        except Exception:
+            return None
+        cl = store.clients.get(cid)
+        if not cl:
+            return None
+        full = f"{cl.get('first_name') or ''} {cl.get('last_name') or ''}".strip()
+        return full or (cl.get("first_name") or cl.get("last_name") or None)
+
     for cr in prestamos_entregados:
         uid = cr.get("user_id")
         u = store.users.get(uid, {})
-        name = (u.get("name") or u.get("username") or "—") if u else "—"
+        fallback = (u.get("name") or u.get("username") or "—") if u else "—"
+        cliente_nm = client_name_from_cash_note(cr.get("note"))
+        name = cliente_nm or fallback
         prestamos_rows += (
             "<tr>"
             f"<td style='padding-right:12px'>{html.escape(str(name))}</td>"
