@@ -2446,6 +2446,7 @@ def audit():
 @super_admin_required
 def super_admin_panel():
     ensure_org()  # no-op para super_admin (solo para no romper otras dependencias)
+    user = current_user()
     now = datetime.utcnow()
 
     def fmt_sub_end(x):
@@ -2670,7 +2671,7 @@ def super_admin_panel():
   {nav_subfooter()}
 </div>
 """
-    return page(body, user=user)
+    return page(body)
 
 
 @app.route("/reportes", methods=["GET", "POST"])
