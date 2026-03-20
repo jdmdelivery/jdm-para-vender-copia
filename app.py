@@ -598,10 +598,16 @@ def manifest():
     })
 
 
-@app.route("/healthz")
+@app.route("/healthz", methods=["GET", "HEAD"])
 def healthz():
-    """Sin auth — para health checks de Render u otros balanceadores."""
-    return Response("ok\n", mimetype="text/plain; charset=utf-8")
+    """Sin auth ni redirects — Render debe usar esto como Health Check Path."""
+    hdrs = {
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        "X-Content-Type-Options": "nosniff",
+    }
+    if request.method == "HEAD":
+        return Response("", status=200, mimetype="text/plain; charset=utf-8", headers=hdrs)
+    return Response("ok\n", status=200, mimetype="text/plain; charset=utf-8", headers=hdrs)
 
 
 @app.route("/sw.js")
