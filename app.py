@@ -144,7 +144,7 @@ class Store:
     __slots__ = (
         "users", "organizations", "clients", "loans", "payments", "loan_arrears",
         "cash_reports", "audit_log", "route_expenses", "initial_discounts", "gps_positions",
-        "weekly_closures", "deposit_history", "_seq",
+        "weekly_closures", "deposit_history", "closure_history", "_seq",
     )
 
     def __init__(self):
@@ -161,6 +161,7 @@ class Store:
         self.gps_positions = {}
         self.weekly_closures = {}
         self.deposit_history = []
+        self.closure_history = []
         self._seq = {"users": 1, "clients": 0, "loans": 0, "payments": 0, "arrears": 0, "cash": 0, "re": 0, "disc": 0, "cierre": 0, "audit": 0}
         self._seed()
 
@@ -308,6 +309,68 @@ def clients_for_user(org_id, user):
     return rows
 
 
+def loan_ids_visible(org_id, user):
+    return {L["id"] for L in loans_for_user(org_id, user)}
+
+
+def payments_in_scope(org_id, user):
+    lids = loan_ids_visible(org_id, user)
+    return [p for p in store.payments.values() if p.get("loan_id") in lids]
+
+
+def compute_financial_kpis(org_id, user):
+    """Métricas alineadas al panel «Resumen financiero» (memoria)."""
+    L = loans_for_user(org_id, user)
+    P = payments_in_scope(org_id, user)
+    ok = [p for p in P if (p.get("status") or "OK") != "ANULADO"]
+
+    capital_prestado = sum(float(x.get("amount") or 0) for x in L)
+    capital_cobrado = sum(float(p.get("capital") or 0) for p in ok)
+    activos = [x for x in L if str(x.get("status", "")).upper() == "ACTIVO"]
+    capital_pendiente = sum(float(x.get("remaining") or 0) for x in activos)
+
+    interes_total = sum(float(x.get("total_interest") or 0) for x in L)
+    interes_cobrado = sum(float(p.get("interest") or 0) for p in ok)
+    interes_pendiente = max(interes_total - interes_cobrado, 0)
+    total_por_cobrar = capital_pendiente + interes_pendiente
+
+    today = date.today()
+    cobrado_hoy = sum(float(p.get("amount") or 0) for p in ok if p.get("date") == today)
+    interes_hoy = sum(float(p.get("interest") or 0) for p in ok if p.get("date") == today)
+
+    atrasados = 0
+    for x in activos:
+        npd = x.get("next_payment_date")
+        if npd and npd < today:
+            atrasados += 1
+
+    n_cobradores = sum(1 for u in store.users.values() if u.get("role") == "cobrador" and u.get("organization_id") == org_id)
+
+    return {
+        "capital_prestado": capital_prestado,
+        "capital_cobrado": capital_cobrado,
+        "capital_pendiente": capital_pendiente,
+        "interes_total": interes_total,
+        "interes_cobrado": interes_cobrado,
+        "interes_pendiente": interes_pendiente,
+        "total_por_cobrar": total_por_cobrar,
+        "cobrado_hoy": cobrado_hoy,
+        "interes_hoy": interes_hoy,
+        "atrasados": atrasados,
+        "n_prestamos": len(L),
+        "n_clientes": len(clients_for_user(org_id, user)),
+        "n_cobradores": n_cobradores,
+        "n_activos": len(activos),
+    }
+
+
+def nav_subfooter():
+    return (
+        f'<p style="margin-top:20px"><a class="btn btn-secondary" href="{url_for("dashboard")}">← Dashboard</a> '
+        f'<a class="btn btn-secondary" href="{url_for("bank_home")}">Banco</a></p>'
+    )
+
+
 # ---------------------------------------------------------------------------
 # Rutas
 # ---------------------------------------------------------------------------
@@ -412,15 +475,206 @@ def dashboard():
         return redirect(url_for("index"))
     ensure_org()
     org_id = session.get("org_id")
-    L = loans_for_user(org_id, user)
-    cap = sum(float(x.get("amount") or 0) for x in L)
-    body = (
-        f'<div class="card"><h2>📊 Dashboard</h2><p>Préstamos visibles: <b>{len(L)}</b></p>'
-        f"<p>Capital (suma montos originales): <b>{fmt_money(cap)}</b></p>"
-        f'<p><a class="btn btn-primary" href="{url_for("clients")}">Clientes</a> '
-        f'<a class="btn btn-primary" href="{url_for("loans")}">Préstamos</a> '
-        f'<a class="btn btn-secondary" href="{url_for("bank_home")}">Banco</a></p></div>'
+    k = compute_financial_kpis(org_id, user)
+
+    def fin_card(label, value, bg):
+        return (
+            f'<div class="fin-mini" style="background:{bg}"><span class="fin-mini-k">{label}</span>'
+            f'<span class="fin-mini-v">{value}</span></div>'
+        )
+
+    fin_row = (
+        fin_card("Capital prestado", fmt_money(k["capital_prestado"]), "linear-gradient(135deg,#0d9488,#14b8a6)")
+        + fin_card("Capital cobrado", fmt_money(k["capital_cobrado"]), "linear-gradient(135deg,#15803d,#22c55e)")
+        + fin_card("Capital pendiente", fmt_money(k["capital_pendiente"]), "linear-gradient(135deg,#1d4ed8,#3b82f6)")
+        + fin_card("Interés total", fmt_money(k["interes_total"]), "linear-gradient(135deg,#7c3aed,#a855f7)")
+        + fin_card("Interés cobrado", fmt_money(k["interes_cobrado"]), "linear-gradient(135deg,#166534,#4ade80)")
+        + fin_card("Interés pendiente", fmt_money(k["interes_pendiente"]), "linear-gradient(135deg,#c2410c,#fb923c)")
+        + fin_card("Total por cobrar", fmt_money(k["total_por_cobrar"]), "linear-gradient(135deg,#b91c1c,#ef4444)")
     )
+
+    daily_row = (
+        f'<div class="daily-card g"><span class="dk">Cobrado hoy</span><span class="dv">{fmt_money(k["cobrado_hoy"])}</span></div>'
+        f'<div class="daily-card g"><span class="dk">Interés hoy</span><span class="dv">{fmt_money(k["interes_hoy"])}</span></div>'
+        f'<div class="daily-card r"><span class="dk">⚠️ Atrasados</span><span class="dv">{k["atrasados"]}</span></div>'
+    )
+
+    def op_tile(href, icon, title, subtitle="", badge=""):
+        sub = f'<span class="op-sub">{subtitle}</span>' if subtitle else ""
+        bd = f'<span class="op-badge">{badge}</span>' if badge else ""
+        return (
+            f'<a class="op-tile" href="{href}"><span class="op-ic">{icon}</span><span class="op-tit">{title}</span>{sub}{bd}</a>'
+        )
+
+    ops = (
+        op_tile(url_for("loans"), "📄", "Préstamos", "", str(k["n_prestamos"]))
+        + op_tile(url_for("clients"), "👤", "Clientes", "", str(k["n_clientes"]))
+        + op_tile(url_for("new_loan"), "➕", "Nuevo préstamo", "Evaluación crédito", "")
+        + op_tile(url_for("credit_history"), "📁", "Historial de crédito", "", "")
+        + op_tile(url_for("client_scores"), "⭐", "Score de clientes", "", "")
+        + op_tile(url_for("cobro_sabado"), "💰", "Cobro sábado", "", "")
+        + op_tile(url_for("bank_ranking"), "⚠️", "Ranking morosos", "", "")
+        + op_tile(url_for("bank_resumen"), "📊", "Resumen financiero", "", "")
+        + op_tile(url_for("check_client"), "🔍", "Consultar por cédula", "", "")
+        + op_tile(url_for("prestamos_pagados"), "✅", "Préstamos pagados", "", "")
+        + op_tile(url_for("employees"), "👥", "Empleados", "", str(k["n_cobradores"]))
+    )
+
+    ctrl = (
+        f'<a class="ctrl-big g" href="{url_for("cierre_semanal")}"><span class="c-ic">📅</span> Cierre semanal</a>'
+        f'<a class="ctrl-big o" href="{url_for("historial_cierres")}"><span class="c-ic">✔️</span> Cuadres cerrados</a>'
+        f'<a class="ctrl-big r" href="{url_for("agregar_dinero_banco")}"><span class="c-ic">🏦</span> Agregar dinero banco</a>'
+    )
+
+    extra_ops = ""
+    if user.get("role") in ("admin", "supervisor"):
+        extra_ops = (
+            '<p class="dash-h2" style="margin-top:18px">Administración</p><div class="ops-scroll">'
+            + op_tile(url_for("users"), "🔑", "Usuarios", "", "")
+            + op_tile(url_for("reportes"), "📈", "Reportes", "", "")
+            + op_tile(url_for("audit"), "🧾", "Auditoría", "", "")
+            + op_tile(url_for("reassign_clients"), "🛣️", "Rutas", "", "")
+            + op_tile(url_for("bank_home"), "🏦", "Menú banco", "", "")
+            + "</div>"
+        )
+
+    body = f"""
+<style>
+.dash-wrap {{ max-width: 900px; margin: 0 auto; }}
+.dash-top {{
+  background: linear-gradient(135deg,#14532d,#22c55e);
+  color: #fff;
+  padding: 20px 16px;
+  border-radius: 20px;
+  text-align: center;
+  margin-bottom: 16px;
+  box-shadow: 0 12px 28px rgba(22,163,74,.3);
+}}
+.dash-top h1 {{ margin: 0; font-size: 1.15rem; font-weight: 900; }}
+.dash-top p {{ margin: 6px 0 0; opacity: .95; font-size: 13px; }}
+.dash-h2 {{
+  font-size: 14px;
+  font-weight: 800;
+  color: #14532d;
+  margin: 16px 0 10px 4px;
+  border-left: 4px solid #22c55e;
+  padding-left: 8px;
+}}
+body.theme-dark .dash-h2 {{ color: #86efac; }}
+.fin-strip {{
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 8px;
+}}
+.fin-mini {{
+  flex: 1 1 calc(50% - 8px);
+  min-width: 140px;
+  border-radius: 14px;
+  padding: 10px 8px;
+  color: #fff;
+  text-align: center;
+  box-shadow: 0 4px 12px rgba(0,0,0,.12);
+}}
+@media(min-width:600px){{ .fin-mini{{ flex: 1 1 calc(25% - 8px); }} }}
+.fin-mini-k {{ display:block; font-size: 10px; font-weight: 700; opacity: .95; text-transform: uppercase; }}
+.fin-mini-v {{ display:block; font-size: 14px; font-weight: 800; margin-top: 4px; }}
+.daily-row {{ display: grid; grid-template-columns: repeat(3,1fr); gap: 8px; margin-bottom: 8px; }}
+.daily-card {{
+  border-radius: 14px;
+  padding: 12px 8px;
+  text-align: center;
+  color: #fff;
+  font-weight: 800;
+}}
+.daily-card.g {{ background: linear-gradient(135deg,#15803d,#4ade80); }}
+.daily-card.r {{ background: linear-gradient(135deg,#b91c1c,#f87171); }}
+.daily-card .dk {{ display:block; font-size:10px; opacity:.95; }}
+.daily-card .dv {{ display:block; font-size:1.1rem; margin-top:4px; }}
+.ops-scroll {{
+  display: flex;
+  flex-direction: row;
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  gap: 10px;
+  padding: 8px 4px 14px;
+  -webkit-overflow-scrolling: touch;
+}}
+.op-tile {{
+  flex: 0 0 100px;
+  width: 100px;
+  min-height: 118px;
+  border-radius: 16px;
+  padding: 10px 6px;
+  text-decoration: none !important;
+  color: #fff !important;
+  text-align: center;
+  font-weight: 800;
+  font-size: 11px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-start;
+  box-shadow: 0 6px 16px rgba(0,0,0,.18);
+  position: relative;
+}}
+.op-tile:nth-child(6n+1) {{ background: linear-gradient(180deg,#2563eb,#3b82f6); }}
+.op-tile:nth-child(6n+2) {{ background: linear-gradient(180deg,#15803d,#22c55e); }}
+.op-tile:nth-child(6n+3) {{ background: linear-gradient(180deg,#0d9488,#2dd4bf); }}
+.op-tile:nth-child(6n+4) {{ background: linear-gradient(180deg,#65a30d,#84cc16); }}
+.op-tile:nth-child(6n+5) {{ background: linear-gradient(180deg,#7c3aed,#a78bfa); }}
+.op-tile:nth-child(6n+0) {{ background: linear-gradient(180deg,#c2410c,#fb923c); }}
+.op-ic {{ font-size: 22px; margin-bottom: 6px; }}
+.op-tit {{ line-height: 1.15; }}
+.op-sub {{ font-size: 9px; font-weight: 700; opacity: .9; margin-top: 4px; line-height: 1.1; }}
+.op-badge {{
+  position: absolute;
+  top: 6px; right: 6px;
+  background: rgba(0,0,0,.25);
+  border-radius: 999px;
+  padding: 2px 7px;
+  font-size: 10px;
+}}
+.ctrl-stack {{ display: flex; flex-direction: column; gap: 10px; margin-top: 8px; }}
+.ctrl-big {{
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 16px;
+  border-radius: 16px;
+  color: #fff !important;
+  font-weight: 900;
+  text-decoration: none !important;
+  font-size: 15px;
+  box-shadow: 0 8px 20px rgba(0,0,0,.15);
+}}
+.ctrl-big.g {{ background: linear-gradient(135deg,#15803d,#22c55e); }}
+.ctrl-big.o {{ background: linear-gradient(135deg,#c2410c,#f59e0b); }}
+.ctrl-big.r {{ background: linear-gradient(135deg,#b91c1c,#ef4444); }}
+.c-ic {{ font-size: 22px; }}
+</style>
+
+<div class="dash-wrap">
+  <div class="dash-top">
+    <h1>💵 {APP_BRAND} 💵</h1>
+    <p>Panel principal · datos en memoria</p>
+  </div>
+
+  <p class="dash-h2">Resumen financiero</p>
+  <div class="fin-strip">{fin_row}</div>
+
+  <p class="dash-h2">Métricas diarias</p>
+  <div class="daily-row">{daily_row}</div>
+
+  <p class="dash-h2">Operaciones</p>
+  <div class="ops-scroll">{ops}</div>
+
+  <p class="dash-h2">Control</p>
+  <div class="ctrl-stack">{ctrl}</div>
+  {extra_ops}
+</div>
+"""
     return page(body, user)
 
 
@@ -443,10 +697,20 @@ def users():
 
 @app.route("/employees")
 @login_required
-@role_required("admin", "supervisor")
 def employees():
-    rows = "".join(f"<tr><td>{u['username']}</td><td>{u['role']}</td></tr>" for u in store.users.values() if u.get("role") == "cobrador")
-    return page(f'<div class="card"><h2>Empleados</h2><table><tr><th>Usuario</th><th>Rol</th></tr>{rows}</table></div>')
+    ensure_org()
+    org_id = session.get("org_id")
+    rows = "".join(
+        f"<tr><td>{u['username']}</td><td>{u.get('phone') or '—'}</td><td>{u['role']}</td></tr>"
+        for u in store.users.values()
+        if u.get("organization_id") == org_id and u.get("role") == "cobrador"
+    )
+    body = (
+        f'<div class="card"><h2>👥 Empleados / cobradores</h2>'
+        f'<div class="table-scroll"><table><tr><th>Usuario</th><th>Teléfono</th><th>Rol</th></tr>{rows or "<tr><td colspan=3>Sin cobradores</td></tr>"}</table></div>'
+        f"{nav_subfooter()}</div>"
+    )
+    return page(body)
 
 
 @app.route("/users/new", methods=["GET", "POST"])
@@ -919,9 +1183,22 @@ def ruta_resumen():
 @app.route("/prestamos/pagados")
 @login_required
 def prestamos_pagados():
-    rows = [L for L in store.loans.values() if str(L.get("status", "")).lower() == "cerrado"]
-    t = "".join(f"<tr><td>#{L['id']}</td><td>{fmt_money(L.get('amount'))}</td></tr>" for L in rows)
-    return page(f'<div class="card"><h2>Préstamos cerrados</h2><table><tr><th>ID</th><th>Monto</th></tr>{t}</table></div>')
+    ensure_org()
+    user = current_user()
+    org_id = session.get("org_id")
+    rows = [
+        L for L in loans_for_user(org_id, user)
+        if str(L.get("status", "")).lower() == "cerrado"
+    ]
+    t = "".join(
+        f"<tr><td>#{L['id']}</td><td>{fmt_money(L.get('amount'))}</td>"
+        f"<td><a class='btn btn-secondary' href='{url_for('loan_detail', loan_id=L['id'])}'>Ver</a></td></tr>"
+        for L in rows
+    )
+    return page(
+        f'<div class="card"><h2>Préstamos pagados / cerrados</h2><div class="table-scroll">'
+        f'<table><tr><th>ID</th><th>Monto original</th><th></th></tr>{t or "<tr><td colspan=3>Ninguno</td></tr>"}</table></div>{nav_subfooter()}</div>'
+    )
 
 
 @app.route("/gps/update", methods=["POST"])
@@ -1087,19 +1364,97 @@ def bank_routes_list():
 @app.route("/bank/late")
 @login_required
 def bank_late():
-    return stub_page("Atrasos")
+    ensure_org()
+    user = current_user()
+    org_id = session.get("org_id")
+    today = date.today()
+    late = [
+        L for L in loans_for_user(org_id, user)
+        if str(L.get("status", "")).upper() == "ACTIVO"
+        and L.get("next_payment_date")
+        and L["next_payment_date"] < today
+    ]
+    late.sort(key=lambda x: x.get("next_payment_date") or today)
+    rows = ""
+    for L in late:
+        cid = L.get("client_id")
+        c = store.clients.get(cid, {})
+        nm = f"{c.get('first_name','')} {c.get('last_name') or ''}".strip() or f"Cliente #{cid}"
+        rows += (
+            f"<tr><td>#{L['id']}</td><td>{nm}</td><td>{L.get('next_payment_date')}</td>"
+            f"<td>{fmt_money(L.get('remaining'))}</td>"
+            f"<td><a class='btn btn-secondary' href='{url_for('loan_detail', loan_id=L['id'])}'>Ver</a></td></tr>"
+        )
+    body = (
+        f'<div class="card"><h2>⚠️ Préstamos atrasados</h2>'
+        f'<div class="table-scroll"><table><tr><th>ID</th><th>Cliente</th><th>Vencía</th><th>Saldo</th><th></th></tr>'
+        f"{rows or '<tr><td colspan=5>Sin atrasos</td></tr>'}</table></div>{nav_subfooter()}</div>"
+    )
+    return page(body)
 
 
 @app.route("/bank/ranking")
 @login_required
 def bank_ranking():
-    return stub_page("Ranking")
+    ensure_org()
+    user = current_user()
+    org_id = session.get("org_id")
+    today = date.today()
+    scored = []
+    for L in loans_for_user(org_id, user):
+        if str(L.get("status", "")).upper() != "ACTIVO":
+            continue
+        npd = L.get("next_payment_date")
+        days_late = (today - npd).days if npd and npd < today else 0
+        rem = float(L.get("remaining") or 0)
+        scored.append((days_late, rem, L))
+    scored.sort(key=lambda x: (-x[0], -x[1]))
+    rows = ""
+    for days_late, rem, L in scored[:50]:
+        cid = L.get("client_id")
+        c = store.clients.get(cid, {})
+        nm = f"{c.get('first_name','')} {c.get('last_name') or ''}".strip() or f"#{cid}"
+        rows += (
+            f"<tr><td>{nm}</td><td>#{L['id']}</td><td>{days_late} d</td><td>{fmt_money(rem)}</td>"
+            f"<td><a class='btn btn-secondary' href='{url_for('loan_detail', loan_id=L['id'])}'>Ver</a></td></tr>"
+        )
+    body = (
+        f'<div class="card"><h2>Ranking morosos</h2><p>Activos ordenados por días de atraso y saldo.</p>'
+        f'<div class="table-scroll"><table><tr><th>Cliente</th><th>Prést.</th><th>Atraso</th><th>Saldo</th><th></th></tr>'
+        f"{rows or '<tr><td colspan=5>Sin datos</td></tr>'}</table></div>{nav_subfooter()}</div>"
+    )
+    return page(body)
 
 
 @app.route("/bank/credit-history")
 @login_required
 def credit_history():
-    return stub_page("Historial de crédito")
+    ensure_org()
+    user = current_user()
+    org_id = session.get("org_id")
+    lids = loan_ids_visible(org_id, user)
+    by_client = {}
+    for L in store.loans.values():
+        if L["id"] not in lids:
+            continue
+        cid = L["client_id"]
+        by_client.setdefault(cid, []).append(L)
+    rows = ""
+    for cid, lst in sorted(by_client.items(), key=lambda x: store.clients.get(x[0], {}).get("first_name", "")):
+        c = store.clients.get(cid, {})
+        nm = f"{c.get('first_name','')} {c.get('last_name') or ''}".strip() or f"#{cid}"
+        doc = c.get("document_id") or "—"
+        n = len(lst)
+        cerr = sum(1 for x in lst if str(x.get("status", "")).lower() == "cerrado")
+        cap = sum(float(x.get("amount") or 0) for x in lst)
+        rows += f"<tr><td>{nm}</td><td>{doc}</td><td>{n}</td><td>{cerr}</td><td>{fmt_money(cap)}</td>"
+        rows += f"<td><a class='btn btn-secondary' href='{url_for('client_detail', client_id=cid)}'>Ver</a></td></tr>"
+    body = (
+        f'<div class="card"><h2>Historial de crédito</h2><p>Por cliente (préstamos en tu alcance).</p>'
+        f'<div class="table-scroll"><table><tr><th>Cliente</th><th>Cédula</th><th>Prést.</th><th>Cerrados</th><th>Capital total</th><th></th></tr>'
+        f"{rows or '<tr><td colspan=6>Sin datos</td></tr>'}</table></div>{nav_subfooter()}</div>"
+    )
+    return page(body)
 
 
 @app.route("/bank/client-scores")
@@ -1115,15 +1470,46 @@ def client_scores():
         mc = calc_max_credito(sd["prestamos_pagados"], sd["score"])
         rows.append(f"<tr><td>{c['first_name']}</td><td>{sd['score']}</td><td>{fmt_money(mc)}</td></tr>")
     t = "".join(rows)
-    return page(f'<div class="card"><h2>Scores</h2><table><tr><th>Cliente</th><th>Score</th><th>Crédito sug.</th></tr>{t}</table></div>')
+    return page(
+        f'<div class="card"><h2>⭐ Score de clientes</h2><div class="table-scroll">'
+        f'<table><tr><th>Cliente</th><th>Score</th><th>Crédito sug.</th></tr>{t}</table></div>{nav_subfooter()}</div>'
+    )
 
 
 @app.route("/bank/check-client", methods=["GET", "POST"])
 @login_required
 def check_client():
+    ensure_org()
+    user = current_user()
+    org_id = session.get("org_id")
+    result_html = ""
     if request.method == "POST":
-        return page('<div class="card"><h2>Consulta</h2><p>Sin base de datos: búsqueda no aplicable.</p></div>')
-    return page('<div class="card"><h2>Consultar por cédula</h2><form method="post"><input name="cedula"><button class="btn btn-primary" type="submit">Buscar</button></form></div>')
+        q = (request.form.get("cedula") or "").strip().upper().replace(" ", "")
+        found = None
+        for c in clients_for_user(org_id, user):
+            doc = (c.get("document_id") or "").strip().upper().replace(" ", "")
+            if doc and q and q in doc:
+                found = c
+                break
+        if found:
+            loans_c = [L for L in store.loans.values() if L.get("client_id") == found["id"]]
+            lr = "".join(
+                f"<tr><td>#{L['id']}</td><td>{L.get('status')}</td><td>{fmt_money(L.get('remaining'))}</td></tr>"
+                for L in loans_c
+            )
+            result_html = (
+                f"<h3>Resultado</h3><p><b>{found.get('first_name')} {found.get('last_name') or ''}</b> · {found.get('document_id')}</p>"
+                f'<div class="table-scroll"><table><tr><th>Préstamo</th><th>Estado</th><th>Saldo</th></tr>{lr}</table></div>'
+                f'<p><a class="btn btn-primary" href="{url_for("client_detail", client_id=found["id"])}">Ficha cliente</a></p>'
+            )
+        else:
+            result_html = "<p>No se encontró ningún cliente con esa cédula en tu cartera.</p>"
+    body = (
+        f'<div class="card"><h2>🔍 Consultar por cédula</h2>'
+        f'<form method="post"><label>Cédula / documento</label><input name="cedula" required placeholder="001-0000000-0">'
+        f'<button class="btn btn-primary" type="submit">Buscar</button></form>{result_html}{nav_subfooter()}</div>'
+    )
+    return page(body)
 
 
 @app.route("/bank/risk-clients")
@@ -1135,32 +1521,130 @@ def risk_clients():
 @app.route("/bank/cobro-sabado")
 @login_required
 def cobro_sabado():
-    return stub_page("Cobro sábado")
+    ensure_org()
+    user = current_user()
+    org_id = session.get("org_id")
+    today = date.today()
+    days_to_sat = (5 - today.weekday()) % 7
+    if days_to_sat == 0:
+        days_to_sat = 7
+    prox_sab = today + timedelta(days=days_to_sat)
+    rows = []
+    for L in loans_for_user(org_id, user):
+        if str(L.get("status", "")).upper() != "ACTIVO":
+            continue
+        if "semanal" not in str(L.get("frequency") or "").lower():
+            continue
+        npd = L.get("next_payment_date")
+        if npd and npd <= prox_sab:
+            cid = L.get("client_id")
+            c = store.clients.get(cid, {})
+            nm = f"{c.get('first_name','')} {c.get('last_name') or ''}".strip()
+            rows.append((npd, L, nm))
+    rows.sort(key=lambda x: x[0] or date.max)
+    tr = ""
+    for npd, L, nm in rows:
+        tr += (
+            f"<tr><td>{nm}</td><td>#{L['id']}</td><td>{npd}</td><td>{fmt_money(L.get('installment_amount'))}</td>"
+            f"<td><a class='btn btn-secondary' href='{url_for('loan_detail', loan_id=L['id'])}'>Cobrar</a></td></tr>"
+        )
+    body = (
+        f'<div class="card"><h2>💰 Cobro sábado</h2><p>Préstamos <b>semanales</b> con cuota hasta el próximo sábado ({prox_sab}).</p>'
+        f'<div class="table-scroll"><table><tr><th>Cliente</th><th>Prést.</th><th>Próx. pago</th><th>Cuota est.</th><th></th></tr>'
+        f"{tr or '<tr><td colspan=5>Ninguno programado para este ciclo</td></tr>'}</table></div>{nav_subfooter()}</div>"
+    )
+    return page(body)
 
 
 @app.route("/bank/resumen")
 @login_required
 def bank_resumen():
-    return stub_page("Resumen banco")
+    ensure_org()
+    k = compute_financial_kpis(session.get("org_id"), current_user())
+    body = (
+        f'<div class="card"><h2>📊 Resumen financiero</h2>'
+        f"<ul style='line-height:1.9'>"
+        f"<li>Capital prestado: <b>{fmt_money(k['capital_prestado'])}</b></li>"
+        f"<li>Capital cobrado: <b>{fmt_money(k['capital_cobrado'])}</b></li>"
+        f"<li>Capital pendiente (activos): <b>{fmt_money(k['capital_pendiente'])}</b></li>"
+        f"<li>Interés total: <b>{fmt_money(k['interes_total'])}</b></li>"
+        f"<li>Interés cobrado: <b>{fmt_money(k['interes_cobrado'])}</b></li>"
+        f"<li>Interés pendiente: <b>{fmt_money(k['interes_pendiente'])}</b></li>"
+        f"<li><b>Total por cobrar: {fmt_money(k['total_por_cobrar'])}</b></li>"
+        f"<li>Cobrado hoy: <b>{fmt_money(k['cobrado_hoy'])}</b> · Interés hoy: <b>{fmt_money(k['interes_hoy'])}</b></li>"
+        f"<li>Préstamos atrasados: <b>{k['atrasados']}</b></li>"
+        f"</ul>{nav_subfooter()}</div>"
+    )
+    return page(body)
 
 
-@app.route("/bank/cierre-semanal", methods=["GET", "POST"])
+@app.route("/bank/cierre-semanal", methods=["GET"])
 @login_required
 def cierre_semanal():
-    return stub_page("Cierre semanal")
+    ensure_org()
+    org_id = session.get("org_id")
+    user = current_user()
+    k = compute_financial_kpis(org_id, user)
+    body = (
+        f'<div class="card"><h2>📅 Cierre semanal</h2>'
+        f"<p>Resumen actual (memoria) antes de cerrar:</p><ul>"
+        f"<li>Cobrado hoy: {fmt_money(k['cobrado_hoy'])}</li>"
+        f"<li>Total por cobrar: {fmt_money(k['total_por_cobrar'])}</li>"
+        f"<li>Préstamos activos en vista: {k['n_activos']}</li></ul>"
+        f'<form method="post" action="{url_for("cerrar_semana")}">'
+        f'<label>Notas del cierre</label><textarea name="notas" rows="3" placeholder="Opcional"></textarea>'
+        f'<button class="btn btn-primary" type="submit">Registrar cierre de semana</button></form>'
+        f"{nav_subfooter()}</div>"
+    )
+    return page(body)
 
 
 @app.route("/bank/cerrar-semana", methods=["POST"])
 @login_required
 def cerrar_semana():
-    flash("Cierre simulado.", "info")
-    return redirect(url_for("bank_resumen"))
+    ensure_org()
+    org_id = session.get("org_id")
+    user = current_user()
+    k = compute_financial_kpis(org_id, user)
+    rec = {
+        "id": store.nid("cierre"),
+        "closed_at": datetime.utcnow(),
+        "user_id": user["id"],
+        "notas": (request.form.get("notas") or "").strip(),
+        "cobrado_hoy_snapshot": k["cobrado_hoy"],
+        "total_por_cobrar_snapshot": k["total_por_cobrar"],
+        "n_activos": k["n_activos"],
+    }
+    store.closure_history.append(rec)
+    try:
+        log_action(user["id"], "cierre_semana", str(rec["id"]))
+    except Exception:
+        pass
+    flash("Cierre de semana registrado.", "success")
+    return redirect(url_for("historial_cierres"))
 
 
 @app.route("/bank/historial-cierres")
 @login_required
 def historial_cierres():
-    return stub_page("Historial cierres")
+    rows = ""
+    for rec in reversed(store.closure_history[-50:]):
+        cid = rec.get("id")
+        del_form = (
+            f'<form method="post" action="{url_for("borrar_cierre", cierre_id=cid)}" style="display:inline" '
+            f'onsubmit="return confirm(\'¿Eliminar este registro?\');"><button type="submit" class="btn btn-secondary">Borrar</button></form>'
+        )
+        rows += (
+            f"<tr><td>{rec.get('closed_at')}</td><td>{fmt_money(rec.get('cobrado_hoy_snapshot'))}</td>"
+            f"<td>{fmt_money(rec.get('total_por_cobrar_snapshot'))}</td>"
+            f"<td>{rec.get('n_activos')}</td><td>{rec.get('notas') or '—'}</td><td>{del_form}</td></tr>"
+        )
+    body = (
+        f'<div class="card"><h2>✔️ Cuadres cerrados</h2><p>Últimos cierres semanales guardados en memoria.</p>'
+        f'<div class="table-scroll"><table><tr><th>Fecha</th><th>Cobrado hoy (snap)</th><th>Total por cobrar</th><th>Activos</th><th>Notas</th><th></th></tr>'
+        f"{rows or '<tr><td colspan=6>Sin cierres aún</td></tr>'}</table></div>{nav_subfooter()}</div>"
+    )
+    return page(body)
 
 
 @app.route("/bank/pagar/<int:loan_id>", methods=["POST"])
@@ -1173,6 +1657,7 @@ def pagar_prestamo(loan_id):
 @app.route("/bank/borrar-cierre/<int:cierre_id>", methods=["POST"])
 @login_required
 def borrar_cierre(cierre_id):
+    store.closure_history = [c for c in store.closure_history if c.get("id") != cierre_id]
     flash("Cierre eliminado (memoria).", "info")
     return redirect(url_for("historial_cierres"))
 
@@ -1180,16 +1665,53 @@ def borrar_cierre(cierre_id):
 @app.route("/bank/agregar-dinero", methods=["GET", "POST"])
 @login_required
 def agregar_dinero_banco():
+    ensure_org()
+    org_id = session.get("org_id")
     if request.method == "POST":
-        flash("Movimiento simulado.", "success")
-        return redirect(url_for("bank_home"))
-    return stub_page("Agregar dinero al banco")
+        amt = request.form.get("amount", type=float)
+        note = (request.form.get("note") or "Depósito banco").strip()
+        if amt is None or amt <= 0:
+            flash("Monto inválido.", "danger")
+            return redirect(url_for("agregar_dinero_banco"))
+        rid = store.nid("cash")
+        store.cash_reports[rid] = {
+            "id": rid,
+            "user_id": current_user()["id"],
+            "date": date.today(),
+            "amount": amt,
+            "note": note,
+            "created_at": datetime.utcnow(),
+            "organization_id": org_id,
+            "movement_type": "deposito_banco",
+        }
+        store.deposit_history.append(
+            {"id": rid, "amount": amt, "note": note, "at": datetime.utcnow()}
+        )
+        flash(f"Ingresado {fmt_money(amt)} al flujo de caja (memoria).", "success")
+        return redirect(url_for("historial_depositos"))
+    body = (
+        f'<div class="card"><h2>🏦 Agregar dinero al banco</h2>'
+        f'<form method="post"><label>Monto (RD$)</label><input name="amount" type="number" step="0.01" required>'
+        f'<label>Nota</label><input name="note" placeholder="Ej. Ingreso efectivo">'
+        f'<button class="btn btn-primary" type="submit">Guardar</button></form>'
+        f'<p><a class="btn btn-secondary" href="{url_for("historial_depositos")}">Ver historial de depósitos</a></p>{nav_subfooter()}</div>'
+    )
+    return page(body)
 
 
 @app.route("/bank/historial-depositos")
 @login_required
 def historial_depositos():
-    return stub_page("Historial depósitos")
+    rows = "".join(
+        f"<tr><td>{d.get('at')}</td><td>{fmt_money(d.get('amount'))}</td><td>{d.get('note') or '—'}</td></tr>"
+        for d in reversed(store.deposit_history[-100:])
+    )
+    body = (
+        f'<div class="card"><h2>Historial de depósitos</h2>'
+        f'<div class="table-scroll"><table><tr><th>Fecha</th><th>Monto</th><th>Nota</th></tr>'
+        f"{rows or '<tr><td colspan=3>Sin depósitos</td></tr>'}</table></div>{nav_subfooter()}</div>"
+    )
+    return page(body)
 
 
 if __name__ == "__main__":
