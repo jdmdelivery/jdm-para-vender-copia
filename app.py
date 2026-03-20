@@ -2824,11 +2824,41 @@ def bank_daily_list():
     tr = ""
     for npd, L, nm in pack:
         nm_e = html.escape(nm)
+        pay_href = url_for("new_payment", loan_id=L["id"])
         tr += (
             f"<tr><td>{nm_e}</td><td>#{L['id']}</td><td>{npd}</td><td>{html.escape(fmt_money(L.get('installment_amount')))}</td>"
             f"<td>{html.escape(fmt_money(L.get('remaining')))}</td>"
-            f"<td><a class='btn btn-secondary' href='{url_for('loan_detail', loan_id=L['id'])}'>Cobrar</a></td></tr>"
+            f"<td><a class='btn btn-primary' href='{pay_href}' data-pay-href='{pay_href}' onclick='return openPayConfirm(this)'>Pagar</a></td></tr>"
         )
+    pay_confirm_modal = """
+    <div id="payConfirmModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.35);z-index:99999">
+      <div style="background:#fff;max-width:420px;margin:18vh auto;padding:16px;border-radius:16px;box-shadow:0 14px 40px rgba(0,0,0,.25)">
+        <h3 style="margin:0 0 8px 0;color:#14532d;font-weight:900">Confirmar pago</h3>
+        <p style="margin:0 0 12px 0;opacity:.92">¿Aceptar y abrir el formulario de pago para este préstamo?</p>
+        <div style="display:flex;gap:10px;justify-content:flex-end;flex-wrap:wrap">
+          <button type="button" class="btn btn-secondary" onclick="closePayConfirm()">Cancelar</button>
+          <button type="button" class="btn btn-primary" onclick="acceptPayConfirm()">Aceptar</button>
+        </div>
+      </div>
+    </div>
+    <script>
+      let payConfirmHref = null;
+      function openPayConfirm(el){
+        payConfirmHref = el.getAttribute('data-pay-href') || el.getAttribute('href');
+        const m = document.getElementById('payConfirmModal');
+        if (m) m.style.display = 'block';
+        return false;
+      }
+      function closePayConfirm(){
+        const m = document.getElementById('payConfirmModal');
+        if (m) m.style.display = 'none';
+        payConfirmHref = null;
+      }
+      function acceptPayConfirm(){
+        if (payConfirmHref) window.location = payConfirmHref;
+      }
+    </script>
+    """
     body = (
         f'<div class="card" style="padding:16px;background:#ecfdf5;border:1px solid rgba(22,163,74,.15);">'
         f'<h2 style="margin:0 0 8px 0;color:#14532d;">📋 Lista diaria — cobro sábados</h2>'
@@ -2839,7 +2869,7 @@ def bank_daily_list():
         f'<div class="table-scroll"><table><tr>'
         f"<th>Cliente</th><th>Prést.</th><th>Próx. pago</th><th>Cuota est.</th><th>Saldo</th><th></th></tr>"
         f"{tr or '<tr><td colspan=6 style=\"text-align:center;opacity:.85\">Ninguno para este sábado de cobro</td></tr>'}"
-        f"</table></div>{nav_subfooter()}</div>"
+        f"</table></div>{pay_confirm_modal}{nav_subfooter()}</div>"
     )
     return page(body)
 
@@ -3271,35 +3301,80 @@ def bank_delivery():
     ensure_org()
     oid = session.get("org_id")
     user = current_user()
-    puede_registrar = user.get("role") in ("admin", "supervisor") or is_cartera_admin(user)
+    puede_registrar_entrega = user.get("role") in ("admin", "supervisor") or is_cartera_admin(user)
+    puede_registrar_devolucion = user.get("role") in ("admin", "supervisor", "cobrador") or is_cartera_admin(user)
 
     if request.method == "POST":
-        if not puede_registrar:
-            flash("Solo administración puede registrar entregas.", "danger")
+        form_type = (request.form.get("form_type") or "entrega").strip().lower()
+
+        if form_type == "entrega":
+            if not puede_registrar_entrega:
+                flash("Solo administración puede registrar entregas.", "danger")
+                return redirect(url_for("bank_delivery"))
+            collector_id = request.form.get("collector_id", type=int)
+            amt = request.form.get("amount", type=float)
+            note = (request.form.get("note") or "").strip()
+            cob = store.users.get(collector_id) if collector_id else None
+            if not cob or cob.get("organization_id") != oid or cob.get("role") != "cobrador":
+                flash("Seleccione un cobrador válido.", "danger")
+                return redirect(url_for("bank_delivery"))
+            if amt is None or amt <= 0:
+                flash("Monto inválido.", "danger")
+                return redirect(url_for("bank_delivery"))
+            try:
+                apply_cash_movement(
+                    movement_type="entrega_cobrador",
+                    amount=-float(amt),
+                    note=note or f"Entrega efectivo para ruta — {cob.get('username')}",
+                    user_id=user["id"],
+                    org_id=oid,
+                    collector_id=collector_id,
+                )
+            except ValueError as e:
+                flash(str(e), "danger")
+                return redirect(url_for("bank_delivery"))
+            flash(f"Entrega registrada: {fmt_money(amt)} para {cob.get('username')}.", "success")
             return redirect(url_for("bank_delivery"))
-        collector_id = request.form.get("collector_id", type=int)
-        amt = request.form.get("amount", type=float)
-        note = (request.form.get("note") or "").strip()
-        cob = store.users.get(collector_id) if collector_id else None
-        if not cob or cob.get("organization_id") != oid or cob.get("role") != "cobrador":
-            flash("Seleccione un cobrador válido.", "danger")
+
+        if form_type == "devolucion":
+            if not puede_registrar_devolucion:
+                flash("No tiene permiso para registrar devoluciones.", "danger")
+                return redirect(url_for("bank_delivery"))
+
+            amt = request.form.get("amount", type=float)
+            note = (request.form.get("note") or "").strip()
+
+            # Un cobrador solo puede registrar devolución a su nombre (si no es admin/outsider).
+            if user.get("role") == "cobrador" and not is_cartera_admin(user):
+                collector_id = user["id"]
+            else:
+                collector_id = request.form.get("collector_id", type=int)
+
+            cob = store.users.get(collector_id) if collector_id else None
+            if not cob or cob.get("organization_id") != oid or cob.get("role") != "cobrador":
+                flash("Seleccione un cobrador válido.", "danger")
+                return redirect(url_for("bank_delivery"))
+            if amt is None or amt <= 0:
+                flash("Monto inválido.", "danger")
+                return redirect(url_for("bank_delivery"))
+
+            try:
+                apply_cash_movement(
+                    movement_type="devolucion_capital",
+                    amount=float(amt),
+                    note=note or f"Devolución de capital — {cob.get('username')}",
+                    user_id=user["id"],
+                    org_id=oid,
+                    collector_id=collector_id,
+                )
+            except ValueError as e:
+                flash(str(e), "danger")
+                return redirect(url_for("bank_delivery"))
+
+            flash(f"Devolución registrada: {fmt_money(amt)} para {cob.get('username')}.", "success")
             return redirect(url_for("bank_delivery"))
-        if amt is None or amt <= 0:
-            flash("Monto inválido.", "danger")
-            return redirect(url_for("bank_delivery"))
-        try:
-            apply_cash_movement(
-                movement_type="entrega_cobrador",
-                amount=-float(amt),
-                note=note or f"Entrega efectivo para ruta — {cob.get('username')}",
-                user_id=user["id"],
-                org_id=oid,
-                collector_id=collector_id,
-            )
-        except ValueError as e:
-            flash(str(e), "danger")
-            return redirect(url_for("bank_delivery"))
-        flash(f"Entrega registrada: {fmt_money(amt)} para {cob.get('username')}.", "success")
+
+        flash("Tipo de formulario inválido.", "danger")
         return redirect(url_for("bank_delivery"))
 
     entregas = sorted(
@@ -3313,6 +3388,18 @@ def bank_delivery():
     )
     if user.get("role") == "cobrador" and not is_cartera_admin(user):
         entregas = [e for e in entregas if e.get("collector_id") == user["id"]]
+
+    devoluciones = sorted(
+        (
+            cr
+            for cr in store.cash_reports.values()
+            if cr.get("organization_id") == oid and cr.get("movement_type") == "devolucion_capital"
+        ),
+        key=lambda x: x.get("created_at") or datetime.min,
+        reverse=True,
+    )
+    if user.get("role") == "cobrador" and not is_cartera_admin(user):
+        devoluciones = [d for d in devoluciones if d.get("collector_id") == user["id"]]
 
     cobradores = sorted(
         [u for u in store.users.values() if u.get("organization_id") == oid and u.get("role") == "cobrador"],
@@ -3336,8 +3423,23 @@ def bank_delivery():
             f"<td>{html.escape(cr.get('note') or '')}</td><td>{reg_by}</td></tr>"
         )
 
+    tr_dev = ""
+    for cr in devoluciones[:150]:
+        col_uid = cr.get("collector_id")
+        col = store.users.get(col_uid, {})
+        col_nm = html.escape(col.get("name") or col.get("username") or "—")
+        reg_by = html.escape(store.users.get(cr.get("user_id"), {}).get("username") or "—")
+        m = float(cr.get("amount") or 0)
+        fecha = cr.get("created_at")
+        fecha_s = fecha.strftime("%d/%m/%Y %I:%M %p") if fecha and hasattr(fecha, "strftime") else str(fecha or "—")
+        tr_dev += (
+            f"<tr><td>{html.escape(fecha_s)}</td><td>{col_nm}</td>"
+            f"<td style='text-align:right;font-weight:800;color:#15803d'>{html.escape(fmt_money(m))}</td>"
+            f"<td>{html.escape(cr.get('note') or '')}</td><td>{reg_by}</td></tr>"
+        )
+
     formulario = ""
-    if puede_registrar:
+    if puede_registrar_entrega:
         formulario = (
             f'<div class="card" style="padding:16px;margin-bottom:14px;background:#ecfdf5;border:1px solid rgba(22,163,74,.2)">'
             f'<h3 style="margin:0 0 8px 0;color:#14532d">Registrar entrega</h3>'
@@ -3357,14 +3459,61 @@ def bank_delivery():
             f'<p style="margin:0">Aquí ves las entregas registradas a tu nombre. Solo administración registra nuevas entregas.</p></div>'
         )
 
+    formulario_dev = ""
+    if puede_registrar_devolucion:
+        if user.get("role") == "cobrador" and not is_cartera_admin(user):
+            # Cobrador: la devolución va siempre a su propio ID.
+            my_name = html.escape(user.get("name") or user.get("username") or "—")
+            formulario_dev = (
+                f'<div class="card" style="padding:16px;margin-bottom:14px;background:#f0f9ff;border:1px solid rgba(56,189,248,.25);">'
+                f'<h3 style="margin:0 0 8px 0;color:#075985">Devolución de capital</h3>'
+                f'<p style="margin:0 0 10px 0;font-size:14px;opacity:.92">Cuando el {my_name} regresa con efectivo no utilizado, se registra aquí para cuadrar el banco.</p>'
+                f'<p style="margin:0 0 10px 0"><b>Banco disponible:</b> {html.escape(fmt_money(get_bank_available(oid)))}</p>'
+                f'<form method="post">'
+                f'<input type="hidden" name="form_type" value="devolucion">'
+                f'<input type="hidden" name="collector_id" value="{user["id"]}">'
+                f'<label>Monto devuelto</label><input name="amount" type="number" step="0.01" min="0.01" required>'
+                f'<label>Nota (opcional)</label><input name="note" type="text" placeholder="Ej. Devolución ruta / cierre">'
+                f'<button class="btn btn-primary" type="submit" style="margin-top:10px">Guardar devolución</button>'
+                f'</form></div>'
+            )
+        else:
+            formulario_dev = (
+                f'<div class="card" style="padding:16px;margin-bottom:14px;background:#f0fdf4;border:1px solid rgba(16,185,129,.2);">'
+                f'<h3 style="margin:0 0 8px 0;color:#14532d">Devolución de capital</h3>'
+                f'<p style="margin:0 0 10px 0;font-size:14px;opacity:.92">El dinero devuelto por el prestamista/cobrador se suma al banco para cuadrar al terminar la ruta.</p>'
+                f'<p style="margin:0 0 10px 0"><b>Banco disponible:</b> {html.escape(fmt_money(get_bank_available(oid)))}</p>'
+                f'<form method="post">'
+                f'<input type="hidden" name="form_type" value="devolucion">'
+                f'<label>Cobrador</label><select name="collector_id" required><option value="">— Elegir —</option>{opts}</select>'
+                f'<label>Monto devuelto</label><input name="amount" type="number" step="0.01" min="0.01" required>'
+                f'<label>Nota (opcional)</label><input name="note" type="text" placeholder="Ej. Ruta norte 22/03">'
+                f'<button class="btn btn-primary" type="submit" style="margin-top:10px">Guardar devolución</button>'
+                f'</form></div>'
+            )
+    else:
+        formulario_dev = (
+            f'<div class="card" style="padding:14px;margin-bottom:14px;opacity:.95">'
+            f'<p style="margin:0">Aquí ves la devolución de capital registrada para el banco.</p></div>'
+        )
+
     body = (
         f"{formulario}"
+        f"{formulario_dev}"
         f'<div class="card" style="padding:16px">'
         f'<h2 style="margin:0 0 6px 0;color:#14532d">💰 Entrega de efectivo</h2>'
         f'<p style="margin:0 0 14px 0;font-size:14px">Historial de entregas al cobrador para salir a cobrar.</p>'
         f'<div class="table-scroll"><table><tr>'
         f"<th>Fecha</th><th>Cobrador</th><th>Monto</th><th>Nota</th><th>Registró</th></tr>"
         f"{tr or '<tr><td colspan=5 style=\"text-align:center;opacity:.85\">Sin entregas registradas</td></tr>'}"
+        "</table></div>"
+        f"</div>"
+        f'<div class="card" style="padding:16px;margin-top:14px">'
+        f'<h2 style="margin:0 0 6px 0;color:#14532d">🧾 Devolución de capital</h2>'
+        f'<p style="margin:0 0 14px 0;font-size:14px">Efectivo devuelto por el cobrador/“prestamista” para cuadrar el banco.</p>'
+        f'<div class="table-scroll"><table><tr>'
+        f"<th>Fecha</th><th>Cobrador</th><th>Monto</th><th>Nota</th><th>Registró</th></tr>"
+        f"{tr_dev or '<tr><td colspan=5 style=\"text-align:center;opacity:.85\">Sin devoluciones registradas</td></tr>'}"
         "</table></div>"
         f"{nav_subfooter()}</div>"
     )
@@ -3771,16 +3920,47 @@ def cobro_sabado():
     tr = ""
     for npd, L, nm in rows:
         nm_e = html.escape(nm or f"Cliente #{L.get('client_id')}")
+        pay_href = url_for("new_payment", loan_id=L["id"])
         tr += (
             f"<tr><td>{nm_e}</td><td>#{L['id']}</td><td>{npd}</td><td>{html.escape(fmt_money(L.get('installment_amount')))}</td>"
-            f"<td><a class='btn btn-secondary' href='{url_for('loan_detail', loan_id=L['id'])}'>Cobrar</a></td></tr>"
+            f"<td><a class='btn btn-primary' href='{pay_href}' data-pay-href='{pay_href}' onclick='return openPayConfirm(this)'>Pagar</a></td></tr>"
         )
     body = (
         f'<div class="card"><h2>💰 Cobro sábado</h2>'
         f"<p>Préstamos <b>semanales</b> con cuota a cobrar a más tardar el sábado "
         f"<b>{prox_sab.strftime('%d/%m/%Y')}</b> (hoy si ya es sábado).</p>"
         f'<div class="table-scroll"><table><tr><th>Cliente</th><th>Prést.</th><th>Próx. pago</th><th>Cuota est.</th><th></th></tr>'
-        f"{tr or '<tr><td colspan=5>Ninguno programado para este ciclo</td></tr>'}</table></div>{nav_subfooter()}</div>"
+        f"{tr or '<tr><td colspan=5>Ninguno programado para este ciclo</td></tr>'}</table></div>"
+        """
+<div id="payConfirmModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.35);z-index:99999">
+  <div style="background:#fff;max-width:420px;margin:18vh auto;padding:16px;border-radius:16px;box-shadow:0 14px 40px rgba(0,0,0,.25)">
+    <h3 style="margin:0 0 8px 0;color:#14532d;font-weight:900">Confirmar pago</h3>
+    <p style="margin:0 0 12px 0;opacity:.92">¿Aceptar y abrir el formulario de pago para este préstamo?</p>
+    <div style="display:flex;gap:10px;justify-content:flex-end;flex-wrap:wrap">
+      <button type="button" class="btn btn-secondary" onclick="closePayConfirm()">Cancelar</button>
+      <button type="button" class="btn btn-primary" onclick="acceptPayConfirm()">Aceptar</button>
+    </div>
+  </div>
+</div>
+<script>
+  let payConfirmHref = null;
+  function openPayConfirm(el){
+    payConfirmHref = el.getAttribute('data-pay-href') || el.getAttribute('href');
+    const m = document.getElementById('payConfirmModal');
+    if (m) m.style.display = 'block';
+    return false;
+  }
+  function closePayConfirm(){
+    const m = document.getElementById('payConfirmModal');
+    if (m) m.style.display = 'none';
+    payConfirmHref = null;
+  }
+  function acceptPayConfirm(){
+    if (payConfirmHref) window.location = payConfirmHref;
+  }
+</script>
+"""
+        f"{nav_subfooter()}</div>"
     )
     return page(body)
 
