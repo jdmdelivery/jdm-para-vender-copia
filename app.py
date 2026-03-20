@@ -43,6 +43,7 @@ ORG_ID = 1
 SUPER_ADMIN_USERNAME = os.getenv("SUPER_ADMIN_USERNAME", "super_admin")
 SUPER_ADMIN_PASSWORD = os.getenv("SUPER_ADMIN_PASSWORD", "super_admin")
 DEFAULT_TENANT_SUBSCRIPTION_DAYS = int(os.getenv("DEFAULT_TENANT_SUBSCRIPTION_DAYS", "30"))
+PAYMENT_EXTENSION_DAYS = int(os.getenv("PAYMENT_EXTENSION_DAYS", "30"))
 
 ACCOUNT_PENDING = "pendiente"
 ACCOUNT_ACTIVE = "activo"
@@ -293,7 +294,8 @@ class Store:
     __slots__ = (
         "users", "organizations", "clients", "loans", "payments", "loan_arrears",
         "cash_reports", "audit_log", "route_expenses", "initial_discounts", "gps_positions",
-        "weekly_closures", "deposit_history", "closure_history", "starting_banks", "starting_bank_default", "_seq",
+        "weekly_closures", "deposit_history", "closure_history", "starting_banks", "starting_bank_default",
+        "admin_payments", "_seq",
     )
 
     def __init__(self):
@@ -311,6 +313,7 @@ class Store:
         self.weekly_closures = {}
         self.deposit_history = []
         self.closure_history = []
+        self.admin_payments = []  # pagos de suscripción de admins (historial)
         # Saldo inicial del banco (por tenant/admin).
         try:
             self.starting_bank_default = float(os.getenv("STARTING_BANK", "0") or 0)
@@ -322,6 +325,7 @@ class Store:
             "clients": 0,
             "loans": 0,
             "payments": 0,
+            "admin_payments": 0,
             "arrears": 0,
             "cash": 0,
             "route_expenses": 0,
@@ -352,7 +356,9 @@ class Store:
             "created_at": created,
             "name": None,
             "account_status": ACCOUNT_ACTIVE,
-            "subscription_end": sub_end,
+            "fecha_inicio": created,
+            "fecha_fin": sub_end,
+            "subscription_end": sub_end,  # compatibilidad
         }
 
         # ADMÍN TENANT inicial (su propio sistema).
@@ -367,7 +373,9 @@ class Store:
             "created_at": created,
             "name": None,
             "account_status": ACCOUNT_ACTIVE,
-            "subscription_end": sub_end,
+            "fecha_inicio": created,
+            "fecha_fin": sub_end,
+            "subscription_end": sub_end,  # compatibilidad
         }
         self.starting_banks[tenant_admin_id] = self.starting_bank_default
         self._seq["users"] = tenant_admin_id
@@ -651,17 +659,36 @@ def login():
             tenant_admin = store.users.get(tenant_id, {}) if tenant_id else user
             now = datetime.utcnow()
 
-            # Auto-suspensión por expiración de suscripción (solo para el admin del tenant).
-            sub_end = tenant_admin.get("subscription_end")
-            if sub_end and hasattr(sub_end, "strftime"):
-                if now > sub_end and tenant_admin.get("account_status") != ACCOUNT_SUSPENDED:
-                    tenant_admin["account_status"] = ACCOUNT_SUSPENDED
+            def to_date(x):
+                if not x:
+                    return None
+                try:
+                    # datetime -> date
+                    if hasattr(x, "date") and not isinstance(x, date):
+                        return x.date()
+                except Exception:
+                    pass
+                if isinstance(x, date):
+                    return x
+                return None
 
+            now_d = now.date()
             u_status = user.get("account_status", ACCOUNT_ACTIVE)
             tenant_status = tenant_admin.get("account_status", ACCOUNT_ACTIVE)
 
-            if u_status == ACCOUNT_SUSPENDED or tenant_status == ACCOUNT_SUSPENDED:
-                flash("Usuario suspendido por el sistema", "danger")
+            # Expiración por fecha: se bloquea con mensaje requerido.
+            u_fin = to_date(user.get("fecha_fin")) or to_date(user.get("subscription_end"))
+            tenant_fin = to_date(tenant_admin.get("fecha_fin")) or to_date(tenant_admin.get("subscription_end"))
+            if u_fin and now_d > u_fin:
+                flash("Acceso vencido", "danger")
+                return render_template_string(
+                    TPL_LOGIN,
+                    flashes=get_flashed_messages(with_categories=True),
+                    app_brand=APP_BRAND,
+                    admin_whatsapp=ADMIN_WHATSAPP,
+                )
+            if tenant_fin and now_d > tenant_fin:
+                flash("Acceso vencido", "danger")
                 return render_template_string(
                     TPL_LOGIN,
                     flashes=get_flashed_messages(with_categories=True),
@@ -669,8 +696,19 @@ def login():
                     admin_whatsapp=ADMIN_WHATSAPP,
                 )
 
+            # Pendiente de aprobación.
             if u_status == ACCOUNT_PENDING or tenant_status == ACCOUNT_PENDING:
                 flash("Usuario pendiente de aprobación por el sistema", "warning")
+                return render_template_string(
+                    TPL_LOGIN,
+                    flashes=get_flashed_messages(with_categories=True),
+                    app_brand=APP_BRAND,
+                    admin_whatsapp=ADMIN_WHATSAPP,
+                )
+
+            # Suspensión por falta de pago.
+            if u_status == ACCOUNT_SUSPENDED or tenant_status == ACCOUNT_SUSPENDED:
+                flash("Usuario suspendido por el sistema", "danger")
                 return render_template_string(
                     TPL_LOGIN,
                     flashes=get_flashed_messages(with_categories=True),
@@ -686,6 +724,15 @@ def login():
                     app_brand=APP_BRAND,
                     admin_whatsapp=ADMIN_WHATSAPP,
                 )
+
+            # Alerta automática por suscripción: si vence en 3 días.
+            effective_fin = u_fin or tenant_fin
+            if effective_fin and hasattr(effective_fin, "strftime"):
+                days_left = (effective_fin - now_d).days
+                if days_left == 3:
+                    flash("Te quedan 3 días", "warning")
+                elif 1 <= days_left <= 2:
+                    flash(f"Te quedan {days_left} días", "warning")
 
             session["user_id"] = user["id"]
             session["role"] = role
@@ -737,7 +784,9 @@ def register_admin():
             "created_at": created,
             "name": None,
             "account_status": ACCOUNT_PENDING,
-            "subscription_end": sub_end,
+            "fecha_inicio": created,
+            "fecha_fin": sub_end,
+            "subscription_end": sub_end,  # compatibilidad
         }
         store.starting_banks[uid] = store.starting_bank_default
         flash("Registro recibido. Queda pendiente de aprobación por el sistema.", "success")
@@ -1126,6 +1175,28 @@ def new_user():
         org_id = session.get("org_id")
         uid = store.nid("users")
         status = ACCOUNT_PENDING if role == "cobrador" else ACCOUNT_ACTIVE
+
+        # Fechas de acceso (solo cobradores). Se guardan incluso si queda pendiente.
+        fecha_inicio = None
+        fecha_fin = None
+        if role == "cobrador":
+            raw_inicio = (request.form.get("fecha_inicio") or "").strip()
+            raw_fin = (request.form.get("fecha_fin") or "").strip()
+            today = date.today()
+            default_inicio = today
+            default_fin = today + timedelta(days=30)
+            try:
+                fecha_inicio = (
+                    datetime.strptime(raw_inicio, "%Y-%m-%d").date() if raw_inicio else default_inicio
+                )
+                fecha_fin = datetime.strptime(raw_fin, "%Y-%m-%d").date() if raw_fin else default_fin
+            except ValueError:
+                flash("Fechas inválidas. Usa el selector de fechas.", "danger")
+                return redirect(url_for("new_user"))
+            if fecha_fin < fecha_inicio:
+                flash("La fecha fin no puede ser menor que la fecha inicio.", "danger")
+                return redirect(url_for("new_user"))
+
         store.users[uid] = {
             "id": uid, "username": username, "password_hash": generate_password_hash(password),
             "role": role,
@@ -1134,6 +1205,8 @@ def new_user():
             "created_at": datetime.utcnow(),
             "name": None,
             "account_status": status,
+            "fecha_inicio": fecha_inicio,
+            "fecha_fin": fecha_fin,
         }
         flash("Usuario creado.", "success")
         return redirect(url_for("users"))
@@ -1143,6 +1216,8 @@ def new_user():
         f'<label>Contraseña</label><input type="password" name="password" required>'
         f'<label>Teléfono</label><input name="phone">'
         f'<label>Rol</label><select name="role"><option value="cobrador">Cobrador (queda pendiente)</option><option value="supervisor">Supervisor</option></select>'
+        f'<label>Fecha inicio (cobradores)</label><input name="fecha_inicio" type="date" value="{date.today().strftime("%Y-%m-%d")}">'
+        f'<label>Fecha fin (cobradores)</label><input name="fecha_fin" type="date" value="{(date.today()+timedelta(days=30)).strftime("%Y-%m-%d")}">'
         f'<label>PIN admin</label><input name="pin" required>'
         f'<button class="btn btn-primary" type="submit">Crear</button></form></div>'
     )
@@ -2442,110 +2517,188 @@ def audit():
     return page(f'<div class="card"><h2>Auditoría</h2><div class="table-scroll"><table><tr><th>Fecha</th><th>Acción</th><th>Detalle</th></tr>{rows}</table></div></div>')
 
 
-def compute_super_admin_stats():
-    """KPIs globales para el panel Super Admin (multi-tenant)."""
+def compute_super_admin_stats(date_from=None, date_to=None):
+    """
+    KPIs y datos para el panel SaaS:
+    - Ganancias del sistema = pagos de suscripción de admins.
+    - Aplicar filtros por rango de fechas a gráficas, estadísticas y ganancias.
+    """
     admins = [u for u in store.users.values() if u.get("role") == "admin"]
     tenant_ids = {a.get("id") for a in admins if a.get("id") is not None}
 
-    now = datetime.utcnow()
     today = date.today()
+    if date_from is None:
+        date_from = today - timedelta(days=29)
+    if date_to is None:
+        date_to = today
+    if isinstance(date_from, str):
+        try:
+            date_from = datetime.strptime(date_from, "%Y-%m-%d").date()
+        except ValueError:
+            date_from = today - timedelta(days=29)
+    if isinstance(date_to, str):
+        try:
+            date_to = datetime.strptime(date_to, "%Y-%m-%d").date()
+        except ValueError:
+            date_to = today
+    if date_from is None:
+        date_from = today - timedelta(days=29)
+    if date_to is None:
+        date_to = today
+    if date_from > date_to:
+        date_from, date_to = date_to, date_from
 
-    # Serie últimos 14 días (intereses cobrados).
-    days = 14
-    start_day = today - timedelta(days=days - 1)
+    # Helper para convertir datetime->date sin depender de otra función.
+    def _to_date(x):
+        if not x:
+            return None
+        if isinstance(x, date):
+            return x
+        try:
+            if hasattr(x, "date"):
+                return x.date()
+        except Exception:
+            return None
+        return None
+
+    # Ganancias basadas en pagos de admins dentro del rango.
+    range_payments = [
+        p
+        for p in store.admin_payments
+        if p.get("admin_id") in tenant_ids
+        and _to_date(p.get("payment_date")) is not None
+        and date_from <= _to_date(p.get("payment_date")) <= date_to
+        and float(p.get("amount") or 0) >= 0
+    ]
+
+    gain_total_range = round(sum(float(p.get("amount") or 0) for p in range_payments), 2)
+
+    # Ganancia total (todo el tiempo).
+    gain_total_all_time = round(
+        sum(
+            float(p.get("amount") or 0)
+            for p in store.admin_payments
+            if p.get("admin_id") in tenant_ids and float(p.get("amount") or 0) >= 0
+        ),
+        2,
+    )
+
+    # Ganancia mensual: mes que contiene `date_to`, respetando el filtro.
+    month_start = date(date_to.year, date_to.month, 1)
+    month_end = (date_to.replace(day=1) + timedelta(days=32)).replace(day=1) - timedelta(days=1)
+    gain_monthly_current = round(
+        sum(
+            float(p.get("amount") or 0)
+            for p in store.admin_payments
+            if p.get("admin_id") in tenant_ids
+            and _to_date(p.get("payment_date")) is not None
+            and max(date_from, month_start) <= _to_date(p.get("payment_date")) <= min(date_to, month_end)
+            and float(p.get("amount") or 0) >= 0
+        ),
+        2,
+    )
+
+    # Serie para gráfica (diaria o semanal si el rango es grande).
+    range_days = (date_to - date_from).days + 1
     income_series = []
-    for i in range(days):
-        d = start_day + timedelta(days=i)
-        s = 0.0
-        for p in store.payments.values():
-            if (p.get("status") or "OK") == "ANULADO":
-                continue
-            if p.get("date") != d:
-                continue
-            loan_id = p.get("loan_id")
-            L = store.loans.get(loan_id) if loan_id is not None else None
-            if not L or L.get("organization_id") not in tenant_ids:
-                continue
-            s += float(p.get("interest") or 0)
-        income_series.append(round(s, 2))
+    labels = []
 
-    # Total global de intereses cobrados.
-    interest_total = 0.0
-    for p in store.payments.values():
-        if (p.get("status") or "OK") == "ANULADO":
-            continue
-        loan_id = p.get("loan_id")
-        L = store.loans.get(loan_id) if loan_id is not None else None
-        if not L or L.get("organization_id") not in tenant_ids:
-            continue
-        interest_total += float(p.get("interest") or 0)
-    interest_total = round(interest_total, 2)
+    if range_days <= 45:
+        # Diaria.
+        cursor = date_from
+        while cursor <= date_to:
+            s = sum(
+                float(p.get("amount") or 0)
+                for p in range_payments
+                if _to_date(p.get("payment_date")) == cursor
+            )
+            labels.append(cursor.strftime("%d/%m"))
+            income_series.append(round(s, 2))
+            cursor += timedelta(days=1)
+    else:
+        # Semanal.
+        cursor = date_from
+        while cursor <= date_to:
+            end = min(cursor + timedelta(days=6), date_to)
+            s = sum(
+                float(p.get("amount") or 0)
+                for p in range_payments
+                if cursor <= _to_date(p.get("payment_date")) <= end
+            )
+            labels.append(f"{cursor.strftime('%d/%m')}-{end.strftime('%d/%m')}")
+            income_series.append(round(s, 2))
+            cursor = end + timedelta(days=1)
 
-    # Ganancia mensual basada en intereses cobrados del mes actual.
-    month_start = date(today.year, today.month, 1)
-    interest_month = 0.0
-    for p in store.payments.values():
-        if (p.get("status") or "OK") == "ANULADO":
-            continue
-        d = p.get("date")
-        if not d or not hasattr(d, "strftime"):
-            continue
-        if d < month_start or d > today:
-            continue
-        loan_id = p.get("loan_id")
-        L = store.loans.get(loan_id) if loan_id is not None else None
-        if not L or L.get("organization_id") not in tenant_ids:
-            continue
-        interest_month += float(p.get("interest") or 0)
-    interest_month = round(interest_month, 2)
+    # Serie mensual para gráfica (barra).
+    month_labels = []
+    monthly_series = []
+    m = date(date_from.year, date_from.month, 1)
+    end_m = date(date_to.year, date_to.month, 1)
+    while m <= end_m:
+        next_m = (m + timedelta(days=32)).replace(day=1)
+        m_end = next_m - timedelta(days=1)
+        month_labels.append(m.strftime("%m/%Y"))
+        s = sum(
+            float(p.get("amount") or 0)
+            for p in range_payments
+            if m <= _to_date(p.get("payment_date")) <= m_end
+        )
+        monthly_series.append(round(s, 2))
+        m = next_m
 
-    # Dinero prestado vs cobrado (capital).
-    borrowed_total = 0.0
-    for L in store.loans.values():
-        if L.get("organization_id") in tenant_ids:
-            borrowed_total += float(L.get("amount") or 0)
-    borrowed_total = round(borrowed_total, 2)
+    # Estado de admins por fechas (activo/vencido) basado en fecha_fin.
+    admins_active_count = 0
+    admins_expired_count = 0
+    pending_admins_count = 0
 
-    collected_capital_total = 0.0
-    for p in store.payments.values():
-        if (p.get("status") or "OK") == "ANULADO":
-            continue
-        loan_id = p.get("loan_id")
-        L = store.loans.get(loan_id) if loan_id is not None else None
-        if not L or L.get("organization_id") not in tenant_ids:
-            continue
-        collected_capital_total += float(p.get("capital") or 0)
-    collected_capital_total = round(collected_capital_total, 2)
-
-    # Alertas (suscripción).
-    upcoming_days = 7
     expired_admins = []
     soon_admins = []
-    pending_collectors = 0
-
+    upcoming_days = 3
+    now = datetime.utcnow()
     for a in admins:
-        sub_end = a.get("subscription_end")
-        status = a.get("account_status", ACCOUNT_ACTIVE)
-        if not sub_end or not hasattr(sub_end, "strftime"):
-            continue
-        if now > sub_end and status != ACCOUNT_SUSPENDED:
+        a_status = a.get("account_status", ACCOUNT_ACTIVE)
+        f_ini = _to_date(a.get("fecha_inicio") or a.get("subscription_start") or None)
+        f_fin = _to_date(a.get("fecha_fin") or a.get("subscription_end") or None)
+        if a_status == ACCOUNT_PENDING:
+            pending_admins_count += 1
+        if f_fin and today > f_fin:
+            admins_expired_count += 1
             expired_admins.append(a)
-        elif now <= sub_end and (sub_end - now).days <= upcoming_days and status == ACCOUNT_ACTIVE:
-            soon_admins.append(a)
+        elif f_fin and f_ini and f_ini <= today <= f_fin and a_status == ACCOUNT_ACTIVE:
+            admins_active_count += 1
+        elif f_fin and f_ini and f_ini <= today <= f_fin and a_status != ACCOUNT_ACTIVE and a_status != ACCOUNT_PENDING:
+            # Si está dentro del rango pero está suspendido, no cuenta como "activo".
+            pass
 
-    for u in store.users.values():
-        if u.get("role") == "cobrador" and u.get("account_status") == ACCOUNT_PENDING:
-            pending_collectors += 1
+        # Alertas próximas a vencer (solo los activos).
+        if f_fin and a_status == ACCOUNT_ACTIVE and today <= f_fin:
+            if (f_fin - today).days <= upcoming_days:
+                soon_admins.append(a)
 
-    labels = [(start_day + timedelta(days=i)).strftime("%d/%m") for i in range(days)]
+    pending_collectors = sum(
+        1 for u in store.users.values() if u.get("role") == "cobrador" and u.get("account_status") == ACCOUNT_PENDING
+    )
+
+    # Historial de pagos (para tabla). Orden por fecha desc.
+    payment_history = sorted(
+        range_payments,
+        key=lambda x: (_to_date(x.get("payment_date")) or date.min, x.get("id") or 0),
+        reverse=True,
+    )[:150]
 
     return {
+        "range_from": date_from.isoformat(),
+        "range_to": date_to.isoformat(),
+        "gain_total_all_time": gain_total_all_time,
+        "gain_monthly_current": gain_monthly_current,
+        "gain_total_range": gain_total_range,
         "labels": labels,
         "income_series": income_series,
-        "interest_month": interest_month,
-        "interest_total": interest_total,
-        "borrowed_total": borrowed_total,
-        "collected_capital_total": collected_capital_total,
+        "month_labels": month_labels,
+        "monthly_series": monthly_series,
+        "admins_active_count": admins_active_count,
+        "admins_expired_count": admins_expired_count,
+        "admins_pending_count": pending_admins_count,
         "alerts": {
             "expired_admins_count": len(expired_admins),
             "soon_admins_count": len(soon_admins),
@@ -2553,6 +2706,17 @@ def compute_super_admin_stats():
             "expired_admins": [{"id": a.get("id"), "username": a.get("username")} for a in expired_admins[:10]],
             "soon_admins": [{"id": a.get("id"), "username": a.get("username")} for a in soon_admins[:10]],
         },
+        "payment_history": [
+            {
+                "id": p.get("id"),
+                "admin_id": p.get("admin_id"),
+                "admin_username": store.users.get(p.get("admin_id"), {}).get("username"),
+                "amount": round(float(p.get("amount") or 0), 2),
+                "payment_date": _to_date(p.get("payment_date")).isoformat() if _to_date(p.get("payment_date")) else None,
+                "method": p.get("method") or "",
+            }
+            for p in payment_history
+        ],
     }
 
 
@@ -2563,6 +2727,25 @@ def super_admin_panel():
     ensure_org()  # no-op para super_admin (solo para no romper otras dependencias)
     user = current_user()
     now = datetime.utcnow()
+
+    # Filtro por fecha (aplica a gráficas, estadísticas y ganancias).
+    today_d = date.today()
+    df = today_d - timedelta(days=29)
+    dt = today_d
+    raw_desde = request.args.get("desde", type=str)
+    raw_hasta = request.args.get("hasta", type=str)
+    if raw_desde:
+        try:
+            df = datetime.strptime(raw_desde, "%Y-%m-%d").date()
+        except ValueError:
+            flash("Fecha «Desde» inválida. Se usará el rango por defecto.", "warning")
+    if raw_hasta:
+        try:
+            dt = datetime.strptime(raw_hasta, "%Y-%m-%d").date()
+        except ValueError:
+            flash("Fecha «Hasta» inválida. Se usará el rango por defecto.", "warning")
+    if df > dt:
+        df, dt = dt, df
 
     def fmt_sub_end(x):
         if not x:
@@ -2631,10 +2814,130 @@ def super_admin_panel():
             flash("Estado del cobrador actualizado.", "success")
             return redirect(url_for("super_admin_panel"))
 
+        if act == "register_admin_payment":
+            # Registrar pago de suscripción y extender fecha_fin.
+            admin_id = request.form.get("admin_id", type=int)
+            amount = request.form.get("amount", type=float)
+            payment_date_raw = (request.form.get("payment_date") or "").strip()
+            method = (request.form.get("method") or "").strip()
+
+            if not admin_id:
+                flash("Admin inválido.", "danger")
+                return redirect(url_for("super_admin_panel"))
+            if amount is None or amount < 0:
+                flash("Monto inválido.", "danger")
+                return redirect(url_for("super_admin_panel"))
+            if amount == 0:
+                flash("El monto debe ser mayor que 0.", "danger")
+                return redirect(url_for("super_admin_panel"))
+
+            try:
+                payment_date = datetime.strptime(payment_date_raw, "%Y-%m-%d").date()
+            except ValueError:
+                flash("Fecha de pago inválida.", "danger")
+                return redirect(url_for("super_admin_panel"))
+
+            admin_u = store.users.get(admin_id)
+            if not admin_u or admin_u.get("role") != "admin":
+                flash("Admin no encontrado.", "danger")
+                return redirect(url_for("super_admin_panel"))
+
+            # Extender fecha_fin + PAYMENT_EXTENSION_DAYS.
+            base_date = admin_u.get("fecha_fin") or admin_u.get("subscription_end")
+            base_d = base_date
+            if hasattr(base_d, "date") and not isinstance(base_d, date):
+                base_d = base_d.date()
+            if isinstance(base_d, date) and base_d >= payment_date:
+                extend_from = base_d
+            else:
+                extend_from = payment_date
+
+            if extend_from < date.today():
+                extend_from = date.today()
+
+            new_fin = extend_from + timedelta(days=PAYMENT_EXTENSION_DAYS)
+            if not admin_u.get("fecha_inicio"):
+                admin_u["fecha_inicio"] = extend_from
+            # Si fechas están invertidas por edición manual, reacomodar.
+            if admin_u.get("fecha_inicio") and isinstance(admin_u["fecha_inicio"], date) and admin_u["fecha_inicio"] > extend_from:
+                admin_u["fecha_inicio"] = extend_from
+
+            admin_u["fecha_fin"] = new_fin
+            admin_u["subscription_end"] = new_fin  # compatibilidad
+            admin_u["account_status"] = ACCOUNT_ACTIVE  # activar si estaba suspendido
+
+            pid = store.nid("admin_payments")
+            store.admin_payments.append(
+                {
+                    "id": pid,
+                    "admin_id": admin_id,
+                    "amount": round(float(amount), 2),
+                    "payment_date": payment_date,
+                    "method": method,
+                    "created_at": datetime.utcnow(),
+                }
+            )
+            try:
+                log_action(current_user()["id"], "admin_payment", str(pid))
+            except Exception:
+                pass
+
+            flash("Pago registrado. Suscripción extendida.", "success")
+            return redirect(url_for("super_admin_panel"))
+
+        if act == "set_admin_subscription_dates":
+            admin_id = request.form.get("target_id", type=int) or request.form.get("admin_id", type=int)
+            admin_u = store.users.get(admin_id) if admin_id else None
+            if not admin_u or admin_u.get("role") != "admin":
+                flash("Admin inválido.", "danger")
+                return redirect(url_for("super_admin_panel"))
+            raw_inicio = (request.form.get("fecha_inicio") or "").strip()
+            raw_fin = (request.form.get("fecha_fin") or "").strip()
+            try:
+                fecha_inicio = datetime.strptime(raw_inicio, "%Y-%m-%d").date()
+                fecha_fin = datetime.strptime(raw_fin, "%Y-%m-%d").date()
+            except ValueError:
+                flash("Fechas inválidas.", "danger")
+                return redirect(url_for("super_admin_panel"))
+            if fecha_fin < fecha_inicio:
+                flash("La fecha fin no puede ser menor que la fecha inicio.", "danger")
+                return redirect(url_for("super_admin_panel"))
+            admin_u["fecha_inicio"] = fecha_inicio
+            admin_u["fecha_fin"] = fecha_fin
+            admin_u["subscription_end"] = fecha_fin  # compatibilidad
+            admin_u["subscription_start"] = fecha_inicio
+            admin_u["account_status"] = ACCOUNT_ACTIVE
+            flash("Suscripción del admin actualizada.", "success")
+            return redirect(url_for("super_admin_panel"))
+
+        if act == "set_cobrador_dates":
+            cob_id = request.form.get("target_id", type=int)
+            cob_u = store.users.get(cob_id) if cob_id else None
+            if not cob_u or cob_u.get("role") != "cobrador":
+                flash("Cobrador inválido.", "danger")
+                return redirect(url_for("super_admin_panel"))
+            raw_inicio = (request.form.get("fecha_inicio") or "").strip()
+            raw_fin = (request.form.get("fecha_fin") or "").strip()
+            try:
+                fecha_inicio = datetime.strptime(raw_inicio, "%Y-%m-%d").date()
+                fecha_fin = datetime.strptime(raw_fin, "%Y-%m-%d").date()
+            except ValueError:
+                flash("Fechas inválidas.", "danger")
+                return redirect(url_for("super_admin_panel"))
+            if fecha_fin < fecha_inicio:
+                flash("La fecha fin no puede ser menor que la fecha inicio.", "danger")
+                return redirect(url_for("super_admin_panel"))
+            cob_u["fecha_inicio"] = fecha_inicio
+            cob_u["fecha_fin"] = fecha_fin
+            cob_u["subscription_end"] = fecha_fin  # compatibilidad
+            cob_u["subscription_start"] = fecha_inicio
+            flash("Fechas del cobrador actualizadas.", "success")
+            return redirect(url_for("super_admin_panel"))
+
         flash("Acción inválida.", "danger")
         return redirect(url_for("super_admin_panel"))
 
-    stats = compute_super_admin_stats()
+    stats = compute_super_admin_stats(df, dt)
     admins = [u for u in store.users.values() if u.get("role") == "admin"]
     admins.sort(key=lambda x: x.get("created_at") or datetime.min, reverse=True)
 
@@ -2655,6 +2958,33 @@ def super_admin_panel():
             return '<span class="sa-badge sa-bad">suspendido</span>'
         return f'<span class="sa-badge">{esc(status)}</span>'
 
+    def to_date_only(x):
+        if not x:
+            return None
+        if isinstance(x, date):
+            return x
+        try:
+            if hasattr(x, "date"):
+                return x.date()
+        except Exception:
+            return None
+        return None
+
+    def date_input_val(x):
+        d = to_date_only(x)
+        return d.strftime("%Y-%m-%d") if d else ""
+
+    def subscription_state_badge(account_status, fecha_fin):
+        a_status = account_status or ACCOUNT_ACTIVE
+        fin_d = to_date_only(fecha_fin)
+        if fin_d and today_d > fin_d:
+            return '<span class="sa-badge sa-bad">vencido</span>'
+        if a_status == ACCOUNT_PENDING:
+            return '<span class="sa-badge sa-warn">pendiente</span>'
+        if a_status == ACCOUNT_SUSPENDED:
+            return '<span class="sa-badge sa-bad">suspendido</span>'
+        return '<span class="sa-badge sa-ok">activo</span>'
+
     def role_badge(role):
         role = (role or "").strip().lower()
         if role == "admin":
@@ -2668,7 +2998,7 @@ def super_admin_panel():
     for a in admins:
         aid = a.get("id")
         status = a.get("account_status", ACCOUNT_ACTIVE)
-        sub_end = a.get("subscription_end")
+        sub_end = a.get("fecha_fin") or a.get("subscription_end")
         pending_c = sum(
             1
             for u in store.users.values()
@@ -2708,10 +3038,28 @@ def super_admin_panel():
                 f"</form>"
             )
 
+        admin_dates_editor = (
+            f"<details style='display:inline-block;margin-left:8px;vertical-align:top'>"
+            f"<summary style='cursor:pointer;font-weight:900;opacity:.85'>Fechas</summary>"
+            f"<form method='post' action='{url_for('super_admin_panel')}' style='margin-top:8px'>"
+            f"<input type='hidden' name='action' value='set_admin_subscription_dates'>"
+            f"<input type='hidden' name='target_id' value='{aid}'>"
+            f"<div style='display:flex;gap:10px;flex-wrap:wrap'>"
+            f"<div><div style='font-size:11px;opacity:.8;font-weight:800;margin-bottom:6px'>Inicio</div>"
+            f"<input name='fecha_inicio' type='date' value='{date_input_val(a.get('fecha_inicio') or a.get('subscription_start'))}' required style='padding:8px 10px;border-radius:12px;border:1px solid rgba(148,163,184,.35);background:rgba(255,255,255,.9)'/></div>"
+            f"<div><div style='font-size:11px;opacity:.8;font-weight:800;margin-bottom:6px'>Fin</div>"
+            f"<input name='fecha_fin' type='date' value='{date_input_val(sub_end)}' required style='padding:8px 10px;border-radius:12px;border:1px solid rgba(148,163,184,.35);background:rgba(255,255,255,.9)'/></div>"
+            f"</div>"
+            f"<button class='sa-btn sa-btn-ghost' type='submit' style='margin-top:8px;width:100%'>Guardar</button>"
+            f"</form>"
+            f"</details>"
+        )
+        actions = f"{actions}{admin_dates_editor}"
+
         admin_rows += (
             "<tr>"
             f"<td>{esc(a.get('username'))}</td>"
-            f"<td>{status_badge(status)}</td>"
+            f"<td>{subscription_state_badge(status, sub_end)}</td>"
             f"<td>{fmt_sub_end(sub_end)}</td>"
             f"<td style='text-align:right'>{users_total}</td>"
             f"<td style='text-align:right'>{clients_total}</td>"
@@ -2733,7 +3081,7 @@ def super_admin_panel():
             f"<td>{esc(tname)}</td>"
             f"<td>{esc(u.get('username'))}</td>"
             f"<td>{role_badge(u.get('role'))}</td>"
-            f"<td>{status_badge(u.get('account_status', ACCOUNT_ACTIVE))}</td>"
+            f"<td>{subscription_state_badge(u.get('account_status', ACCOUNT_ACTIVE), u.get('fecha_fin') or u.get('subscription_end'))}</td>"
             f"<td>{esc(u.get('phone') or '—')}</td>"
             f"<td>{esc(u.get('created_at'))}</td>"
             "</tr>"
@@ -2756,6 +3104,7 @@ def super_admin_panel():
         rows = ""
         for c in collectors[:200]:
             c_status = c.get("account_status", ACCOUNT_PENDING)
+            c_fin = c.get("fecha_fin") or c.get("subscription_end")
             actions = ""
             if c_status == ACCOUNT_PENDING:
                 actions = (
@@ -2784,10 +3133,28 @@ def super_admin_panel():
                     f"</form>"
                 )
 
+            c_dates_editor = (
+                f"<details style='display:inline-block;margin-left:8px;vertical-align:top'>"
+                f"<summary style='cursor:pointer;font-weight:900;opacity:.85'>Fechas</summary>"
+                f"<form method='post' action='{url_for('super_admin_panel')}' style='margin-top:8px'>"
+                f"<input type='hidden' name='action' value='set_cobrador_dates'>"
+                f"<input type='hidden' name='target_id' value='{c.get('id')}'>"
+                f"<div style='display:flex;gap:10px;flex-wrap:wrap'>"
+                f"<div><div style='font-size:11px;opacity:.8;font-weight:800;margin-bottom:6px'>Inicio</div>"
+                f"<input name='fecha_inicio' type='date' value='{date_input_val(c.get('fecha_inicio') or c.get('subscription_start'))}' required style='padding:8px 10px;border-radius:12px;border:1px solid rgba(148,163,184,.35);background:rgba(255,255,255,.9)'/></div>"
+                f"<div><div style='font-size:11px;opacity:.8;font-weight:800;margin-bottom:6px'>Fin</div>"
+                f"<input name='fecha_fin' type='date' value='{date_input_val(c_fin)}' required style='padding:8px 10px;border-radius:12px;border:1px solid rgba(148,163,184,.35);background:rgba(255,255,255,.9)'/></div>"
+                f"</div>"
+                f"<button class='sa-btn sa-btn-ghost' type='submit' style='margin-top:8px;width:100%'>Guardar</button>"
+                f"</form>"
+                f"</details>"
+            )
+            actions = f"{actions}{c_dates_editor}"
+
             rows += (
                 "<tr>"
                 f"<td>{esc(c.get('username'))}</td>"
-                f"<td>{status_badge(c_status)}</td>"
+                f"<td>{subscription_state_badge(c_status, c_fin)}</td>"
                 f"<td>{esc(a_name)}</td>"
                 f"<td>{esc(c.get('phone') or '—')}</td>"
                 f"<td>{esc(c.get('created_at'))}</td>"
@@ -2808,8 +3175,26 @@ def super_admin_panel():
     expired_list = ", ".join(esc(a.get("username")) for a in expired_admins) if expired_admins else "Sin admins vencidos"
     soon_list = ", ".join(esc(a.get("username")) for a in soon_admins) if soon_admins else "Nadie próximo a vencer"
 
+    payment_admin_opts = "".join(
+        f"<option value='{a.get('id')}'>{esc(a.get('username'))}</option>"
+        for a in admins
+    )
+    payments_rows = "".join(
+        "<tr>"
+        f"<td>{esc(p.get('admin_username') or '—')}</td>"
+        f"<td style='text-align:right'>{fmt_money(p.get('amount') or 0)}</td>"
+        f"<td>{esc(p.get('payment_date') or '—')}</td>"
+        f"<td>{esc(p.get('method') or '—')}</td>"
+        "</tr>"
+        for p in (stats.get("payment_history") or [])
+    )
+
     initial_json = json.dumps(stats)
-    stats_url = url_for("super_admin_stats")
+    stats_url = url_for(
+        "super_admin_stats",
+        desde=df.isoformat(),
+        hasta=dt.isoformat(),
+    )
     charts_js = """
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <script>
@@ -2853,12 +3238,12 @@ function buildCharts(){
   prestadoChart = new Chart(prestCtx, {
     type: 'bar',
     data: {
-      labels: ['Prestado (capital)', 'Cobrado (capital)'],
+      labels: initialData.month_labels || [],
       datasets: [{
-        label: 'Capital',
-        data: [initialData.borrowed_total || 0, initialData.collected_capital_total || 0],
-        backgroundColor: ['rgba(16,185,129,.75)','rgba(59,130,246,.75)'],
-        borderColor: ['rgba(16,185,129,1)','rgba(59,130,246,1)'],
+        label: 'Ganancia por mes',
+        data: initialData.monthly_series || [],
+        backgroundColor: 'rgba(22,163,74,.35)',
+        borderColor: 'rgba(22,163,74,1)',
         borderWidth: 1
       }]
     },
@@ -2872,18 +3257,20 @@ function buildCharts(){
 }
 
 function updateFrom(data){
-  document.getElementById('gainMonthly').textContent = money(data.interest_month);
-  document.getElementById('gainGlobal').textContent = money(data.interest_total);
-  document.getElementById('prestadoTotal').textContent = money(data.borrowed_total);
-  document.getElementById('cobradoTotal').textContent = money(data.collected_capital_total);
+  document.getElementById('gainMonthly').textContent = money(data.gain_monthly_current);
+  document.getElementById('gainGlobal').textContent = money(data.gain_total_all_time);
+  document.getElementById('gainRange').textContent = money(data.gain_total_range);
+  document.getElementById('adminsActiveCount').textContent = data.admins_active_count ?? 0;
+  document.getElementById('adminsExpiredCount').textContent = data.admins_expired_count ?? 0;
 
   if (incomeChart && data.labels && data.income_series){
     incomeChart.data.labels = data.labels;
     incomeChart.data.datasets[0].data = data.income_series;
     incomeChart.update();
   }
-  if (prestadoChart && data.borrowed_total != null){
-    prestadoChart.data.datasets[0].data = [data.borrowed_total || 0, data.collected_capital_total || 0];
+  if (prestadoChart && data.month_labels && data.monthly_series){
+    prestadoChart.data.labels = data.month_labels;
+    prestadoChart.data.datasets[0].data = data.monthly_series;
     prestadoChart.update();
   }
 
@@ -2999,6 +3386,19 @@ window.addEventListener('load', () => {
   <div class="sa-top">
     <h2>🛡️ Panel Super Admin</h2>
     <p>Control multi-tenant con aprobaciones, suspensión y métricas tipo SaaS (memoria).</p>
+    <form method="get" style="margin-top:12px">
+      <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end">
+        <div style="min-width:160px">
+          <div style="font-size:12px;opacity:.8;font-weight:800;margin-bottom:6px">Desde</div>
+          <input type="date" name="desde" value="{df.isoformat()}" style="width:100%;padding:9px 10px;border-radius:12px;border:1px solid rgba(148,163,184,.35);background:rgba(255,255,255,.9);"/>
+        </div>
+        <div style="min-width:160px">
+          <div style="font-size:12px;opacity:.8;font-weight:800;margin-bottom:6px">Hasta</div>
+          <input type="date" name="hasta" value="{dt.isoformat()}" style="width:100%;padding:9px 10px;border-radius:12px;border:1px solid rgba(148,163,184,.35);background:rgba(255,255,255,.9);"/>
+        </div>
+        <button class="sa-btn sa-btn-ghost" type="submit">Filtrar</button>
+      </div>
+    </form>
     <div class="sa-alerts">
       <div class="sa-alert-item">
         <div class="t">Admins con suscripción vencida</div>
@@ -3006,7 +3406,7 @@ window.addEventListener('load', () => {
         <div class="d">{expired_list}</div>
       </div>
       <div class="sa-alert-item">
-        <div class="t">Admins próximos a vencer (7 días)</div>
+        <div class="t">Admins próximos a vencer (3 días)</div>
         <div class="n" style="color:#92400e;"><span id="alertSoonCount">{stats.get('alerts', {}).get('soon_admins_count', 0)}</span></div>
         <div class="d">{soon_list}</div>
       </div>
@@ -3020,16 +3420,27 @@ window.addEventListener('load', () => {
 
   <div class="sa-grid-3">
     <div class="sa-metric">
-      <div class="k">Ganancia mensual (intereses cobrados)</div>
-      <div class="v" id="gainMonthly">{fmt_money(stats.get('interest_month', 0))}</div>
+      <div class="k">💰 Ganancia mensual</div>
+      <div class="v" id="gainMonthly">{fmt_money(stats.get('gain_monthly_current', 0))}</div>
     </div>
     <div class="sa-metric">
-      <div class="k">Ganancia global</div>
-      <div class="v" id="gainGlobal">{fmt_money(stats.get('interest_total', 0))}</div>
+      <div class="k">💰 Ganancia total</div>
+      <div class="v" id="gainGlobal">{fmt_money(stats.get('gain_total_all_time', 0))}</div>
     </div>
     <div class="sa-metric">
-      <div class="k">Prestado vs cobrado (capital)</div>
-      <div class="v">{total_loans} préstamos · {total_clients} clientes</div>
+      <div class="k">💰 Ganancia por rango</div>
+      <div class="v" id="gainRange">{fmt_money(stats.get('gain_total_range', 0))}</div>
+    </div>
+  </div>
+
+  <div class="sa-grid-2" style="margin-top:14px;">
+    <div class="sa-metric">
+      <div class="k">👥 Admins activos</div>
+      <div class="v" id="adminsActiveCount">{stats.get('admins_active_count', 0)}</div>
+    </div>
+    <div class="sa-metric">
+      <div class="k">⛔ Admins vencidos</div>
+      <div class="v" id="adminsExpiredCount">{stats.get('admins_expired_count', 0)}</div>
     </div>
   </div>
 
@@ -3037,8 +3448,8 @@ window.addEventListener('load', () => {
     <div class="sa-card sa-chart-card">
       <div class="sa-section-head">
         <div>
-          <h3 class="sa-h3">Ingresos globales (últimos 14 días)</h3>
-          <p class="sa-sub">Intereses cobrados por fecha de pago.</p>
+          <h3 class="sa-h3">Ganancia del sistema (rango)</h3>
+          <p class="sa-sub">Pagos de admins agrupados por fecha.</p>
         </div>
       </div>
       <div class="sa-chart-wrap"><canvas id="chartIncome"></canvas></div>
@@ -3046,15 +3457,54 @@ window.addEventListener('load', () => {
     <div class="sa-card sa-chart-card">
       <div class="sa-section-head">
         <div>
-          <h3 class="sa-h3">Dinero prestado vs cobrado</h3>
-          <p class="sa-sub">Capital total acumulado por tenant.</p>
+          <h3 class="sa-h3">Ganancias mensuales</h3>
+          <p class="sa-sub">Total por mes dentro del rango.</p>
         </div>
       </div>
       <div style="display:flex;gap:12px;align-items:flex-end;margin-bottom:10px;flex-wrap:wrap">
-        <div style="font-size:12px;opacity:.78">Prestado: <b id="prestadoTotal">{fmt_money(stats.get('borrowed_total', 0))}</b></div>
-        <div style="font-size:12px;opacity:.78">Cobrado: <b id="cobradoTotal">{fmt_money(stats.get('collected_capital_total', 0))}</b></div>
+        <div style="font-size:12px;opacity:.78">Meses: <b>{len(stats.get('month_labels', []) or [])}</b></div>
       </div>
       <div class="sa-chart-wrap"><canvas id="chartPrestadoCobrado"></canvas></div>
+    </div>
+  </div>
+
+  <div class="sa-grid-2">
+    <div class="sa-card sa-section sa-table">
+      <div class="sa-section-head">
+        <div>
+          <h3 class="sa-h3">Registrar pago (admins)</h3>
+          <p class="sa-sub">Renueva suscripción y activa la cuenta si estaba suspendida.</p>
+        </div>
+      </div>
+      <form method="post" style="margin-top:8px">
+        <input type="hidden" name="action" value="register_admin_payment">
+        <label style="display:block;font-size:12px;opacity:.8;font-weight:800;margin-top:6px">Admin</label>
+        <select name="admin_id" required style="width:100%;padding:10px;border-radius:12px;border:1px solid rgba(148,163,184,.35);background:rgba(255,255,255,.9);">
+          {payment_admin_opts}
+        </select>
+        <label style="display:block;font-size:12px;opacity:.8;font-weight:800;margin-top:10px">Monto pagado</label>
+        <input name="amount" type="number" step="0.01" min="0" required style="width:100%;padding:10px;border-radius:12px;border:1px solid rgba(148,163,184,.35);background:rgba(255,255,255,.9);">
+        <label style="display:block;font-size:12px;opacity:.8;font-weight:800;margin-top:10px">Fecha de pago</label>
+        <input name="payment_date" type="date" value="{dt.isoformat()}" required style="width:100%;padding:10px;border-radius:12px;border:1px solid rgba(148,163,184,.35);background:rgba(255,255,255,.9);">
+        <label style="display:block;font-size:12px;opacity:.8;font-weight:800;margin-top:10px">Método (opcional)</label>
+        <input name="method" type="text" placeholder="Ej. Transferencia, Efectivo" style="width:100%;padding:10px;border-radius:12px;border:1px solid rgba(148,163,184,.35);background:rgba(255,255,255,.9);">
+        <button class="sa-btn sa-btn-primary" type="submit" style="margin-top:12px;width:100%">Guardar pago</button>
+      </form>
+    </div>
+
+    <div class="sa-card sa-section sa-table">
+      <div class="sa-section-head">
+        <div>
+          <h3 class="sa-h3">Historial de pagos</h3>
+          <p class="sa-sub">Filtrado por el rango seleccionado.</p>
+        </div>
+      </div>
+      <div class="table-scroll" style="margin-top:8px">
+        <table>
+          <tr><th>Admin</th><th style="text-align:right">Monto</th><th>Fecha</th><th>Método</th></tr>
+          {payments_rows or "<tr><td colspan='4' style='text-align:center;opacity:.85'>Sin pagos en el rango</td></tr>"}
+        </table>
+      </div>
     </div>
   </div>
 
@@ -3105,7 +3555,22 @@ window.addEventListener('load', () => {
 @login_required
 @super_admin_required
 def super_admin_stats():
-    return jsonify(compute_super_admin_stats())
+    raw_from = request.args.get("desde", type=str)
+    raw_to = request.args.get("hasta", type=str)
+    df = None
+    dt = None
+    if raw_from:
+        try:
+            df = datetime.strptime(raw_from, "%Y-%m-%d").date()
+        except ValueError:
+            df = None
+    if raw_to:
+        try:
+            dt = datetime.strptime(raw_to, "%Y-%m-%d").date()
+        except ValueError:
+            dt = None
+    stats = compute_super_admin_stats(df, dt)
+    return jsonify(stats)
 
 
 @app.route("/reportes", methods=["GET", "POST"])
