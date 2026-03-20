@@ -819,6 +819,11 @@ def logout():
 
 @app.route("/")
 def index():
+    # Compatibilidad: si Render o un monitor hace health-check contra "/",
+    # evitamos redirects a login y respondemos 200.
+    ua = (request.headers.get("User-Agent") or "").lower()
+    if request.method in ("GET", "HEAD") and "go-http-client" in ua:
+        return Response("ok\n", status=200, mimetype="text/plain; charset=utf-8")
     if session.get("user_id"):
         return redirect(url_for("dashboard"))
     return redirect(url_for("login"))
