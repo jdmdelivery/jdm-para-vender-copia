@@ -440,10 +440,47 @@ def super_admin_required(fn):
     return role_required("super_admin")(fn)
 
 
-def log_action(user_id, action, detail=""):
-    store.audit_log.append({
-        "id": store.nid("audit"), "user_id": user_id, "action": action, "detail": detail, "created_at": datetime.utcnow(),
-    })
+def log_action(user_id, action, detail="", module=""):
+    """
+    Auditoría en memoria.
+    Campos: user_id, user_name, role (admin/prestamista), action, module, detail, created_at, ip, device.
+    """
+    try:
+        u = store.users.get(user_id, {}) if user_id is not None else {}
+        user_name = u.get("name") or u.get("username") or "—"
+        raw_role = (u.get("role") or "").strip().lower()
+        role_group = "admin" if raw_role in ("admin", "supervisor", "super_admin") else "prestamista"
+
+        # IP y device (opcionales). Mantener simple para que no falle en locales/Render.
+        ip = None
+        device = None
+        try:
+            # X-Forwarded-For ayuda en algunos proxys.
+            ip = (request.headers.get("X-Forwarded-For") or request.remote_addr) if request else None
+            ua = (request.headers.get("User-Agent") or "") if request else ""
+            device = (ua[:220] if ua else None)
+        except Exception:
+            ip = None
+            device = None
+
+        store.audit_log.append(
+            {
+                "id": store.nid("audit"),
+                "user_id": user_id,
+                "user_name": user_name,
+                "role": role_group,
+                "raw_role": raw_role,
+                "action": action,
+                "module": module or "",
+                "detail": detail or "",
+                "created_at": datetime.utcnow(),
+                "ip": ip,
+                "device": device,
+            }
+        )
+    except Exception:
+        # Nunca rompemos el flujo si la auditoría falla.
+        return
 
 
 def ensure_org():
@@ -814,7 +851,7 @@ def login():
             session["org_id"] = tenant_id
 
         try:
-            log_action(user["id"], "login", "login")
+            log_action(user["id"], "login", detail="login", module="auth")
         except Exception:
             pass
         flash(f"Bienvenido, {user['username']}", "success")
@@ -885,6 +922,12 @@ def register_admin():
 
 @app.route("/logout")
 def logout():
+    u = current_user()
+    try:
+        if u:
+            log_action(u.get("id"), "logout", detail="logout", module="auth")
+    except Exception:
+        pass
     session.clear()
     flash("Sesión cerrada.", "success")
     return redirect(url_for("login"))
@@ -1362,11 +1405,26 @@ def reassign_single_client(client_id):
         return redirect(url_for("client_detail", client_id=client_id))
 
     # Reasignar el "dueño" del cliente y también los préstamos existentes.
+    old_owner_id = c.get("created_by")
+    old_owner_u = store.users.get(old_owner_id, {}) if old_owner_id is not None else {}
+    old_owner_name = old_owner_u.get("username") or old_owner_u.get("name") or "—"
     c["created_by"] = collector_id
     for L in store.loans.values():
         if L.get("client_id") == client_id and L.get("organization_id") == oid:
             L["created_by"] = collector_id
 
+    try:
+        u = current_user()
+        new_owner = new_collector.get("username") or new_collector.get("name") or "—"
+        full_nm = f"{c.get('first_name') or ''} {c.get('last_name') or ''}".strip()
+        log_action(
+            u.get("id"),
+            "reasignar cliente",
+            module="clientes",
+            detail=f"{full_nm} (de {old_owner_name} a {new_owner})",
+        )
+    except Exception:
+        pass
     flash("Cliente y préstamos reasignados.", "success")
     return redirect(url_for("client_detail", client_id=client_id))
 
@@ -1383,11 +1441,9 @@ def clients():
         f"<td><a class='btn btn-secondary' href='{url_for('client_detail', client_id=c['id'])}'>Ver</a></td></tr>"
         for c in rows
     )
-    new_client_btn = (
-        f'<a class="btn btn-primary" href="{url_for("new_client")}">Nuevo cliente</a>'
-        if can_admin_actions(user)
-        else ""
-    )
+    new_client_btn = ""
+    if can_admin_actions(user) or is_cajero_role(user):
+        new_client_btn = f'<a class="btn btn-primary" href="{url_for("new_client")}">Nuevo cliente</a>'
     body = (
         f'<div class="card"><h2>Clientes</h2><div class="table-scroll"><table><tr><th>Nombre</th><th>Tel</th><th></th></tr>{t}</table></div>'
         + new_client_btn
@@ -1401,8 +1457,8 @@ def clients():
 def new_client():
     user = current_user()
     ensure_org()
-    if not can_admin_actions(user):
-        flash("Acción restringida: solo admin puede crear clientes.", "danger")
+    if not (can_admin_actions(user) or is_cajero_role(user)):
+        flash("Acción restringida.", "danger")
         return redirect(url_for("clients"))
     if request.method == "POST":
         first = (request.form.get("first_name") or "").strip()
@@ -1410,6 +1466,7 @@ def new_client():
             flash("Nombre obligatorio.", "danger")
             return redirect(url_for("new_client"))
         cid = store.nid("clients")
+        route = (request.form.get("route") or "").strip()
         store.clients[cid] = {
             "id": cid,
             "first_name": first,
@@ -1422,6 +1479,16 @@ def new_client():
             "organization_id": session.get("org_id"),
             "created_at": datetime.utcnow(),
         }
+        try:
+            full_nm = f"{first} {store.clients[cid].get('last_name') or ''}".strip()
+            log_action(
+                user["id"],
+                "crear cliente",
+                detail=f"{full_nm} (Ruta: {route or '—'})",
+                module="clientes",
+            )
+        except Exception:
+            pass
         flash("Cliente creado.", "success")
         return redirect(url_for("clients"))
     body = (
@@ -1460,6 +1527,16 @@ def edit_client(client_id):
         c["address"] = (request.form.get("address") or "").strip()
         c["document_id"] = (request.form.get("document_id") or "").strip()
         c["route"] = (request.form.get("route") or "").strip()
+        try:
+            full_nm = f"{c.get('first_name') or ''} {c.get('last_name') or ''}".strip()
+            log_action(
+                user["id"],
+                "editar cliente",
+                module="clientes",
+                detail=f"{full_nm} (ID: {client_id})",
+            )
+        except Exception:
+            pass
         flash("Guardado.", "success")
         return redirect(url_for("client_detail", client_id=client_id))
     fn = c.get("first_name") or ""
@@ -1494,6 +1571,16 @@ def delete_client(client_id):
     for lid, L in list(store.loans.items()):
         if L.get("organization_id") == oid and L.get("client_id") == client_id:
             store.loans.pop(lid, None)
+    try:
+        full_nm = f"{c.get('first_name') or ''} {c.get('last_name') or ''}".strip()
+        log_action(
+            u.get("id"),
+            "eliminar cliente",
+            module="clientes",
+            detail=f"{full_nm} (ID: {client_id})",
+        )
+    except Exception:
+        pass
     flash("Cliente eliminado.", "success")
     return redirect(url_for("clients"))
 
@@ -1511,6 +1598,16 @@ def client_detail(client_id):
     if is_cajero_role(user) and c.get("created_by") != user["id"] and not is_cartera_admin(user):
         flash("Sin acceso.", "danger")
         return redirect(url_for("clients"))
+    try:
+        full_nm = f"{c.get('first_name') or ''} {c.get('last_name') or ''}".strip() or f"Cliente #{client_id}"
+        log_action(
+            user.get("id"),
+            "ver cliente",
+            module="clientes",
+            detail=full_nm,
+        )
+    except Exception:
+        pass
     org_id = session.get("org_id")
     sd = calc_client_score(client_id, org_id)
     mx = calc_max_credito(sd["prestamos_pagados"], sd["score"])
@@ -2111,7 +2208,7 @@ def loans():
 <div class="loans-page-wrap">
   <h1 class="loans-page-title">📋 Lista de Préstamos</h1>
   <div class="loans-toolbar">
-    {('<a class="btn-loan-new" href="' + url_for("new_loan") + '">👤➕ Nuevo préstamo</a>') if can_admin_actions(user) else ''}
+    {('<a class="btn-loan-new" href="' + url_for("new_loan") + '">👤➕ Nuevo préstamo</a>') if (can_admin_actions(user) or is_cajero_role(user)) else ''}
     {filter_block}
   </div>
   <div class="loans-summary">
@@ -2134,8 +2231,8 @@ def loans():
 def new_loan():
     ensure_org()
     user = current_user()
-    if not can_admin_actions(user):
-        flash("Acción restringida: solo admin puede crear préstamos.", "danger")
+    if not (can_admin_actions(user) or is_cajero_role(user)):
+        flash("Acción restringida.", "danger")
         return redirect(url_for("loans"))
     org_id = session.get("org_id")
     clist = clients_for_user(org_id, user)
@@ -2151,6 +2248,12 @@ def new_loan():
         if not client_id or amount is None or not start_str:
             flash("Complete cliente, monto y fecha.", "danger")
             return redirect(url_for("new_loan"))
+        if is_cajero_role(user):
+            # Validación backend: el cajero solo puede crear préstamos para sus clientes.
+            c = store.clients.get(client_id)
+            if not c or c.get("organization_id") != org_id or c.get("created_by") != user.get("id"):
+                flash("Sin acceso al cliente seleccionado.", "danger")
+                return redirect(url_for("new_loan"))
         if amount <= 0:
             flash("El monto debe ser mayor que 0.", "danger")
             return redirect(url_for("new_loan"))
@@ -2187,6 +2290,17 @@ def new_loan():
                     user_id=user["id"],
                     org_id=org_id,
                 )
+                try:
+                    cl = store.clients.get(client_id, {})
+                    client_nm = f"{cl.get('first_name') or ''} {cl.get('last_name') or ''}".strip() or f"Cliente #{client_id}"
+                    log_action(
+                        user["id"],
+                        "registrar descuento inicial",
+                        module="descuentos",
+                        detail=f"{fmt_money(discount_amount)} para {client_nm}",
+                    )
+                except Exception:
+                    pass
             if monto_entregado > 0:
                 disbursement_cash_id = apply_cash_movement(
                     movement_type="prestamo_entregado",
@@ -2226,6 +2340,17 @@ def new_loan():
             "id_photo_b64": None,
             "id_photo_back_b64": None,
         }
+        try:
+            cl = store.clients.get(client_id, {})
+            client_nm = f"{cl.get('first_name') or ''} {cl.get('last_name') or ''}".strip() or f"Cliente #{client_id}"
+            log_action(
+                user["id"],
+                "crear préstamo",
+                module="préstamos",
+                detail=f"{fmt_money(amount)} para {client_nm} (cuotas: {term_count})",
+            )
+        except Exception:
+            pass
         flash("Préstamo creado.", "success")
         return redirect(url_for("loan_detail", loan_id=lid))
     opts = "".join(f"<option value='{c['id']}'{' selected' if request.args.get('client_id', type=int)==c['id'] else ''}>{c['first_name']}</option>" for c in clist)
@@ -2288,6 +2413,19 @@ def delete_loan(loan_id):
         flash(str(e), "danger")
         return redirect(url_for("loan_detail", loan_id=loan_id))
 
+    try:
+        user = current_user()
+        cl = store.clients.get(L.get("client_id"), {}) if L else {}
+        client_nm = f"{cl.get('first_name') or ''} {cl.get('last_name') or ''}".strip() or f"Cliente #{L.get('client_id') if L else '—'}"
+        loan_amt = float(L.get("amount") or 0) if L else 0
+        log_action(
+            user.get("id"),
+            "eliminar préstamo",
+            module="préstamos",
+            detail=f"#{loan_id} • {fmt_money(loan_amt)} para {client_nm}",
+        )
+    except Exception:
+        pass
     flash("Préstamo eliminado y movimientos del banco revertidos.", "success")
     return redirect(url_for("loans"))
 
@@ -2306,6 +2444,18 @@ def edit_loan(loan_id):
     if request.method == "POST":
         L["rate"] = request.form.get("rate", type=float) or L.get("rate")
         L["remaining"] = request.form.get("remaining", type=float)
+        try:
+            user = current_user()
+            cl = store.clients.get(L.get("client_id"), {}) if L else {}
+            client_nm = f"{cl.get('first_name') or ''} {cl.get('last_name') or ''}".strip() or f"Cliente #{L.get('client_id') if L else '—'}"
+            log_action(
+                user.get("id"),
+                "editar préstamo",
+                module="préstamos",
+                detail=f"#{loan_id} • saldo {fmt_money(L.get('remaining'))} • cliente {client_nm}",
+            )
+        except Exception:
+            pass
         flash("Actualizado.", "success")
         return redirect(url_for("loan_detail", loan_id=loan_id))
     body = (
@@ -2333,6 +2483,16 @@ def loan_detail(loan_id):
     if not scope_owns_loan(u, L):
         flash("Sin acceso.", "danger")
         return redirect(url_for("loans"))
+    try:
+        client_nm = f"{store.clients.get(L.get('client_id'), {}).get('first_name') or ''} {store.clients.get(L.get('client_id'), {}).get('last_name') or ''}".strip() or "Cliente"
+        log_action(
+            u.get("id"),
+            "ver préstamo",
+            module="préstamos",
+            detail=f"#{loan_id} • {client_nm}",
+        )
+    except Exception:
+        pass
     client_id = L.get("client_id")
     client = store.clients.get(client_id, {})
     pays = [p for p in store.payments.values() if p.get("loan_id") == loan_id]
@@ -2724,6 +2884,27 @@ def new_payment(loan_id):
             "created_at": datetime.utcnow(),
         }
 
+        try:
+            cl = store.clients.get(L.get("client_id"), {})
+            client_nm = f"{cl.get('first_name') or ''} {cl.get('last_name') or ''}".strip() or f"Cliente #{L.get('client_id')}"
+            user_id = current_user()["id"]
+            if typ_l == "adelanto":
+                log_action(
+                    user_id,
+                    "registrar adelanto",
+                    module="adelantos",
+                    detail=f"{fmt_money(amt)} ({weeks_adv} semanas) — {client_nm}",
+                )
+            else:
+                log_action(
+                    user_id,
+                    "registrar pago",
+                    module="pagos",
+                    detail=f"{fmt_money(amt)} ({typ_l}) — {client_nm}",
+                )
+        except Exception:
+            pass
+
         rem = float(L.get("remaining") or 0) - capital_part
         L["remaining"] = max(0, rem)
         if "remaining_capital" in L:
@@ -2946,6 +3127,18 @@ def delete_payment(payment_id):
             L["next_payment_date"] = current_due - timedelta(days=interval_days * weeks)
 
     store.payments.pop(payment_id, None)
+    try:
+        cl = store.clients.get(L.get("client_id"), {}) if L else {}
+        client_nm = f"{cl.get('first_name') or ''} {cl.get('last_name') or ''}".strip() or f"Cliente #{L.get('client_id') if L else '—'}"
+        loan_amt = float(L.get("amount") or 0) if L else 0
+        log_action(
+            user.get("id"),
+            "eliminar pago",
+            module="pagos",
+            detail=f"Pago #{payment_id} ({typ_l}) • {fmt_money(amt)} — Préstamo #{loan_id} • {client_nm}",
+        )
+    except Exception:
+        pass
     flash("Pago eliminado y banco revertido.", "success")
     return redirect(url_for("loan_detail", loan_id=loan_id))
 
@@ -2967,15 +3160,24 @@ def bank_home():
         f'<a href="{url_for("bank_daily_list")}" class="bank-tile blue">🗓️ Lista diaria</a>'
         f'<a href="{url_for("bank_late")}" class="bank-tile orange">🔥 Atrasos</a>'
     )
+    tiles_prestamista = (
+        f'<a href="{url_for("bank_expenses")}" class="bank-tile red">📓 Gastos de ruta</a>'
+        f'<a href="{url_for("bank_acta")}" class="bank-tile yellow">💸 Descuento inicial</a>'
+        f'<a href="{url_for("bank_routes_list")}" class="bank-tile teal">🏦 Capital por ruta</a>'
+        f'<a href="{url_for("bank_advance")}" class="bank-tile lavender">💵 Adelantos</a>'
+        f'<a href="{url_for("bank_legal_list")}" class="bank-tile purple">📜 Documento legal</a>'
+    ) if is_cajero_role(user) or is_cartera_admin(user) else ""
+
     tiles_admin = (
         f'<a href="{url_for("bank_delivery")}" class="bank-tile green2">💰 Entrega</a>'
-        f'<a href="{url_for("bank_expenses")}" class="bank-tile red">📓 Gastos</a>'
+        f'<a href="{url_for("bank_expenses")}" class="bank-tile red">📓 Gastos de ruta</a>'
         f'<a href="{url_for("bank_acta")}" class="bank-tile yellow">💸 Descuento inicial</a>'
         f'<a href="{url_for("bank_routes_list")}" class="bank-tile teal">🏦 Capital por ruta</a>'
         f'<a href="{url_for("bank_advance")}" class="bank-tile lavender">💵 Adelantos</a>'
         f'<a href="{url_for("bank_legal_list")}" class="bank-tile purple">📜 Documento legal</a>'
     ) if adminish else ""
-    tiles = tiles_base + tiles_admin
+
+    tiles = tiles_base + (tiles_admin if adminish else tiles_prestamista)
     bottom = (
         f'<a href="{url_for("collector_map")}" class="bank-tile bank-tile-full teal2">📍 Ver ubicación cobrador</a>'
     )
@@ -3040,16 +3242,182 @@ def admin_clear_all():
 
 @app.route("/audit")
 @login_required
-@role_required("admin", "supervisor")
 def audit():
     ensure_org()
     oid = session.get("org_id")
-    rows = "".join(
-        f"<tr><td>{a.get('created_at')}</td><td>{a.get('action')}</td><td>{a.get('detail')}</td></tr>"
-        for a in store.audit_log[-200:]
-        if store.users.get(a.get("user_id"), {}).get("organization_id") == oid
+    u = current_user()
+    # Seguridad: solo admin (tenant) y super_admin ven auditoría completa.
+    is_adminish = bool(u) and u.get("role") in ("admin", "super_admin")
+
+    # Filtros (query params)
+    q_uid = request.args.get("user_id", type=int)
+    q_action = (request.args.get("accion") or "").strip().lower()
+    q_from = request.args.get("desde") or ""
+    q_to = request.args.get("hasta") or ""
+
+    def parse_d(s):
+        s = (s or "").strip()
+        if not s:
+            return None
+        try:
+            return datetime.strptime(s, "%Y-%m-%d").date()
+        except ValueError:
+            return None
+
+    d_from = parse_d(q_from)
+    d_to = parse_d(q_to)
+
+    filtered = []
+    for a in store.audit_log:
+        au = store.users.get(a.get("user_id"), {})
+        if u.get("role") != "super_admin" and au.get("organization_id") != oid:
+            continue
+
+        # Seguridad: prestamista solo ve su propio historial.
+        if not is_adminish and a.get("user_id") != u.get("id"):
+            continue
+
+        if q_uid is not None and a.get("user_id") != q_uid:
+            continue
+        if q_action and q_action not in str(a.get("action") or "").lower() and q_action not in str(a.get("module") or "").lower():
+            continue
+
+        created_dt = a.get("created_at")
+        created_date = created_dt.date() if hasattr(created_dt, "date") else None
+        if d_from and (not created_date or created_date < d_from):
+            continue
+        if d_to and (not created_date or created_date > d_to):
+            continue
+
+        filtered.append(a)
+
+    filtered.sort(key=lambda x: x.get("created_at") or datetime.min, reverse=True)
+    filtered = filtered[:600]
+
+    def severity(a):
+        act = str(a.get("action") or "").lower()
+        mod = str(a.get("module") or "").lower()
+        red_words = (
+            "eliminar",
+            "borrar",
+            "delete",
+            "reverso",
+            "editar",
+            "reasignar",
+            "suspender",
+            "subir foto",
+            "firmar",
+            "entrega de dinero",
+            "devolución",
+            "banco insuficiente",
+        )
+        blue_words = ("ver ", "ver información", "información", "vista", "consulta", "ver préstamo", "ver cliente", "ver documento")
+        if any(w in act for w in red_words) or "crítico" in act:
+            return "red"
+        if any(w in act for w in blue_words) or "ver " in act:
+            return "blue"
+        return "green"
+
+    color_map = {
+        "red": ("#fee2e2", "#991b1b"),
+        "green": ("#dcfce7", "#166534"),
+        "blue": ("#dbeafe", "#1d4ed8"),
+    }
+
+    style = """
+<style>
+  .audit-wrap{max-width:1080px;margin:0 auto;padding:12px 0 26px}
+  .audit-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap}
+  .audit-filters{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end}
+  .audit-filters label{font-size:12px;font-weight:900;opacity:.9}
+  .audit-input{padding:10px 10px;border-radius:12px;border:1px solid rgba(148,163,184,.35);background:#fff;font-weight:800}
+  body.theme-dark .audit-input{background:rgba(2,6,23,.55);color:#e5e7eb}
+  .audit-btn{padding:10px 16px;border-radius:999px;border:none;background:#16a34a;color:#fff;font-weight:900;cursor:pointer}
+  body.theme-dark .audit-btn{background:#22c55e}
+  .audit-table{width:100%;border-collapse:separate;border-spacing:0}
+  .audit-table th{text-align:left;padding:12px 10px;border-bottom:2px solid rgba(148,163,184,.25);background:rgba(2,132,199,.06);position:sticky;top:0}
+  .audit-table td{padding:10px 10px;border-bottom:1px solid rgba(148,163,184,.16);vertical-align:top}
+  .audit-row{transition: transform .12s ease, filter .12s ease}
+  .audit-row:hover{transform: translateY(-1px);filter:brightness(1.01)}
+</style>
+"""
+
+    # Tabla
+    rows_html = ""
+    for a in filtered:
+        sev = severity(a)
+        bg, fg = color_map[sev]
+        created_dt = a.get("created_at")
+        dt_txt = created_dt.strftime("%Y-%m-%d %H:%M:%S") if hasattr(created_dt, "strftime") else str(created_dt or "")
+        rows_html += (
+            "<tr class='audit-row' style='background:{};'>"
+            "<td style='font-variant-numeric:tabular-nums;white-space:nowrap;color:{}'>{}</td>"
+            "<td>{}</td>"
+            "<td>{}</td>"
+            "<td>{}</td>"
+            "<td style='max-width:520px;word-break:break-word'>{}</td>"
+            "<td style='white-space:nowrap;opacity:.85'>{}</td>"
+            "</tr>".format(
+                bg,
+                fg,
+                html.escape(dt_txt),
+                html.escape(str(a.get("user_name") or "—")),
+                html.escape(str(a.get("role") or a.get("raw_role") or "—")),
+                html.escape(str(a.get("module") or "—")),
+                html.escape(str(a.get("action") or "—")),
+                html.escape(str(a.get("detail") or "")),
+                html.escape(str(a.get("ip") or "—")),
+            )
+        )
+
+    if not rows_html:
+        rows_html = "<tr><td colspan='7' style='opacity:.75;text-align:center;padding:18px'>Sin auditoría para estos filtros</td></tr>"
+
+    user_filter_html = ""
+    if is_adminish:
+        # Opciones por usuario (en el tenant actual)
+        opts = "".join(
+            f"<option value='{uid}'{' selected' if q_uid == uid else ''}>{html.escape(uobj.get('username') or uobj.get('name') or str(uid))}</option>"
+            for uid, uobj in store.users.items()
+            if u.get("role") == "super_admin" or uobj.get("organization_id") == oid
+        )
+        user_filter_html = f"<select name='user_id' class='audit-input' style='min-width:190px'>{opts}</select>"
+    else:
+        user_filter_html = f"<input type='hidden' name='user_id' value='{u.get('id')}'/>"
+
+    body = (
+        style
+        + "<div class='audit-wrap'>"
+        + "<div class='card' style='padding:16px;'>"
+        + "<div class='audit-head'>"
+        + "<div>"
+        + "<h2 style='margin:0 0 6px 0'>🧾 Auditoría</h2>"
+        + "<div style='opacity:.88;font-weight:800;font-size:13px'>Registra acciones críticas y consultas.</div>"
+        + "</div>"
+        + "<div class='audit-filters'>"
+        + "<form method='get' style='display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end'>"
+        + "<div><label>Usuario</label><br>" + user_filter_html + "</div>"
+        + "<div><label>Acción / módulo</label><br><input class='audit-input' name='accion' placeholder='ej: crear préstamo' value='" + html.escape(q_action) + "'></div>"
+        + "<div><label>Desde</label><br><input class='audit-input' type='date' name='desde' value='" + html.escape(q_from) + "'></div>"
+        + "<div><label>Hasta</label><br><input class='audit-input' type='date' name='hasta' value='" + html.escape(q_to) + "'></div>"
+        + "<div><button class='audit-btn' type='submit'>Filtrar</button></div>"
+        + "</form>"
+        + "</div>"
+        + "</div>"
+        + "<div style='margin-top:14px'>"
+        + "<div class='table-scroll'>"
+        + "<table class='audit-table'>"
+        + "<thead><tr>"
+        + "<th>Fecha</th><th>Usuario</th><th>Rol</th><th>Módulo</th><th>Acción</th><th>Detalle</th><th>IP</th>"
+        + "</tr></thead>"
+        + "<tbody>" + rows_html + "</tbody>"
+        + "</table>"
+        + "</div>"
+        + "</div>"
+        + "</div>"
+        + "</div>"
     )
-    return page(f'<div class="card"><h2>Auditoría</h2><div class="table-scroll"><table><tr><th>Fecha</th><th>Acción</th><th>Detalle</th></tr>{rows}</table></div></div>')
+    return page(body)
 
 
 def compute_super_admin_stats(date_from=None, date_to=None):
@@ -4806,9 +5174,15 @@ def bank_legal_list():
     ensure_org()
     oid = session.get("org_id")
     user = current_user()
-    if not can_admin_actions(user):
-        flash("Acción restringida: solo admin puede ver documentos legales.", "danger")
-        return redirect(url_for("bank_home"))
+    try:
+        log_action(
+            user.get("id"),
+            "ver documentos legales",
+            module="documento legal",
+            detail="lista",
+        )
+    except Exception:
+        pass
     rows = []
 
     for L in sorted(loans_for_user(oid, user), key=lambda x: -x.get("id", 0))[:200]:
@@ -4855,9 +5229,21 @@ def view_legal_document(loan_id):
     if not loan or loan.get("organization_id") != oid:
         flash("Préstamo no encontrado.", "danger")
         return redirect(url_for("bank_legal_list"))
-    if not can_admin_actions(current_user()):
-        flash("Acción restringida: solo admin puede ver documentos legales.", "danger")
+    u = current_user()
+    if not scope_owns_loan(u, loan):
+        flash("Sin acceso.", "danger")
         return redirect(url_for("bank_legal_list"))
+    try:
+        cl = store.clients.get(loan.get("client_id"), {})
+        client_nm = f"{cl.get('first_name') or ''} {cl.get('last_name') or ''}".strip() or "Cliente"
+        log_action(
+            u.get("id"),
+            "ver documento legal",
+            module="documento legal",
+            detail=f"Préstamo #{loan_id} • {client_nm}",
+        )
+    except Exception:
+        pass
 
     client = store.clients.get(loan.get("client_id"), {})
     cob_u = store.users.get(loan.get("created_by"), {})
@@ -5152,9 +5538,10 @@ def upload_id_front(loan_id):
     if not loan or loan.get("organization_id") != oid:
         flash("Préstamo no encontrado.", "danger")
         return redirect(url_for("bank_legal_list"))
-    if not can_admin_actions(current_user()):
-        flash("Acción restringida: solo admin puede gestionar documentos legales.", "danger")
-        return redirect(url_for("bank_home"))
+    u = current_user()
+    if not scope_owns_loan(u, loan):
+        flash("Sin acceso.", "danger")
+        return redirect(url_for("bank_legal_list"))
 
     f = request.files.get("id_front")
     if not f:
@@ -5168,6 +5555,12 @@ def upload_id_front(loan_id):
 
     b64 = base64.b64encode(raw).decode("ascii")
     loan["id_photo_b64"] = f"data:image/png;base64,{b64}"
+    try:
+        cl = store.clients.get(loan.get("client_id"), {})
+        client_nm = f"{cl.get('first_name') or ''} {cl.get('last_name') or ''}".strip() or f"Cliente #{loan.get('client_id')}"
+        log_action(u.get("id"), "subir foto ID (frente)", module="documento legal", detail=f"Préstamo #{loan_id} • {client_nm}")
+    except Exception:
+        pass
     flash("ID (frente) guardada en memoria.", "success")
     return redirect(url_for("view_legal_document", loan_id=loan_id))
 
@@ -5181,9 +5574,10 @@ def upload_id_back(loan_id):
     if not loan or loan.get("organization_id") != oid:
         flash("Préstamo no encontrado.", "danger")
         return redirect(url_for("bank_legal_list"))
-    if not can_admin_actions(current_user()):
-        flash("Acción restringida: solo admin puede gestionar documentos legales.", "danger")
-        return redirect(url_for("bank_home"))
+    u = current_user()
+    if not scope_owns_loan(u, loan):
+        flash("Sin acceso.", "danger")
+        return redirect(url_for("bank_legal_list"))
 
     f = request.files.get("id_back")
     if not f:
@@ -5197,6 +5591,12 @@ def upload_id_back(loan_id):
 
     b64 = base64.b64encode(raw).decode("ascii")
     loan["id_photo_back_b64"] = f"data:image/png;base64,{b64}"
+    try:
+        cl = store.clients.get(loan.get("client_id"), {})
+        client_nm = f"{cl.get('first_name') or ''} {cl.get('last_name') or ''}".strip() or f"Cliente #{loan.get('client_id')}"
+        log_action(u.get("id"), "subir foto ID (atrás)", module="documento legal", detail=f"Préstamo #{loan_id} • {client_nm}")
+    except Exception:
+        pass
     flash("ID (atrás) guardada en memoria.", "success")
     return redirect(url_for("view_legal_document", loan_id=loan_id))
 
@@ -5214,9 +5614,10 @@ def sign_legal_document(loan_id):
             flash("Préstamo no encontrado.", "danger")
             return redirect(url_for("bank_legal_list"))
 
-        if not can_admin_actions(current_user()):
-            flash("Acción restringida: solo admin puede firmar documentos legales.", "danger")
-            return redirect(url_for("bank_home"))
+        u = current_user()
+        if not scope_owns_loan(u, loan):
+            flash("Sin acceso.", "danger")
+            return redirect(url_for("bank_legal_list"))
 
         sig = request.form.get("signature_b64")
         if not sig or not str(sig).startswith("data:"):
@@ -5224,6 +5625,12 @@ def sign_legal_document(loan_id):
             return redirect(url_for("view_legal_document", loan_id=loan_id))
 
         loan["signature_b64"] = sig
+        try:
+            cl = store.clients.get(loan.get("client_id"), {})
+            client_nm = f"{cl.get('first_name') or ''} {cl.get('last_name') or ''}".strip() or f"Cliente #{loan.get('client_id')}"
+            log_action(u.get("id"), "firmar documento legal", module="documento legal", detail=f"Préstamo #{loan_id} • {client_nm}")
+        except Exception:
+            pass
         flash("Firma guardada en memoria.", "success")
         return redirect(url_for("loan_detail", loan_id=loan_id))
 
@@ -5237,9 +5644,6 @@ def bank_advance():
     ensure_org()
     oid = session.get("org_id")
     user = current_user()
-    if not can_admin_actions(user):
-        flash("Acción restringida: solo admin puede ver/gestionar adelantos.", "danger")
-        return redirect(url_for("bank_home"))
     can_del = user.get("role") == "admin" or is_cartera_admin(user)
 
     def payment_ts(p):
@@ -5392,10 +5796,15 @@ def bank_expenses():
     ensure_org()
     oid = session.get("org_id")
     u = current_user()
-    if not can_admin_actions(u):
-        flash("Acción restringida: solo admin puede registrar gastos de ruta.", "danger")
+    if not (can_admin_actions(u) or is_cajero_role(u) or user_is_cobrador_limited(u)):
+        flash("Acción restringida.", "danger")
         return redirect(url_for("bank_home"))
-    restrict = False
+    try:
+        log_action(u.get("id"), "ver gastos de ruta", module="gastos de ruta", detail="")
+    except Exception:
+        pass
+    restrict = user_is_cobrador_limited(u)
+    can_manage = can_admin_actions(u)
 
     kind_options = "".join(
         f'<option value="{k}">{ico} {lbl}</option>' for k, (lbl, ico) in ROUTE_EXPENSE_KINDS.items()
@@ -5416,11 +5825,17 @@ def bank_expenses():
         kind = e.get("kind") or "otros"
         lbl, ico = route_expense_kind_info(kind)
         row_bg = "#ecfdf5" if idx % 2 == 0 else "#ffffff"
-        edit_btn = f'<a class="route-act route-act-edit" href="{url_for("edit_expense", expense_id=e["id"])}" title="Editar">✏</a>'
+        edit_btn = (
+            f'<a class="route-act route-act-edit" href="{url_for("edit_expense", expense_id=e["id"])}" title="Editar">✏</a>'
+            if can_manage
+            else ""
+        )
         del_form = (
             f'<form method="post" action="{url_for("delete_route_expense", expense_id=e["id"])}" style="display:inline" '
             f'onsubmit="return confirm(\'¿Eliminar este gasto?\');">'
             f'<button type="submit" class="route-act route-act-del" title="Eliminar">🗑</button></form>'
+            if can_manage
+            else ""
         )
         tbody_rows.append(
             f"<tr style='background:{row_bg};'>"
@@ -5517,6 +5932,16 @@ def delete_route_expense(expense_id):
     if cash_id is not None:
         store.cash_reports.pop(cash_id, None)
     store.route_expenses.pop(expense_id, None)
+    try:
+        exp_nm = f"{exp.get('route') or '—'} • {exp.get('kind') or '—'}"
+        log_action(
+            u.get("id"),
+            "eliminar gasto de ruta",
+            module="gastos de ruta",
+            detail=f"{exp_nm} — {fmt_money(exp.get('amount'))}",
+        )
+    except Exception:
+        pass
     flash("Gasto eliminado y banco actualizado.", "success")
     return redirect(url_for("bank_expenses"))
 
@@ -5579,6 +6004,17 @@ def edit_expense(expense_id):
         exp["amount"] = round(float(new_amt), 2)
         exp["note"] = note or "—"
         exp["cash_report_id"] = new_cash_id
+        try:
+            route_nm = f"{route or '—'}"
+            kind_lbl = ROUTE_EXPENSE_KINDS.get(kind, (kind, ""))[0] if "ROUTE_EXPENSE_KINDS" in globals() else (kind, "")
+            log_action(
+                current_user()["id"],
+                "editar gasto de ruta",
+                module="gastos de ruta",
+                detail=f"{route_nm} • {kind_lbl} — {fmt_money(exp.get('amount'))}",
+            )
+        except Exception:
+            pass
         flash("Gasto actualizado.", "success")
         return redirect(url_for("bank_expenses"))
 
@@ -5607,8 +6043,9 @@ def edit_expense(expense_id):
 def add_route_expense():
     ensure_org()
     org_id = session.get("org_id")
-    if not can_admin_actions(current_user()):
-        flash("Acción restringida: solo admin puede registrar gastos de ruta.", "danger")
+    u = current_user()
+    if not (can_admin_actions(u) or is_cajero_role(u)):
+        flash("Acción restringida.", "danger")
         return redirect(url_for("bank_home"))
     route = (request.form.get("route") or "").strip()
     note = (request.form.get("note") or "").strip()
@@ -5648,6 +6085,16 @@ def add_route_expense():
         "organization_id": org_id,
         "cash_report_id": cash_id,
     }
+    try:
+        u = current_user()
+        log_action(
+            u.get("id"),
+            "agregar gasto de ruta",
+            module="gastos de ruta",
+            detail=f"{route or '—'} • {lbl} — {fmt_money(exp_amount)}",
+        )
+    except Exception:
+        pass
     flash("Gasto registrado. Banco actualizado.", "success")
     return redirect(url_for("bank_expenses"))
 
@@ -5731,6 +6178,19 @@ def delete_discount(discount_id):
     if float(target.get("remaining") or 0) <= 0:
         target["status"] = "cerrado"
 
+    try:
+        user_id = u.get("id")
+        loan_id = target.get("id") or "—"
+        cl = store.clients.get(client_id, {})
+        client_nm = f"{cl.get('first_name') or ''} {cl.get('last_name') or ''}".strip() or f"Cliente #{client_id}"
+        log_action(
+            user_id,
+            "eliminar descuento inicial",
+            module="descuentos",
+            detail=f"Préstamo #{loan_id} • {fmt_money(old_discount_amount)} • {client_nm}",
+        )
+    except Exception:
+        pass
     flash("Descuento inicial eliminado y banco actualizado.", "success")
     return redirect(url_for("bank_acta"))
 
@@ -5830,6 +6290,19 @@ def edit_discount(discount_id):
     else:
         target["status"] = target.get("status") if target.get("status") != "cerrado" else "ACTIVO"
 
+    try:
+        user_id = u.get("id") if "u" in locals() else current_user().get("id")
+        loan_id = target.get("id") or "—"
+        cl = store.clients.get(client_id, {})
+        client_nm = f"{cl.get('first_name') or ''} {cl.get('last_name') or ''}".strip() or f"Cliente #{client_id}"
+        log_action(
+            user_id,
+            "editar descuento inicial",
+            module="descuentos",
+            detail=f"Préstamo #{loan_id} • {fmt_money(new_discount_amount)} • {client_nm}",
+        )
+    except Exception:
+        pass
     flash("Descuento inicial editado y banco actualizado.", "success")
     return redirect(url_for("bank_acta"))
 
@@ -5878,6 +6351,15 @@ def bank_delivery():
             except ValueError as e:
                 flash(str(e), "danger")
                 return redirect(url_for("bank_delivery"))
+            try:
+                log_action(
+                    user.get("id"),
+                    "entrega de dinero",
+                    module="banco",
+                    detail=f"{fmt_money(amt)} para {cob.get('username')}",
+                )
+            except Exception:
+                pass
             flash(f"Entrega registrada: {fmt_money(amt)} para {cob.get('username')}.", "success")
             return redirect(url_for("bank_delivery"))
 
@@ -5916,6 +6398,15 @@ def bank_delivery():
                 flash(str(e), "danger")
                 return redirect(url_for("bank_delivery"))
 
+            try:
+                log_action(
+                    user.get("id"),
+                    "devolución de capital",
+                    module="banco",
+                    detail=f"{fmt_money(amt)} para {cob.get('username')}",
+                )
+            except Exception:
+                pass
             flash(f"Devolución registrada: {fmt_money(amt)} para {cob.get('username')}.", "success")
             return redirect(url_for("bank_delivery"))
 
@@ -6084,10 +6575,26 @@ def bank_acta():
     ensure_org()
     oid = session.get("org_id")
     u = current_user()
-    if not can_admin_actions(u):
-        flash("Acción restringida: solo admin puede ver/gestionar el acta (descuentos).", "danger")
+    if not (can_admin_actions(u) or is_cajero_role(u)):
+        flash("Acción restringida.", "danger")
         return redirect(url_for("bank_home"))
-    restrict = False
+    try:
+        log_action(u.get("id"), "ver acta", module="banco", detail="")
+    except Exception:
+        pass
+    restrict = user_is_cobrador_limited(u)
+    can_manage = can_admin_actions(u)
+
+    # Para cajero/cobrador: los "descuentos iniciales" deben verse por préstamos en alcance
+    # (loan.created_by == user.id), no solo por cash_report.user_id.
+    loan_ids = loan_ids_visible(oid, u) if restrict else None
+    discount_cash_ids = None
+    if restrict:
+        discount_cash_ids = {
+            L.get("discount_cash_report_id")
+            for L in loans_for_user(oid, u)
+            if L.get("discount_cash_report_id") is not None
+        }
     # ============================================================
     # Vista tipo "Acta global" (alineada al otro sistema)
     # - Caja global: depósitos + banco inicial (sin incluir préstamos/pagos)
@@ -6108,7 +6615,7 @@ def bank_acta():
             for cr in store.cash_reports.values()
             if cr.get("organization_id") == oid
             and cr.get("movement_type") == "descuento_inicial"
-            and (not restrict or cr.get("user_id") == u.get("id"))
+            and (not restrict or cr.get("id") in discount_cash_ids)
         ),
         2,
     )
@@ -6139,7 +6646,7 @@ def bank_acta():
             for cr in store.cash_reports.values()
             if cr.get("organization_id") == oid
             and cr.get("movement_type") == "descuento_inicial"
-            and (not restrict or cr.get("user_id") == u.get("id"))
+            and (not restrict or cr.get("id") in discount_cash_ids)
         ),
         key=lambda x: x.get("created_at") or datetime.min,
         reverse=True,
@@ -6160,11 +6667,12 @@ def bank_acta():
         cobrador = store.users.get(user_id, {}).get("username") or "—"
         ruta = client.get("route") or "—"
         monto = float(cr.get("amount") or 0)
-
         del_form = (
             f"<form method='post' action='{url_for('delete_discount', discount_id=discount_id)}' "
             f"onsubmit=\"return confirm('¿Eliminar este descuento y ajustar el banco?');\" style='margin:0'>"
             f"<button class='btn btn-secondary' type='submit' title='Eliminar'>🗑</button></form>"
+            if can_manage
+            else "<span style='opacity:.55'>—</span>"
         )
 
         rows += (
@@ -6224,12 +6732,18 @@ def bank_routes_list():
     ensure_org()
     oid = session.get("org_id")
     user = current_user()
-    if not can_admin_actions(user):
-        flash("Acción restringida: solo admin puede ver Capital por ruta.", "danger")
-        return redirect(url_for("bank_home"))
     # Filtros (query params)
     ruta_q = (request.args.get("ruta") or "").strip()
     prestamista_q = request.args.get("prestamista", type=int)
+    try:
+        log_action(
+            user.get("id"),
+            "ver capital por ruta",
+            module="banco",
+            detail=f"ruta={ruta_q or '—'} • prestamista={prestamista_q or '—'}",
+        )
+    except Exception:
+        pass
 
     by_route = {}
     prestamista_ids = set()
