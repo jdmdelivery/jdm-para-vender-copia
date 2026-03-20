@@ -21,9 +21,15 @@ from flask import (
     get_flashed_messages,
     send_from_directory,
     jsonify,
+    Response,
 )
 
 APP_BRAND = "JDM Cash Now"
+# Service worker mínimo si no hay archivo en static/ (p. ej. deploy sin carpeta static).
+SW_JS_MINIMAL = """/* Minimal service worker */
+self.addEventListener('install', (e) => self.skipWaiting());
+self.addEventListener('activate', (e) => e.waitUntil(self.clients.claim()));
+"""
 ADMIN_PIN = os.getenv("ADMIN_PIN", "5555")
 CURRENCY = "RD$"
 ADMIN_WHATSAPP = os.getenv("ADMIN_WHATSAPP", "3128565688")
@@ -559,7 +565,11 @@ def manifest():
 
 @app.route("/sw.js")
 def service_worker():
-    return send_from_directory("static", "sw.js", mimetype="application/javascript")
+    folder = app.static_folder
+    path = os.path.join(folder, "sw.js") if folder else ""
+    if folder and os.path.isfile(path):
+        return send_from_directory(folder, "sw.js", mimetype="application/javascript")
+    return Response(SW_JS_MINIMAL, mimetype="application/javascript")
 
 
 @app.route("/api/notification-check")
