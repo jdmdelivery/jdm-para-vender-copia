@@ -2966,6 +2966,8 @@ def super_admin_panel():
     def to_date_only(x):
         if not x:
             return None
+        if isinstance(x, datetime):
+            return x.date()
         if isinstance(x, date):
             return x
         try:
