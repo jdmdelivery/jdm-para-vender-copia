@@ -39,7 +39,15 @@ RECEIPT_SUBTITLE = os.getenv("RECEIPT_SUBTITLE", "LA FACTORIA DEL POZO")
 RECEIPT_COMPANY_TEL = os.getenv("RECEIPT_COMPANY_TEL", "8495788819")
 CARTERA_ADMIN_USER_ID = 60
 ORG_ID = 1
-ROLES = ("admin", "supervisor", "cobrador")
+SUPER_ADMIN_USERNAME = os.getenv("SUPER_ADMIN_USERNAME", "super_admin")
+SUPER_ADMIN_PASSWORD = os.getenv("SUPER_ADMIN_PASSWORD", "super_admin")
+DEFAULT_TENANT_SUBSCRIPTION_DAYS = int(os.getenv("DEFAULT_TENANT_SUBSCRIPTION_DAYS", "30"))
+
+ACCOUNT_PENDING = "pendiente"
+ACCOUNT_ACTIVE = "activo"
+ACCOUNT_SUSPENDED = "suspendido"
+
+ROLES = ("admin", "supervisor", "cobrador", "super_admin")
 
 
 def fmt_money(val):
@@ -284,7 +292,7 @@ class Store:
     __slots__ = (
         "users", "organizations", "clients", "loans", "payments", "loan_arrears",
         "cash_reports", "audit_log", "route_expenses", "initial_discounts", "gps_positions",
-        "weekly_closures", "deposit_history", "closure_history", "starting_bank", "_seq",
+        "weekly_closures", "deposit_history", "closure_history", "starting_banks", "starting_bank_default", "_seq",
     )
 
     def __init__(self):
@@ -302,11 +310,12 @@ class Store:
         self.weekly_closures = {}
         self.deposit_history = []
         self.closure_history = []
-        # Saldo inicial del banco (0 por defecto). Opcional: variable de entorno STARTING_BANK.
+        # Saldo inicial del banco (por tenant/admin).
         try:
-            self.starting_bank = float(os.getenv("STARTING_BANK", "0") or 0)
+            self.starting_bank_default = float(os.getenv("STARTING_BANK", "0") or 0)
         except ValueError:
-            self.starting_bank = 0.0
+            self.starting_bank_default = 0.0
+        self.starting_banks = {}
         self._seq = {
             "users": 1,
             "clients": 0,
@@ -328,16 +337,39 @@ class Store:
 
     def _seed(self):
         """Solo administrador inicial; clientes, préstamos y demás usuarios se crean desde la app."""
+        created = datetime.utcnow()
+        sub_end = created + timedelta(days=DEFAULT_TENANT_SUBSCRIPTION_DAYS)
+
+        # SUPER ADMIN (plataforma).
         self.users[1] = {
             "id": 1,
+            "username": SUPER_ADMIN_USERNAME,
+            "password_hash": generate_password_hash(SUPER_ADMIN_PASSWORD),
+            "role": "super_admin",
+            "phone": "",
+            "organization_id": None,
+            "created_at": created,
+            "name": None,
+            "account_status": ACCOUNT_ACTIVE,
+            "subscription_end": sub_end,
+        }
+
+        # ADMÍN TENANT inicial (su propio sistema).
+        tenant_admin_id = 2
+        self.users[tenant_admin_id] = {
+            "id": tenant_admin_id,
             "username": "admin",
             "password_hash": generate_password_hash("admin"),
             "role": "admin",
             "phone": "",
-            "organization_id": ORG_ID,
-            "created_at": datetime.utcnow(),
+            "organization_id": tenant_admin_id,  # Tenant = su propio admin.
+            "created_at": created,
             "name": None,
+            "account_status": ACCOUNT_ACTIVE,
+            "subscription_end": sub_end,
         }
+        self.starting_banks[tenant_admin_id] = self.starting_bank_default
+        self._seq["users"] = tenant_admin_id
 
     def reset_all(self):
         self.__init__()
@@ -380,6 +412,10 @@ def admin_required(fn):
     return role_required("admin")(fn)
 
 
+def super_admin_required(fn):
+    return role_required("super_admin")(fn)
+
+
 def log_action(user_id, action, detail=""):
     store.audit_log.append({
         "id": store.nid("audit"), "user_id": user_id, "action": action, "detail": detail, "created_at": datetime.utcnow(),
@@ -387,7 +423,14 @@ def log_action(user_id, action, detail=""):
 
 
 def ensure_org():
-    session["org_id"] = session.get("org_id") or ORG_ID
+    # Para multi-tenant: org_id se define en el login según el usuario.
+    # Si por alguna razón no existe, se intenta derivar desde el usuario actual.
+    if session.get("org_id") is None:
+        u = current_user()
+        if u and u.get("role") != "super_admin":
+            session["org_id"] = u.get("organization_id") or ORG_ID
+        else:
+            session["org_id"] = ORG_ID
 
 
 def calc_client_score(client_id, org_id):
@@ -458,7 +501,7 @@ def bank_org_id(org_id=None):
 
 def get_bank_available(org_id=None):
     oid = bank_org_id(org_id)
-    total = float(getattr(store, "starting_bank", 0.0) or 0.0)
+    total = float(getattr(store, "starting_banks", {}).get(oid, 0.0) or 0.0)
     for cr in store.cash_reports.values():
         if cr.get("organization_id") == oid:
             total += float(cr.get("amount") or 0)
@@ -570,6 +613,9 @@ def compute_financial_kpis(org_id, user):
 
 
 def nav_subfooter():
+    u = current_user()
+    if u and u.get("role") == "super_admin":
+        return f'<p style="margin-top:20px"><a class="btn btn-secondary" href="{url_for("super_admin_panel")}">← Panel Super Admin</a></p>'
     return (
         f'<p style="margin-top:20px"><a class="btn btn-secondary" href="{url_for("dashboard")}">← Dashboard</a> '
         f'<a class="btn btn-secondary" href="{url_for("bank_home")}">Banco</a></p>'
@@ -590,10 +636,60 @@ def login():
             return render_template_string(
                 TPL_LOGIN, flashes=get_flashed_messages(with_categories=True), app_brand=APP_BRAND, admin_whatsapp=ADMIN_WHATSAPP
             )
+
         session.clear()
-        session["user_id"] = user["id"]
-        session["role"] = user.get("role")
-        session["org_id"] = user.get("organization_id") or ORG_ID
+
+        # Bloqueos por estado/aprobación/suscripción.
+        role = user.get("role")
+        if role == "super_admin":
+            session["user_id"] = user["id"]
+            session["role"] = "super_admin"
+            session["org_id"] = None
+        else:
+            tenant_id = user.get("organization_id") or ORG_ID
+            tenant_admin = store.users.get(tenant_id, {}) if tenant_id else user
+            now = datetime.utcnow()
+
+            # Auto-suspensión por expiración de suscripción (solo para el admin del tenant).
+            sub_end = tenant_admin.get("subscription_end")
+            if sub_end and hasattr(sub_end, "strftime"):
+                if now > sub_end and tenant_admin.get("account_status") != ACCOUNT_SUSPENDED:
+                    tenant_admin["account_status"] = ACCOUNT_SUSPENDED
+
+            u_status = user.get("account_status", ACCOUNT_ACTIVE)
+            tenant_status = tenant_admin.get("account_status", ACCOUNT_ACTIVE)
+
+            if u_status == ACCOUNT_SUSPENDED or tenant_status == ACCOUNT_SUSPENDED:
+                flash("Cuenta suspendida por falta de pago", "danger")
+                return render_template_string(
+                    TPL_LOGIN,
+                    flashes=get_flashed_messages(with_categories=True),
+                    app_brand=APP_BRAND,
+                    admin_whatsapp=ADMIN_WHATSAPP,
+                )
+
+            if u_status == ACCOUNT_PENDING or tenant_status == ACCOUNT_PENDING:
+                flash("Usuario pendiente de aprobación por el sistema", "warning")
+                return render_template_string(
+                    TPL_LOGIN,
+                    flashes=get_flashed_messages(with_categories=True),
+                    app_brand=APP_BRAND,
+                    admin_whatsapp=ADMIN_WHATSAPP,
+                )
+
+            if tenant_status != ACCOUNT_ACTIVE:
+                flash("Cuenta suspendida por falta de pago", "danger")
+                return render_template_string(
+                    TPL_LOGIN,
+                    flashes=get_flashed_messages(with_categories=True),
+                    app_brand=APP_BRAND,
+                    admin_whatsapp=ADMIN_WHATSAPP,
+                )
+
+            session["user_id"] = user["id"]
+            session["role"] = role
+            session["org_id"] = tenant_id
+
         try:
             log_action(user["id"], "login", "login")
         except Exception:
@@ -603,6 +699,63 @@ def login():
     return render_template_string(
         TPL_LOGIN, flashes=get_flashed_messages(with_categories=True), app_brand=APP_BRAND, admin_whatsapp=ADMIN_WHATSAPP
     )
+
+
+@app.route("/register-admin", methods=["GET", "POST"])
+def register_admin():
+    """
+    Registro de nuevos admins (tenants).
+    Quedan en estado "pendiente" hasta aprobación del super admin.
+    """
+    if request.method == "POST":
+        username = (request.form.get("username") or "").strip()
+        password = (request.form.get("password") or "").strip()
+        phone = (request.form.get("phone") or "").strip()
+        days = request.form.get("subscription_days", type=int) or DEFAULT_TENANT_SUBSCRIPTION_DAYS
+
+        if not username or not password:
+            flash("Complete usuario y contraseña.", "danger")
+            return redirect(url_for("register_admin"))
+        if any(u.get("username") == username for u in store.users.values()):
+            flash("Usuario ya existe.", "danger")
+            return redirect(url_for("register_admin"))
+        if days < 1:
+            days = DEFAULT_TENANT_SUBSCRIPTION_DAYS
+
+        created = datetime.utcnow()
+        sub_end = created + timedelta(days=days)
+
+        uid = store.nid("users")
+        store.users[uid] = {
+            "id": uid,
+            "username": username,
+            "password_hash": generate_password_hash(password),
+            "role": "admin",
+            "phone": phone,
+            "organization_id": uid,  # Tenant = su propio admin.
+            "created_at": created,
+            "name": None,
+            "account_status": ACCOUNT_PENDING,
+            "subscription_end": sub_end,
+        }
+        store.starting_banks[uid] = store.starting_bank_default
+        flash("Registro recibido. Queda pendiente de aprobación por el sistema.", "success")
+        return redirect(url_for("login"))
+
+    body = (
+        f'<div class="card" style="padding:16px;max-width:520px;margin:20px auto;">'
+        f'<h2 style="margin:0 0 12px 0;color:#14532d;">Registro de nuevo Admin</h2>'
+        f'<form method="post">'
+        f'<label>Usuario</label><input name="username" required>'
+        f'<label>Contraseña</label><input type="password" name="password" required>'
+        f'<label>Teléfono (opcional)</label><input name="phone" placeholder="809...">'
+        f'<label>Días de suscripción</label><input name="subscription_days" type="number" min="1" value="{DEFAULT_TENANT_SUBSCRIPTION_DAYS}">'
+        f'<button class="btn btn-primary" type="submit" style="width:auto;margin-top:12px">Registrar (pendiente)</button>'
+        f'</form>'
+        f'<p style="margin-top:10px"><a class="btn btn-secondary" href="{url_for("login")}">Volver al login</a></p>'
+        f'</div>'
+    )
+    return page(body, user=None)
 
 
 @app.route("/logout")
@@ -694,6 +847,8 @@ def dashboard():
     if user["role"] not in ROLES:
         flash("Acceso no permitido", "danger")
         return redirect(url_for("index"))
+    if user.get("role") == "super_admin":
+        return redirect(url_for("super_admin_panel"))
     ensure_org()
     org_id = session.get("org_id")
     k = compute_financial_kpis(org_id, user)
@@ -911,11 +1066,14 @@ body.theme-dark .dash-h2 {{ color: #86efac; }}
 @login_required
 @role_required("admin", "supervisor")
 def users():
+    ensure_org()
+    oid = session.get("org_id")
     rows = "".join(
         f"<tr><td>{u['username']}</td><td>{u['role']}</td><td>{u.get('phone') or ''}</td>"
         f"""<td><form method="post" action="{url_for('delete_user', user_id=u['id'])}" style="display:inline" """
         f"""onsubmit="return confirm('¿Eliminar usuario?');"><button class="btn btn-secondary" type="submit">Borrar</button></form></td></tr>"""
         for u in store.users.values()
+        if u.get("organization_id") == oid and u.get("role") != "super_admin"
     )
     body = (
         f'<div class="card"><h2>Usuarios</h2><div class="table-scroll"><table><tr><th>Usuario</th><th>Rol</th><th>Tel</th><th></th></tr>{rows}</table></div>'
@@ -946,6 +1104,7 @@ def employees():
 @login_required
 @admin_required
 def new_user():
+    ensure_org()
     if request.method == "POST":
         if request.form.get("pin") != ADMIN_PIN:
             flash("PIN incorrecto.", "danger")
@@ -957,13 +1116,23 @@ def new_user():
         if not username or not password:
             flash("Datos incompletos.", "danger")
             return redirect(url_for("new_user"))
+        if role == "admin":
+            flash("No puede crear usuarios con rol 'admin'.", "danger")
+            return redirect(url_for("new_user"))
         if any(u["username"] == username for u in store.users.values()):
             flash("Usuario ya existe.", "danger")
             return redirect(url_for("new_user"))
+        org_id = session.get("org_id")
         uid = store.nid("users")
+        status = ACCOUNT_PENDING if role == "cobrador" else ACCOUNT_ACTIVE
         store.users[uid] = {
             "id": uid, "username": username, "password_hash": generate_password_hash(password),
-            "role": role, "phone": phone, "organization_id": ORG_ID, "created_at": datetime.utcnow(), "name": None,
+            "role": role,
+            "phone": phone,
+            "organization_id": org_id,
+            "created_at": datetime.utcnow(),
+            "name": None,
+            "account_status": status,
         }
         flash("Usuario creado.", "success")
         return redirect(url_for("users"))
@@ -972,7 +1141,7 @@ def new_user():
         f'<label>Usuario</label><input name="username" required>'
         f'<label>Contraseña</label><input type="password" name="password" required>'
         f'<label>Teléfono</label><input name="phone">'
-        f'<label>Rol</label><select name="role"><option value="cobrador">Cobrador</option><option value="supervisor">Supervisor</option><option value="admin">Admin</option></select>'
+        f'<label>Rol</label><select name="role"><option value="cobrador">Cobrador (queda pendiente)</option><option value="supervisor">Supervisor</option></select>'
         f'<label>PIN admin</label><input name="pin" required>'
         f'<button class="btn btn-primary" type="submit">Crear</button></form></div>'
     )
@@ -986,6 +1155,12 @@ def delete_user(user_id):
     if user_id == session.get("user_id"):
         flash("No puede borrarse a sí mismo.", "danger")
         return redirect(url_for("users"))
+    ensure_org()
+    oid = session.get("org_id")
+    u = store.users.get(user_id)
+    if not u or u.get("organization_id") != oid:
+        flash("Sin acceso para eliminar ese usuario.", "danger")
+        return redirect(url_for("users"))
     store.users.pop(user_id, None)
     flash("Usuario eliminado.", "success")
     return redirect(url_for("users"))
@@ -998,7 +1173,13 @@ def reassign_clients():
     if request.method == "POST":
         flash("Reasignación guardada.", "info")
         return redirect(url_for("clients"))
-    opts = "".join(f"<option value='{u['id']}'>{u['username']}</option>" for u in store.users.values() if u.get("role") == "cobrador")
+    ensure_org()
+    oid = session.get("org_id")
+    opts = "".join(
+        f"<option value='{u['id']}'>{u['username']}</option>"
+        for u in store.users.values()
+        if u.get("role") == "cobrador" and u.get("organization_id") == oid
+    )
     body = f'<div class="card"><h2>Reasignar rutas</h2><select>{opts}</select><p><a class="btn btn-secondary" href="{url_for("clients")}">Volver</a></p></div>'
     return page(body)
 
@@ -1057,6 +1238,7 @@ def clients():
 @login_required
 def new_client():
     user = current_user()
+    ensure_org()
     if request.method == "POST":
         first = (request.form.get("first_name") or "").strip()
         if not first:
@@ -1072,7 +1254,7 @@ def new_client():
             "address": (request.form.get("address") or "").strip(),
             "route": (request.form.get("route") or "").strip(),
             "created_by": user["id"],
-            "organization_id": ORG_ID,
+            "organization_id": session.get("org_id"),
             "created_at": datetime.utcnow(),
         }
         flash("Cliente creado.", "success")
@@ -1143,6 +1325,7 @@ def client_detail(client_id):
         flash("No encontrado.", "danger")
         return redirect(url_for("clients"))
     user = current_user()
+    can_admin = user.get("role") == "admin" or is_cartera_admin(user)
     if user["role"] == "cobrador" and c.get("created_by") != user["id"] and not is_cartera_admin(user):
         flash("Sin acceso.", "danger")
         return redirect(url_for("clients"))
@@ -1182,11 +1365,16 @@ def client_detail(client_id):
             f"</form>"
         )
 
-        actions = (
-            f"<a class='btn btn-secondary' style='padding:6px 10px' href='{url_for('loan_detail', loan_id=L['id'])}'>Ver</a> "
-            f"<a class='btn btn-primary' style='padding:6px 10px' href='{url_for('edit_loan', loan_id=L['id'])}'>Editar</a> "
-            f"{del_form}"
-        )
+        if can_admin:
+            actions = (
+                f"<a class='btn btn-secondary' style='padding:6px 10px' href='{url_for('loan_detail', loan_id=L['id'])}'>Ver</a> "
+                f"<a class='btn btn-primary' style='padding:6px 10px' href='{url_for('edit_loan', loan_id=L['id'])}'>Editar</a> "
+                f"{del_form}"
+            )
+        else:
+            actions = (
+                f"<a class='btn btn-secondary' style='padding:6px 10px' href='{url_for('loan_detail', loan_id=L['id'])}'>Ver</a>"
+            )
 
         loan_rows.append(
             "<tr>"
@@ -1585,8 +1773,47 @@ def new_loan():
 @app.route("/loans/<int:loan_id>/delete", methods=["POST"])
 @login_required
 def delete_loan(loan_id):
-    store.loans.pop(loan_id, None)
-    flash("Préstamo eliminado.", "success")
+    ensure_org()
+    oid = session.get("org_id")
+    user = current_user()
+    L = store.loans.get(loan_id)
+    if not L or L.get("organization_id") != oid:
+        flash("Préstamo no encontrado.", "danger")
+        return redirect(url_for("loans"))
+    if user.get("role") != "admin" and not is_cartera_admin(user):
+        flash("Solo admin puede borrar préstamos.", "danger")
+        return redirect(url_for("loans"))
+
+    try:
+        # 1) Revertir pagos asociados (no podemos borrar cash_reports porque no guardamos sus IDs en el payment).
+        payments = [p for p in store.payments.values() if p.get("loan_id") == loan_id]
+        for p in payments:
+            amt = float(p.get("amount") or 0)
+            if abs(amt) < 1e-9:
+                continue
+            apply_cash_movement(
+                movement_type="reverso_pago_prestamo",
+                amount=-amt,
+                note=f"Reverso por eliminación préstamo #{loan_id} (pago #{p.get('id')})",
+                user_id=user["id"],
+                org_id=oid,
+            )
+            store.payments.pop(p.get("id"), None)
+
+        # 2) Revertir movimientos iniciales del préstamo (aquí sí tenemos los IDs en el loan).
+        disc_id = L.get("discount_cash_report_id")
+        if disc_id is not None:
+            store.cash_reports.pop(disc_id, None)
+        disb_id = L.get("disbursement_cash_report_id")
+        if disb_id is not None:
+            store.cash_reports.pop(disb_id, None)
+
+        store.loans.pop(loan_id, None)
+    except ValueError as e:
+        flash(str(e), "danger")
+        return redirect(url_for("loan_detail", loan_id=loan_id))
+
+    flash("Préstamo eliminado y movimientos del banco revertidos.", "success")
     return redirect(url_for("loans"))
 
 
@@ -1597,6 +1824,10 @@ def edit_loan(loan_id):
     if not L:
         flash("No encontrado.", "danger")
         return redirect(url_for("loans"))
+    user = current_user()
+    if user.get("role") != "admin" and not is_cartera_admin(user):
+        flash("Solo admin puede editar préstamos.", "danger")
+        return redirect(url_for("loan_detail", loan_id=loan_id))
     if request.method == "POST":
         L["rate"] = request.form.get("rate", type=float) or L.get("rate")
         L["remaining"] = request.form.get("remaining", type=float)
@@ -1621,6 +1852,13 @@ def loan_detail(loan_id):
     client_id = L.get("client_id")
     client = store.clients.get(client_id, {})
     pays = [p for p in store.payments.values() if p.get("loan_id") == loan_id]
+    u = current_user()
+    can_admin = u.get("role") == "admin" or is_cartera_admin(u)
+    edit_btn = (
+        f'<a class="btn btn-secondary" href="{url_for("edit_loan", loan_id=loan_id)}">✏️ Editar</a>'
+        if can_admin
+        else ""
+    )
 
     # =========================
     # Métricas/Resumen
@@ -1777,7 +2015,7 @@ def loan_detail(loan_id):
   <div class="loan-actions">
     <a class="btn btn-secondary" href="{wa_link}" target="_blank" rel="noopener">📲 Recordar por WhatsApp</a>
     <a class="btn btn-primary" href="{url_for('new_payment', loan_id=loan_id)}">➕ Registrar pago</a>
-    <a class="btn btn-secondary" href="{url_for('edit_loan', loan_id=loan_id)}">✏️ Editar</a>
+    {edit_btn}
   </div>
 
   <div class="loan-section">
@@ -2049,9 +2287,60 @@ body{{background:#fff}}
 @app.route("/payment/delete/<int:payment_id>", methods=["POST"])
 @login_required
 def delete_payment(payment_id):
+    ensure_org()
+    oid = session.get("org_id")
+    user = current_user()
+    p = store.payments.get(payment_id)
+    if not p:
+        flash("Pago no encontrado.", "danger")
+        return redirect(url_for("loans"))
+    loan_id = p.get("loan_id")
+    L = store.loans.get(loan_id) if loan_id is not None else None
+    if not L or L.get("organization_id") != oid:
+        flash("Préstamo no encontrado.", "danger")
+        return redirect(url_for("loans"))
+    if user.get("role") != "admin" and not is_cartera_admin(user):
+        flash("Solo admin puede eliminar pagos.", "danger")
+        return redirect(url_for("loan_detail", loan_id=loan_id))
+
+    typ_l = str(p.get("type") or "").strip().lower()
+    weeks = int(p.get("weeks_advanced") or 0)
+    if typ_l == "adelanto" and weeks < 1:
+        weeks = 1
+
+    amt = float(p.get("amount") or 0)
+    try:
+        apply_cash_movement(
+            movement_type="reverso_pago_prestamo",
+            amount=-amt,
+            note=f"Reverso pago #{payment_id} préstamo #{loan_id}",
+            user_id=user["id"],
+            org_id=oid,
+        )
+    except ValueError as e:
+        flash(str(e), "danger")
+        return redirect(url_for("loan_detail", loan_id=loan_id))
+
+    # Ajustar préstamo (saldo y fechas) para que no quede inconsistente.
+    L["remaining"] = float(L.get("remaining") or 0) + amt
+    if "remaining_capital" in L:
+        L["remaining_capital"] = float(L.get("remaining_capital") or 0) + amt
+    if float(L.get("remaining") or 0) > 0:
+        L["status"] = "ACTIVO"
+    else:
+        L["status"] = "cerrado"
+
+    interval_days = freq_interval_days(L.get("frequency"))
+    current_due = L.get("next_payment_date")
+    if hasattr(current_due, "strftime"):
+        if typ_l == "cuota":
+            L["next_payment_date"] = current_due - timedelta(days=interval_days)
+        elif typ_l == "adelanto" and weeks > 0:
+            L["next_payment_date"] = current_due - timedelta(days=interval_days * weeks)
+
     store.payments.pop(payment_id, None)
-    flash("Pago eliminado.", "info")
-    return redirect(url_for("loans"))
+    flash("Pago eliminado y banco revertido.", "success")
+    return redirect(url_for("loan_detail", loan_id=loan_id))
 
 
 @app.route("/payment/undo/<int:loan_id>", methods=["POST"])
@@ -2142,11 +2431,246 @@ def admin_clear_all():
 @login_required
 @role_required("admin", "supervisor")
 def audit():
+    ensure_org()
+    oid = session.get("org_id")
     rows = "".join(
         f"<tr><td>{a.get('created_at')}</td><td>{a.get('action')}</td><td>{a.get('detail')}</td></tr>"
         for a in store.audit_log[-200:]
+        if store.users.get(a.get("user_id"), {}).get("organization_id") == oid
     )
     return page(f'<div class="card"><h2>Auditoría</h2><div class="table-scroll"><table><tr><th>Fecha</th><th>Acción</th><th>Detalle</th></tr>{rows}</table></div></div>')
+
+
+@app.route("/super-admin", methods=["GET", "POST"])
+@login_required
+@super_admin_required
+def super_admin_panel():
+    ensure_org()  # no-op para super_admin (solo para no romper otras dependencias)
+    now = datetime.utcnow()
+
+    def fmt_sub_end(x):
+        if not x:
+            return "—"
+        try:
+            return x.strftime("%d/%m/%Y")
+        except Exception:
+            return str(x)
+
+    if request.method == "POST":
+        act = (request.form.get("action") or "").strip()
+        target_id = request.form.get("target_id", type=int)
+        tenant_id = request.form.get("tenant_id", type=int)
+
+        u = store.users.get(target_id) if target_id else None
+        if not u:
+            flash("Usuario no encontrado.", "danger")
+            return redirect(url_for("super_admin_panel"))
+
+        if act == "approve_admin":
+            if u.get("role") != "admin":
+                flash("Solo se aprueban admins.", "danger")
+                return redirect(url_for("super_admin_panel"))
+            u["account_status"] = ACCOUNT_ACTIVE
+            flash("Admin aprobado y activado.", "success")
+            return redirect(url_for("super_admin_panel"))
+
+        if act == "toggle_admin":
+            if u.get("role") != "admin":
+                flash("Solo se pueden activar/desactivar admins.", "danger")
+                return redirect(url_for("super_admin_panel"))
+            new_status = request.form.get("new_status", type=str)
+            if new_status not in (ACCOUNT_ACTIVE, ACCOUNT_SUSPENDED):
+                flash("Estado inválido.", "danger")
+                return redirect(url_for("super_admin_panel"))
+            u["account_status"] = new_status
+            flash("Estado de admin actualizado.", "success")
+            return redirect(url_for("super_admin_panel"))
+
+        if act == "approve_cobrador":
+            if u.get("role") != "cobrador":
+                flash("Solo se aprueban cobradores.", "danger")
+                return redirect(url_for("super_admin_panel"))
+            # Si el cobrador no pertenece a un tenant/admin, no se aprueba.
+            tid = u.get("organization_id")
+            if tid is None:
+                flash("Cobrador sin tenant asociado.", "danger")
+                return redirect(url_for("super_admin_panel"))
+            u["account_status"] = ACCOUNT_ACTIVE
+            flash("Cobrador aprobado.", "success")
+            return redirect(url_for("super_admin_panel"))
+
+        flash("Acción inválida.", "danger")
+        return redirect(url_for("super_admin_panel"))
+
+    admins = [u for u in store.users.values() if u.get("role") == "admin"]
+    admins.sort(key=lambda x: x.get("created_at") or datetime.min, reverse=True)
+
+    total_admins = len(admins)
+    pending_admins = sum(1 for u in admins if u.get("account_status") == ACCOUNT_PENDING)
+    suspended_admins = sum(1 for u in admins if u.get("account_status") == ACCOUNT_SUSPENDED)
+    pending_cobradores = sum(
+        1 for u in store.users.values()
+        if u.get("role") == "cobrador" and u.get("account_status") == ACCOUNT_PENDING
+    )
+
+    # Estadísticas globales (básicas).
+    total_loans = len(store.loans)
+    total_clients = len(store.clients)
+    total_payments_ok = sum(1 for p in store.payments.values() if (p.get("status") or "OK") != "ANULADO")
+    global_bank = 0.0
+    for a in admins:
+        org_id = a.get("organization_id")
+        if org_id is not None:
+            global_bank += float(get_bank_available(org_id) or 0)
+    global_bank = round(global_bank, 2)
+
+    admin_rows = ""
+    for a in admins:
+        aid = a.get("id")
+        status = a.get("account_status", ACCOUNT_ACTIVE)
+        sub_end = a.get("subscription_end")
+        expired = bool(sub_end and now > sub_end)
+        pending_c = sum(
+            1 for u in store.users.values()
+            if u.get("role") == "cobrador" and u.get("organization_id") == aid and u.get("account_status") == ACCOUNT_PENDING
+        )
+        users_total = sum(1 for u in store.users.values() if u.get("organization_id") == aid)
+        clients_total = sum(1 for c in store.clients.values() if c.get("organization_id") == aid)
+        loans_total = sum(1 for L in store.loans.values() if L.get("organization_id") == aid)
+
+        actions = ""
+        if status == ACCOUNT_PENDING:
+            actions += (
+                f"<form method='post' action='{url_for('super_admin_panel')}' style='display:inline'>"
+                f"<input type='hidden' name='action' value='approve_admin'>"
+                f"<input type='hidden' name='target_id' value='{aid}'>"
+                f"<button class='btn btn-primary' type='submit'>Aprobar admin</button>"
+                f"</form> "
+            )
+
+        if status == ACCOUNT_ACTIVE:
+            actions += (
+                f"<form method='post' action='{url_for('super_admin_panel')}' style='display:inline'>"
+                f"<input type='hidden' name='action' value='toggle_admin'>"
+                f"<input type='hidden' name='target_id' value='{aid}'>"
+                f"<input type='hidden' name='new_status' value='{ACCOUNT_SUSPENDED}'>"
+                f"<button class='btn btn-secondary' type='submit'>Suspender</button>"
+                f"</form> "
+            )
+        else:
+            actions += (
+                f"<form method='post' action='{url_for('super_admin_panel')}' style='display:inline'>"
+                f"<input type='hidden' name='action' value='toggle_admin'>"
+                f"<input type='hidden' name='target_id' value='{aid}'>"
+                f"<input type='hidden' name='new_status' value='{ACCOUNT_ACTIVE}'>"
+                f"<button class='btn btn-primary' type='submit'>Activar</button>"
+                f"</form> "
+            )
+
+        admin_rows += (
+            "<tr>"
+            f"<td>{html.escape(str(a.get('username')))}</td>"
+            f"<td>{status}{' (vencido)' if expired else ''}</td>"
+            f"<td>{fmt_sub_end(sub_end)}</td>"
+            f"<td style='text-align:right'>{users_total}</td>"
+            f"<td style='text-align:right'>{clients_total}</td>"
+            f"<td style='text-align:right'>{loans_total}</td>"
+            f"<td style='text-align:right'>{pending_c}</td>"
+            f"<td>{actions}</td>"
+            "</tr>"
+        )
+
+    pending_cob_rows = ""
+    pending_cob = [u for u in store.users.values() if u.get("role") == "cobrador" and u.get("account_status") == ACCOUNT_PENDING]
+    pending_cob.sort(key=lambda u: u.get("created_at") or datetime.min, reverse=True)
+    for u in pending_cob[:120]:
+        tid = u.get("organization_id")
+        tname = store.users.get(tid, {}).get("username") or f"Admin #{tid}"
+        pending_cob_rows += (
+            "<tr>"
+            f"<td>{html.escape(u.get('username') or '—')}</td>"
+            f"<td>{html.escape(tname)}</td>"
+            f"<td>{u.get('phone') or '—'}</td>"
+            f"<td>{u.get('created_at')}</td>"
+            f"<td>"
+            f"<form method='post' action='{url_for('super_admin_panel')}' style='display:inline'>"
+            f"<input type='hidden' name='action' value='approve_cobrador'>"
+            f"<input type='hidden' name='target_id' value='{u.get('id')}'>"
+            f"<button class='btn btn-primary' type='submit'>Aprobar</button>"
+            f"</form>"
+            "</td>"
+            "</tr>"
+        )
+
+    # Lista global de usuarios por tenant (para que el super admin vea todo).
+    users_rows = ""
+    tenant_ids = {a.get("id") for a in admins}
+    all_users = [u for u in store.users.values() if u.get("role") != "super_admin" and u.get("organization_id") in tenant_ids]
+    all_users.sort(key=lambda u: u.get("created_at") or datetime.min, reverse=True)
+    for u in all_users[:220]:
+        tid = u.get("organization_id")
+        tname = store.users.get(tid, {}).get("username") or f"Admin #{tid}"
+        users_rows += (
+            "<tr>"
+            f"<td>{html.escape(tname)}</td>"
+            f"<td>{html.escape(u.get('username') or '—')}</td>"
+            f"<td>{html.escape(u.get('role') or '—')}</td>"
+            f"<td>{u.get('account_status', ACCOUNT_ACTIVE)}</td>"
+            f"<td>{u.get('phone') or '—'}</td>"
+            f"<td>{u.get('created_at')}</td>"
+            "</tr>"
+        )
+
+    body = f"""
+<div class="card" style="padding:16px;background:#ecfdf5;border:1px solid rgba(22,163,74,.2);">
+  <h2 style="margin:0 0 10px 0;color:#14532d;">🛡️ Panel Super Admin</h2>
+  <p style="margin:0 0 14px 0;opacity:.9;">
+    Total admins: <b>{total_admins}</b> · pendientes: <b>{pending_admins}</b> · suspendidos: <b>{suspended_admins}</b> · cobradores pendientes: <b>{pending_cobradores}</b>
+  </p>
+
+  <div class="table-scroll">
+    <table>
+      <tr>
+        <th>Admin</th><th>Estado</th><th>Expira</th><th>Usuarios</th><th>Clientes</th><th>Préstamos</th><th>Cobradores pendientes</th><th>Acciones</th>
+      </tr>
+      {admin_rows or "<tr><td colspan='8' style='text-align:center;opacity:.85'>Sin admins</td></tr>"}
+    </table>
+  </div>
+
+  <div style="margin-top:18px;">
+    <h3 style="margin:0 0 10px 0;color:#14532d;">Lista de usuarios por admin (vista global)</h3>
+    <div class="table-scroll">
+      <table>
+        <tr><th>Tenant (admin)</th><th>Usuario</th><th>Rol</th><th>Estado</th><th>Tel</th><th>Fecha reg.</th></tr>
+        {users_rows or "<tr><td colspan='6' style='text-align:center;opacity:.85'>Sin usuarios</td></tr>"}
+      </table>
+    </div>
+  </div>
+
+  <div style="margin-top:18px;">
+    <h3 style="margin:0 0 10px 0;color:#14532d;">Aprobar cobradores pendientes</h3>
+    <div class="table-scroll">
+      <table>
+        <tr><th>Cobrador</th><th>Admin tenant</th><th>Tel</th><th>Fecha reg.</th><th></th></tr>
+        {pending_cob_rows or "<tr><td colspan='5' style='text-align:center;opacity:.85'>No hay cobradores pendientes</td></tr>"}
+      </table>
+    </div>
+  </div>
+
+  <div style="margin-top:18px;opacity:.95;">
+    <h3 style="margin:0 0 10px 0;color:#14532d;">Estadísticas globales</h3>
+    <ul style="margin:0;padding-left:18px;">
+      <li>Total clientes: <b>{total_clients}</b></li>
+      <li>Total préstamos: <b>{total_loans}</b></li>
+      <li>Total pagos (no anulados): <b>{total_payments_ok}</b></li>
+      <li>Suma banco (por tenant): <b>{fmt_money(global_bank)}</b></li>
+    </ul>
+  </div>
+
+  {nav_subfooter()}
+</div>
+"""
+    return page(body, user=user)
 
 
 @app.route("/reportes", methods=["GET", "POST"])
@@ -2229,9 +2753,100 @@ def gps_update():
 @app.route("/bank/collector-map")
 @login_required
 def collector_map():
-    pos = store.gps_positions.get(session.get("user_id"))
-    extra = f"<p>Última posición: {pos}</p>" if pos else "<p>Sin posición (active GPS en el navegador).</p>"
-    return page('<div class="card"><h2>Mapa cobrador</h2>' + extra + "</div>")
+    ensure_org()
+    oid = session.get("org_id")
+    user = current_user()
+
+    def fmt_ts(ts):
+        if not ts:
+            return "—"
+        try:
+            return ts.strftime("%d/%m/%Y %I:%M %p")
+        except Exception:
+            return str(ts)
+
+    # La geolocalización se registra para el usuario logueado (cada cobrador debe abrir esta pantalla).
+    me_pos = store.gps_positions.get(user.get("id"))
+
+    is_admin = user.get("role") == "admin" or is_cartera_admin(user)
+    if is_admin:
+        collectors = [
+            u
+            for u in store.users.values()
+            if u.get("organization_id") == oid and u.get("role") == "cobrador"
+        ]
+        collectors.sort(key=lambda u: str(u.get("name") or u.get("username") or "").lower())
+        rows = ""
+        for c in collectors:
+            p = store.gps_positions.get(c.get("id"))
+            lat = p.get("lat") if p else None
+            lng = p.get("lng") if p else None
+            rows += (
+                "<tr>"
+                f"<td>{html.escape(str(c.get('name') or c.get('username') or '—'))}</td>"
+                f"<td>{html.escape(str(lat) if lat else '—')}</td>"
+                f"<td>{html.escape(str(lng) if lng else '—')}</td>"
+                f"<td>{fmt_ts(p.get('ts')) if p else '—'}</td>"
+                "</tr>"
+            )
+        table = (
+            "<div class='table-scroll'>"
+            "<table><tr><th>Cobrador</th><th>Lat</th><th>Lng</th><th>Actualizado</th></tr>"
+            f"{rows or '<tr><td colspan=4 style=\"text-align:center;opacity:.85\">No hay cobradores con posiciones aún</td></tr>'}"
+            "</table></div>"
+        )
+        extra = (
+            "<p style='margin:0 0 10px 0;opacity:.9;font-size:14px'>"
+            "Para ver ubicaciones, cada cobrador debe abrir esta pantalla con su GPS activo."
+            "</p>"
+            f"{table}"
+        )
+    else:
+        extra = f"<p>{('Última posición registrada: ' + str(me_pos.get('ts')) ) if me_pos else 'Sin posición (activa GPS en el navegador).'} </p>" \
+            f"<p style='margin-top:6px;opacity:.9;font-size:14px'>Abre el mapa para registrar tu ubicación automáticamente.</p>"
+
+    js = """
+    <script>
+      async function sendPos(pos){
+        if(!pos || !pos.coords) return;
+        const lat = pos.coords.latitude;
+        const lng = pos.coords.longitude;
+        const body = new URLSearchParams();
+        body.append('lat', lat);
+        body.append('lng', lng);
+        try{
+          await fetch('/gps/update', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+            body: body.toString()
+          });
+        }catch(e){}
+      }
+
+      function startGps(){
+        if(!navigator.geolocation) return;
+        function tick(){
+          navigator.geolocation.getCurrentPosition(
+            (p)=>sendPos(p),
+            ()=>{},
+            {enableHighAccuracy:true, maximumAge:15000, timeout:8000}
+          );
+        }
+        tick();
+        setInterval(tick, 60000);
+      }
+      window.addEventListener('load', startGps);
+    </script>
+    """
+
+    body = (
+        "<div class='card'>"
+        "<h2>Mapa cobrador</h2>"
+        f"{extra}"
+        f"{js}"
+        "</div>"
+    )
+    return page(body)
 
 
 @app.route("/advance/delete/<int:payment_id>", methods=["POST"])
@@ -2251,6 +2866,9 @@ def delete_advance(payment_id):
         return redirect(url_for("bank_advance"))
     if L and loan_id not in loan_ids_visible(oid, user):
         flash("Sin acceso.", "danger")
+        return redirect(url_for("bank_advance"))
+    if user.get("role") != "admin" and not is_cartera_admin(user):
+        flash("Solo admin puede eliminar adelantos.", "danger")
         return redirect(url_for("bank_advance"))
 
     is_adv = str(p.get("type") or "").strip().lower() == "adelanto" or int(p.get("weeks_advanced") or 0) > 0
@@ -2731,6 +3349,7 @@ def bank_advance():
     ensure_org()
     oid = session.get("org_id")
     user = current_user()
+    can_del = user.get("role") == "admin" or is_cartera_admin(user)
 
     def payment_ts(p):
         ts = p.get("created_at")
@@ -2765,6 +3384,8 @@ def bank_advance():
             f'<form method="post" action="{url_for("delete_advance", payment_id=p["id"])}" style="display:inline; margin:0" '
             f'onsubmit="return confirm(\'¿Eliminar este adelanto?\');">'
             f'<button type="submit" class="btn-adv-del">🗑 Eliminar</button></form>'
+            if can_del
+            else "<span style='opacity:.55'>—</span>"
         )
         rows.append(
             "<tr>"
@@ -3545,7 +4166,7 @@ def bank_acta():
     # - Gastos realizados: movimientos "gasto_ruta"
     # - Disponible: saldo real del banco (starting_bank + todos los cash_reports)
     # ============================================================
-    caja_global = float(getattr(store, "starting_bank", 0.0) or 0.0) + sum(
+    caja_global = float(getattr(store, "starting_banks", {}).get(oid, 0.0) or 0.0) + sum(
         float(cr.get("amount") or 0)
         for cr in store.cash_reports.values()
         if cr.get("organization_id") == oid and cr.get("movement_type") == "deposito_banco"
@@ -4117,6 +4738,7 @@ def cerrar_semana():
     k = compute_financial_kpis(org_id, user)
     rec = {
         "id": store.nid("cierre"),
+        "organization_id": org_id,
         "closed_at": datetime.utcnow(),
         "user_id": user["id"],
         "notas": (request.form.get("notas") or "").strip(),
@@ -4136,8 +4758,10 @@ def cerrar_semana():
 @app.route("/bank/historial-cierres")
 @login_required
 def historial_cierres():
+    ensure_org()
+    oid = session.get("org_id")
     rows = ""
-    for rec in reversed(store.closure_history[-50:]):
+    for rec in reversed([r for r in store.closure_history if r.get("organization_id") == oid][-50:]):
         cid = rec.get("id")
         del_form = (
             f'<form method="post" action="{url_for("borrar_cierre", cierre_id=cid)}" style="display:inline" '
@@ -4166,7 +4790,13 @@ def pagar_prestamo(loan_id):
 @app.route("/bank/borrar-cierre/<int:cierre_id>", methods=["POST"])
 @login_required
 def borrar_cierre(cierre_id):
-    store.closure_history = [c for c in store.closure_history if c.get("id") != cierre_id]
+    ensure_org()
+    oid = session.get("org_id")
+    store.closure_history = [
+        c
+        for c in store.closure_history
+        if not (c.get("id") == cierre_id and c.get("organization_id") == oid)
+    ]
     flash("Cierre eliminado (memoria).", "info")
     return redirect(url_for("historial_cierres"))
 
@@ -4196,7 +4826,7 @@ def agregar_dinero_banco():
             return redirect(url_for("agregar_dinero_banco"))
 
         store.deposit_history.append(
-            {"id": rid, "amount": amt, "note": note, "at": datetime.utcnow()}
+            {"id": rid, "organization_id": org_id, "amount": amt, "note": note, "at": datetime.utcnow()}
         )
         flash(f"Ingresado {fmt_money(amt)} al flujo de caja (memoria).", "success")
         return redirect(url_for("historial_depositos"))
@@ -4213,9 +4843,11 @@ def agregar_dinero_banco():
 @app.route("/bank/historial-depositos")
 @login_required
 def historial_depositos():
+    ensure_org()
+    oid = session.get("org_id")
     rows = "".join(
         f"<tr><td>{d.get('at')}</td><td>{fmt_money(d.get('amount'))}</td><td>{d.get('note') or '—'}</td></tr>"
-        for d in reversed(store.deposit_history[-100:])
+        for d in reversed([d for d in store.deposit_history if d.get("organization_id") == oid][-100:])
     )
     body = (
         f'<div class="card"><h2>Historial de depósitos</h2>'
