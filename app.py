@@ -3957,10 +3957,10 @@ def view_legal_document(loan_id):
   if (signForm) {
     signForm.addEventListener('submit', ()=>{document.getElementById('signature_b64').value = canvas.toDataURL('image/png');});
   }
-  function legalScrollFirma() {{
+  function legalScrollFirma() {
     const c = document.getElementById('sigCanvas');
-    if (c) c.scrollIntoView({{behavior:'smooth', block:'center'}});
-  }}
+    if (c) c.scrollIntoView({behavior:'smooth', block:'center'});
+  }
 </script>
 """
 
