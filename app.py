@@ -99,6 +99,52 @@ def freq_interval_days(freq):
     return 7
 
 
+def loan_frequency_label(freq):
+    """Etiqueta para listados (ej. Quincenal, Semanal)."""
+    s = str(freq or "").strip().lower()
+    if "quinc" in s:
+        return "Quincenal"
+    if "seman" in s:
+        return "Semanal"
+    if "diar" in s:
+        return "Diario"
+    if "mens" in s:
+        return "Mensual"
+    if not s:
+        return "—"
+    return str(freq).title()
+
+
+def proximo_sabado_cobro(d=None):
+    """Sábado objetivo de la ruta: hoy si ya es sábado; si no, el próximo sábado."""
+    today = d or date.today()
+    ahead = (5 - today.weekday()) % 7
+    return today if ahead == 0 else today + timedelta(days=ahead)
+
+
+def loans_cobro_sabado_semanal(org_id, user, ref_date=None):
+    """
+    Préstamos semanales activos cuya próxima cuota vence a más tardar el sábado de cobro.
+    Misma criterio que la lista de cobro de sábados.
+    """
+    today = ref_date or date.today()
+    prox_sab = proximo_sabado_cobro(today)
+    rows = []
+    for L in loans_for_user(org_id, user):
+        if str(L.get("status", "")).upper() != "ACTIVO":
+            continue
+        if "semanal" not in str(L.get("frequency") or "").lower():
+            continue
+        npd = L.get("next_payment_date")
+        if npd and npd <= prox_sab:
+            cid = L.get("client_id")
+            c = store.clients.get(cid, {})
+            nm = f"{c.get('first_name','')} {c.get('last_name') or ''}".strip() or f"Cliente #{cid}"
+            rows.append((npd, L, nm))
+    rows.sort(key=lambda x: x[0] or date.max)
+    return prox_sab, rows
+
+
 # Tipos de gasto de ruta (iconos + etiqueta para UI).
 ROUTE_EXPENSE_KINDS = {
     "gasolina": ("Gasolina", "⛽"),
@@ -422,10 +468,11 @@ def get_bank_available(org_id=None):
     return round(total, 2)
 
 
-def apply_cash_movement(movement_type, amount, note, user_id=None, org_id=None):
+def apply_cash_movement(movement_type, amount, note, user_id=None, org_id=None, collector_id=None):
     """
     Aplica un movimiento al banco (memoria) y valida que nunca quede negativo.
     movement_type: string informativo (deposito_banco, prestamo_entregado, descuento_inicial, pago_prestamo, gasto_ruta, etc.)
+    collector_id: opcional (p. ej. entrega de efectivo al cobrador antes de la ruta).
     """
     oid = bank_org_id(org_id)
     amt = float(amount or 0)
@@ -440,7 +487,7 @@ def apply_cash_movement(movement_type, amount, note, user_id=None, org_id=None):
         projected = 0.0
 
     rid = store.nid("cash")
-    store.cash_reports[rid] = {
+    rec = {
         "id": rid,
         "user_id": user_id,
         "date": date.today(),
@@ -450,6 +497,9 @@ def apply_cash_movement(movement_type, amount, note, user_id=None, org_id=None):
         "organization_id": oid,
         "movement_type": movement_type,
     }
+    if collector_id is not None:
+        rec["collector_id"] = int(collector_id)
+    store.cash_reports[rid] = rec
     return rid
 
 
@@ -1201,16 +1251,221 @@ def loans():
     ensure_org()
     user = current_user()
     org_id = session.get("org_id")
-    rows = loans_for_user(org_id, user)
-    t = "".join(
-        f"<tr><td>#{L['id']}</td><td>{L.get('status')}</td><td>{fmt_money(L.get('remaining'))}</td>"
-        f"<td><a class='btn btn-secondary' href='{url_for('loan_detail', loan_id=L['id'])}'>Ver</a></td></tr>"
-        for L in sorted(rows, key=lambda x: -x["id"])
+    rows_all = loans_for_user(org_id, user)
+    show_filter = user.get("role") in ("admin", "supervisor") or is_cartera_admin(user)
+    filter_id = request.args.get("prestamista", type=int)
+
+    if show_filter and filter_id:
+        rows = [L for L in rows_all if L.get("created_by") == filter_id]
+    else:
+        rows = list(rows_all)
+
+    by_coll = {}
+    for L in rows_all:
+        uid = L.get("created_by")
+        by_coll.setdefault(uid, []).append(L)
+
+    def prestamista_name(uid):
+        if uid is None:
+            return "—"
+        u = store.users.get(uid, {})
+        return u.get("name") or u.get("username") or f"#{uid}"
+
+    sum_rows = []
+    for uid in sorted(by_coll.keys(), key=lambda i: str(prestamista_name(i)).lower()):
+        lg = by_coll[uid]
+        n = len(lg)
+        pagados = sum(
+            1 for x in lg if str(x.get("status", "")).upper() == "CERRADO" or float(x.get("remaining") or 0) <= 0
+        )
+        total_prest = sum(float(x.get("amount") or 0) for x in lg)
+        cap_activo = sum(float(x.get("remaining") or 0) for x in lg if str(x.get("status", "")).upper() == "ACTIVO")
+        nm = html.escape(str(prestamista_name(uid)))
+        sum_rows.append(
+            "<tr>"
+            f"<td>{nm}</td><td>{n}</td><td>{pagados}</td>"
+            f"<td>{html.escape(fmt_money(total_prest))}</td>"
+            f"<td>{html.escape(fmt_money(cap_activo))}</td>"
+            "</tr>"
+        )
+    sum_body = "".join(sum_rows) if sum_rows else "<tr><td colspan='5' style='text-align:center;opacity:.85'>Sin préstamos</td></tr>"
+
+    ids_loans = {L.get("created_by") for L in rows_all if L.get("created_by")}
+    collector_map = {}
+    for u in store.users.values():
+        if u.get("organization_id") != org_id:
+            continue
+        if u.get("role") == "cobrador" or u["id"] in ids_loans:
+            collector_map[u["id"]] = u
+    collector_options = sorted(
+        collector_map.values(), key=lambda u: str(u.get("name") or u.get("username") or "").lower()
     )
-    body = (
-        f'<div class="card"><h2>Préstamos</h2><div class="table-scroll"><table><tr><th>ID</th><th>Estado</th><th>Saldo</th><th></th></tr>{t}</table></div>'
-        f'<a class="btn btn-primary" href="{url_for("new_loan")}">Nuevo préstamo</a></div>'
-    )
+    opt_parts = ['<option value="">-- TODOS --</option>']
+    for u in collector_options:
+        sel = " selected" if filter_id == u["id"] else ""
+        lab = html.escape(str(u.get("name") or u.get("username") or ""))
+        opt_parts.append(f'<option value="{u["id"]}"{sel}>{lab}</option>')
+    opts_html = "".join(opt_parts)
+
+    filter_block = ""
+    if show_filter:
+        filter_block = (
+            f'<form class="loans-filter-form" method="get" action="{url_for("loans")}">'
+            f'<span class="loans-filter-lbl">👤 Ver préstamos por prestamista</span>'
+            f'<select name="prestamista" class="loans-filter-select" onchange="this.form.submit()">{opts_html}</select>'
+            f"</form>"
+        )
+
+    cards = []
+    for L in sorted(rows, key=lambda x: -x["id"]):
+        cid = L.get("client_id")
+        cl = store.clients.get(cid, {})
+        nm_raw = f"{cl.get('first_name','')} {cl.get('last_name') or ''}".strip() or f"Cliente #{cid}"
+        nm = html.escape(nm_raw)
+        freq = loan_frequency_label(L.get("frequency"))
+        st = str(L.get("status") or "").upper()
+        if st == "CERRADO" or float(L.get("remaining") or 0) <= 0:
+            badge = '<span class="loan-card-badge loan-card-badge-done">Cerrado</span>'
+        else:
+            badge = '<span class="loan-card-badge">Activo</span>'
+        sub = html.escape(f"Préstamo #{L['id']} - {freq}")
+        amt = html.escape(fmt_money(L.get("remaining")))
+        href = url_for("loan_detail", loan_id=L["id"])
+        cards.append(
+            f'<a class="loan-card-link" href="{href}">'
+            f'<div class="loan-card">'
+            f'<div class="loan-card-ic" aria-hidden="true">💵</div>'
+            f'<div class="loan-card-mid">'
+            f'<div class="loan-card-name">{nm}</div>'
+            f'<div class="loan-card-sub">{sub}</div>'
+            f"{badge}"
+            f"</div>"
+            f'<div class="loan-card-amt">{amt}</div>'
+            f"</div></a>"
+        )
+    cards_html = "".join(cards) if cards else '<p class="loans-empty">No hay préstamos en esta vista.</p>'
+
+    body = f"""
+<style>
+.loans-page-wrap {{ max-width: 720px; margin: 0 auto; }}
+.loans-page-title {{
+  text-align: center;
+  font-size: 1.35rem;
+  font-weight: 900;
+  color: #14532d;
+  margin: 8px 0 16px;
+}}
+.loans-toolbar {{
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  margin-bottom: 18px;
+}}
+.btn-loan-new {{
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  align-self: flex-start;
+  padding: 12px 20px;
+  border-radius: 999px;
+  font-weight: 900;
+  font-size: 15px;
+  text-decoration: none !important;
+  color: #fff !important;
+  background: linear-gradient(135deg,#15803d,#22c55e);
+  box-shadow: 0 8px 22px rgba(22,163,74,.35);
+}}
+.btn-loan-new:hover {{ filter: brightness(1.05); }}
+.loans-filter-form {{
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  font-size: 14px;
+  color: #166534;
+  font-weight: 600;
+}}
+.loans-filter-select {{
+  padding: 8px 12px;
+  border-radius: 12px;
+  border: 1px solid rgba(22,101,52,.25);
+  background: #fff;
+  font-weight: 600;
+  min-width: 200px;
+}}
+.loans-summary {{
+  background: rgba(255,255,255,.92);
+  border-radius: 18px;
+  padding: 16px;
+  margin-bottom: 20px;
+  border: 1px solid rgba(22,163,74,.15);
+  box-shadow: 0 6px 20px rgba(0,0,0,.06);
+}}
+.loans-summary h3 {{
+  margin: 0 0 12px 0;
+  font-size: 1.05rem;
+  font-weight: 900;
+  color: #14532d;
+}}
+.loans-summary table {{ width: 100%; font-size: 13px; }}
+.loans-summary th {{
+  text-align: left;
+  padding: 8px 6px;
+  color: #14532d;
+  border-bottom: 2px solid rgba(22,163,74,.2);
+}}
+.loans-summary td {{ padding: 8px 6px; border-bottom: 1px solid rgba(148,163,184,.25); }}
+.loan-card-link {{ text-decoration: none !important; color: inherit; display: block; }}
+.loan-card {{
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  background: #fff;
+  border-radius: 18px;
+  padding: 16px 18px;
+  margin-bottom: 12px;
+  box-shadow: 0 8px 24px rgba(0,0,0,.07);
+  border: 1px solid rgba(22,163,74,.12);
+  transition: transform .12s ease, box-shadow .12s ease;
+}}
+.loan-card:hover {{ transform: translateY(-2px); box-shadow: 0 12px 28px rgba(0,0,0,.09); }}
+.loan-card-ic {{ font-size: 28px; line-height: 1; flex-shrink: 0; }}
+.loan-card-mid {{ flex: 1; min-width: 0; }}
+.loan-card-name {{ font-weight: 900; font-size: 16px; color: #0f172a; }}
+.loan-card-sub {{ font-size: 13px; color: #64748b; margin-top: 4px; }}
+.loan-card-badge {{
+  display: inline-block;
+  margin-top: 8px;
+  padding: 4px 12px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 800;
+  background: #dc2626;
+  color: #fff;
+  letter-spacing: .02em;
+}}
+.loan-card-badge-done {{ background: #16a34a; }}
+.loan-card-amt {{ font-weight: 900; font-size: 17px; color: #15803d; white-space: nowrap; flex-shrink: 0; }}
+.loans-empty {{ text-align: center; opacity: .85; padding: 24px; }}
+</style>
+<div class="loans-page-wrap">
+  <h1 class="loans-page-title">📋 Lista de Préstamos</h1>
+  <div class="loans-toolbar">
+    <a class="btn-loan-new" href="{url_for("new_loan")}">👤➕ Nuevo préstamo</a>
+    {filter_block}
+  </div>
+  <div class="loans-summary">
+    <h3>📌 Resumen por prestamista</h3>
+    <div class="table-scroll">
+      <table>
+        <tr><th>Prestamista</th><th># Préstamos</th><th>Pagados</th><th>Total prestado</th><th>Capital activo</th></tr>
+        {sum_body}
+      </table>
+    </div>
+  </div>
+  <div class="loans-cards">{cards_html}</div>
+</div>
+"""
     return page(body)
 
 
@@ -1811,25 +2066,48 @@ def undo_payment(loan_id):
 def bank_home():
     ensure_org()
     user = current_user()
-    tiles = """
-    <a href="/bank/daily-list" class="bank-tile blue">Lista diaria</a>
-    <a href="/bank/expenses" class="bank-tile red">Gastos</a>
-    <a href="/bank/late" class="bank-tile orange">Atrasos</a>
-    <a href="/bank/legal" class="bank-tile purple">Legal</a>
-    <a href="/bank/advance" class="bank-tile indigo">Adelantos</a>
-    """
-    adm = ""
+    tiles = (
+        f'<a href="{url_for("bank_daily_list")}" class="bank-tile blue">🗓️ Lista diaria</a>'
+        f'<a href="{url_for("bank_delivery")}" class="bank-tile green2">💰 Entrega</a>'
+        f'<a href="{url_for("bank_expenses")}" class="bank-tile red">📓 Gastos</a>'
+        f'<a href="{url_for("bank_acta")}" class="bank-tile yellow">💸 Descuento inicial</a>'
+        f'<a href="{url_for("bank_routes_list")}" class="bank-tile teal">🏦 Capital por ruta</a>'
+        f'<a href="{url_for("bank_advance")}" class="bank-tile lavender">💵 Adelantos</a>'
+        f'<a href="{url_for("bank_legal_list")}" class="bank-tile purple">📜 Documento legal</a>'
+        f'<a href="{url_for("bank_late")}" class="bank-tile orange">🔥 Atrasos</a>'
+    )
+    bottom = (
+        f'<a href="{url_for("collector_map")}" class="bank-tile bank-tile-full teal2">📍 Ver ubicación cobrador</a>'
+    )
+    destroy = ""
     if user.get("role") == "admin":
-        adm = f'<form method="post" action="{url_for("admin_clear_all")}" onsubmit="return confirm(\'¿Vaciar todos los datos en memoria? Se cerrará la sesión.\');" style="margin-top:12px"><button class="btn btn-secondary" type="submit">Vaciar datos (memoria)</button></form>'
+        destroy = (
+            f'<form method="post" action="{url_for("admin_clear_all")}" style="margin:14px 0 0 0;" '
+            f'onsubmit="return confirm(\'¿BORRAR TODO EL SISTEMA? Se eliminarán todos los datos en memoria y se cerrará la sesión. Esta acción no se puede deshacer.\');">'
+            f'<button type="submit" class="bank-tile bank-tile-full bank-destroy">🗑️ BORRAR TODO EL SISTEMA</button></form>'
+        )
     body = (
-        f'<h2 style="text-align:center">🏦 Banco</h2><style>'
-        f'.bank-menu{{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;align-items:stretch;padding:8px 4px 14px}}'
-        f'.bank-tile{{display:flex;align-items:center;justify-content:center;text-align:center;padding:16px 12px;min-height:56px;border-radius:16px;color:#fff;font-weight:900;text-decoration:none;box-shadow:0 10px 24px rgba(0,0,0,.14);transition:transform .12s ease,opacity .12s ease;box-sizing:border-box}}'
-        f'.bank-tile:hover{{transform:translateY(-2px);opacity:.98}}'
-        f'.bank-tile:focus{{outline:2px solid rgba(255,255,255,.85);outline-offset:2px}}'
-        f'.blue{{background:#4f8df7}} .red{{background:#f87171}} .orange{{background:#fb923c}} .purple{{background:#a855f7}} .indigo{{background:#6366f1}}'
-        f'</style><div class="bank-menu">{tiles}</div>'
-        f'<a class="btn btn-primary" style="display:block;margin-top:12px;text-align:center" href="{url_for("collector_map")}">Mapa cobrador</a>{adm}'
+        f'<h2 style="text-align:center;margin:8px 0 6px 0;font-size:1.5rem;font-weight:900;color:#14532d">🏛️ Banco</h2>'
+        f"<style>"
+        f".bank-wrap{{max-width:520px;margin:0 auto;padding:6px 4px 20px}}"
+        f".bank-menu{{display:grid;grid-template-columns:1fr 1fr;gap:12px;align-items:stretch}}"
+        f"@media(max-width:420px){{.bank-menu{{grid-template-columns:1fr}}}}"
+        f".bank-tile{{display:flex;align-items:center;justify-content:center;text-align:center;padding:18px 14px;min-height:64px;border-radius:18px;color:#fff!important;font-weight:900;text-decoration:none!important;font-size:15px;box-shadow:0 10px 26px rgba(0,0,0,.16);transition:transform .12s ease,filter .12s ease;box-sizing:border-box;line-height:1.25}}"
+        f".bank-tile:hover{{transform:translateY(-2px);filter:brightness(1.02)}}"
+        f".bank-tile:focus{{outline:2px solid rgba(255,255,255,.85);outline-offset:2px}}"
+        f".bank-tile-full{{grid-column:1/-1}}"
+        f".blue{{background:linear-gradient(135deg,#4f8df7,#60a5fa)}}"
+        f".red{{background:linear-gradient(135deg,#f87171,#fb7185)}}"
+        f".orange{{background:linear-gradient(135deg,#fb923c,#fdba74)}}"
+        f".purple{{background:linear-gradient(135deg,#a855f7,#c084fc)}}"
+        f".lavender{{background:linear-gradient(135deg,#6366f1,#818cf8)}}"
+        f".teal{{background:linear-gradient(135deg,#0d9488,#14b8a6)}}"
+        f".teal2{{background:linear-gradient(135deg,#0f766e,#2dd4bf)}}"
+        f".yellow{{background:linear-gradient(135deg,#ca8a04,#eab308)}}"
+        f".green2{{background:linear-gradient(135deg,#15803d,#22c55e)}}"
+        f".bank-destroy{{background:linear-gradient(135deg,#dc2626,#ef4444)!important;border:2px solid rgba(255,255,255,.35);cursor:pointer;width:100%;font:inherit}}"
+        f"</style>"
+        f'<div class="bank-wrap"><div class="bank-menu">{tiles}{bottom}</div>{destroy}</div>'
     )
     return page(body)
 
@@ -2076,15 +2354,14 @@ def view_legal_document(loan_id):
         return redirect(url_for("bank_legal_list"))
 
     client = store.clients.get(loan.get("client_id"), {})
-    cobrador = store.users.get(loan.get("created_by"), {}).get("username") or "—"
-
-    def fmt_date(d):
-        return d.strftime("%d/%m/%Y") if hasattr(d, "strftime") else str(d)
+    cob_u = store.users.get(loan.get("created_by"), {})
+    cobrador = cob_u.get("name") or cob_u.get("username") or "—"
 
     capital_aprobado = float(loan.get("amount") or 0)
     interes_total = float(loan.get("total_interest") or 0)
     start_date = loan.get("start_date")
-    cedula = client.get("document_id") or "—"
+    doc_raw = (client.get("document_id") or "").strip()
+    cedula = doc_raw if doc_raw else "No tiene"
     cliente_nombre = f"{client.get('first_name','')} {client.get('last_name') or ''}".strip() or "—"
 
     # Mostrar previews si ya subieron fotos/firmaron.
@@ -2142,71 +2419,220 @@ def view_legal_document(loan_id):
   if (signForm) {
     signForm.addEventListener('submit', ()=>{document.getElementById('signature_b64').value = canvas.toDataURL('image/png');});
   }
+  function legalScrollFirma() {{
+    const c = document.getElementById('sigCanvas');
+    if (c) c.scrollIntoView({{behavior:'smooth', block:'center'}});
+  }}
 </script>
 """
 
+    cliente_nombre_esc = html.escape(cliente_nombre)
+    cedula_esc = html.escape(str(cedula))
+    cobrador_esc = html.escape(str(cobrador))
+    fecha_inicio_txt = (
+        start_date.strftime("%Y-%m-%d")
+        if start_date and hasattr(start_date, "strftime")
+        else (str(start_date) if start_date else "—")
+    )
+    fecha_inicio_esc = html.escape(fecha_inicio_txt)
+
     body = f"""
-<div class="card" style="padding:16px;">
-  <h2 style="margin:0 0 10px 0;">Contrato de Préstamo</h2>
-  <div style="opacity:.9; font-size:13px; margin-bottom:12px;">
-    <div><b>Cliente:</b> {cliente_nombre}</div>
-    <div><b>Cédula:</b> {cedula}</div>
-    <div><b>Capital aprobado:</b> {fmt_money(capital_aprobado)}</div>
-    <div><b>Interés total:</b> {fmt_money(interes_total)}</div>
-    <div><b>Fecha inicio:</b> {fmt_date(start_date)}</div>
-    <div><b>Cobrador:</b> {cobrador}</div>
+<style>
+.legal-contract-wrap {{
+  background: linear-gradient(180deg,#ecfdf5 0%,#f0fdf4 48%,#ecfdf5 100%);
+  border-radius: 22px;
+  padding: 18px 16px 26px;
+  border: 1px solid rgba(22,163,74,.2);
+  box-shadow: 0 10px 32px rgba(0,0,0,.07);
+  margin-bottom: 14px;
+}}
+.legal-back {{
+  display: inline-block;
+  background: #e5e7eb;
+  color: #374151;
+  padding: 9px 18px;
+  border-radius: 999px;
+  text-decoration: none !important;
+  font-weight: 800;
+  font-size: 14px;
+  margin-bottom: 14px;
+  border: none;
+  box-shadow: 0 2px 8px rgba(0,0,0,.06);
+}}
+.legal-back:hover {{ filter: brightness(0.97); }}
+.legal-title {{
+  margin: 0 0 16px 0;
+  font-size: 1.45rem;
+  font-weight: 900;
+  color: #14532d;
+  letter-spacing: -0.02em;
+}}
+.legal-dl {{ font-size: 14px; color: #166534; line-height: 1.65; margin: 0 0 18px 0; }}
+.legal-dl div {{ margin: 2px 0; }}
+.legal-dl b {{ color: #14532d; font-weight: 800; min-width: 9rem; display: inline-block; }}
+.legal-sep {{ height: 1px; background: rgba(22,101,52,.2); margin: 16px 0; border: 0; }}
+.legal-h3 {{
+  margin: 0 0 10px 0;
+  font-size: 1.05rem;
+  font-weight: 900;
+  color: #14532d;
+}}
+.legal-compromiso p {{
+  margin: 0 0 10px 0;
+  font-size: 14px;
+  line-height: 1.55;
+  color: #1e293b;
+}}
+.legal-compromiso p:last-child {{ margin-bottom: 0; }}
+.legal-id-grid {{
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin-top: 12px;
+}}
+@media (max-width: 560px) {{ .legal-id-grid {{ grid-template-columns: 1fr; }} }}
+.legal-upload-form {{ margin: 0; }}
+.legal-upload-label {{
+  display: block;
+  cursor: pointer;
+  margin: 0;
+}}
+.legal-upload-btn {{
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  min-height: 72px;
+  padding: 14px 12px;
+  background: linear-gradient(180deg,#64748b,#475569);
+  color: #fff !important;
+  font-weight: 800;
+  font-size: 14px;
+  border-radius: 16px;
+  box-shadow: 0 8px 22px rgba(15,23,42,.22);
+  transition: transform .12s ease, filter .12s ease;
+  border: none;
+}}
+.legal-upload-btn:hover {{ filter: brightness(1.06); transform: translateY(-1px); }}
+.legal-upload-hint {{ font-size: 12px; opacity: .85; margin-top: 8px; color: #166534; text-align: center; }}
+.legal-firma-actions {{
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  justify-content: center;
+  margin: 14px 0 18px 0;
+}}
+.legal-btn-sign {{
+  border: none;
+  cursor: pointer;
+  padding: 14px 22px;
+  border-radius: 999px;
+  font-weight: 900;
+  font-size: 15px;
+  color: #fff;
+  background: linear-gradient(135deg,#2563eb,#3b82f6);
+  box-shadow: 0 10px 26px rgba(37,99,235,.45);
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}}
+.legal-btn-sign:hover {{ filter: brightness(1.05); }}
+.legal-btn-print {{
+  border: none;
+  cursor: pointer;
+  padding: 14px 22px;
+  border-radius: 999px;
+  font-weight: 900;
+  font-size: 15px;
+  color: #fff;
+  background: linear-gradient(135deg,#15803d,#22c55e);
+  box-shadow: 0 10px 26px rgba(22,163,74,.4);
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}}
+.legal-btn-print:hover {{ filter: brightness(1.05); }}
+.legal-sig-box {{
+  background: #fff;
+  border-radius: 16px;
+  border: 1px solid rgba(22,101,52,.15);
+  padding: 14px;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.8);
+}}
+.legal-sig-box .hint {{ font-size: 12px; color: #64748b; margin-bottom: 8px; }}
+@media print {{
+  .no-print-legal, header.topbar, .premium-btn, .menu-overlay, .side-menu, nav, .container > .card:first-child {{ display: none !important; }}
+  .legal-contract-wrap {{ box-shadow: none !important; border: none !important; background: #fff !important; }}
+}}
+</style>
+<div class="legal-contract-wrap">
+  <a class="legal-back no-print-legal" href="{url_for('bank_legal_list')}">← Volver</a>
+  <h1 class="legal-title">Contrato de Préstamo</h1>
+  <div class="legal-dl">
+    <div><b>Cliente:</b> {cliente_nombre_esc}</div>
+    <div><b>Cédula:</b> {cedula_esc}</div>
+    <div><b>Capital aprobado:</b> {html.escape(fmt_money(capital_aprobado))}</div>
+    <div><b>Interés total:</b> {html.escape(fmt_money(interes_total))}</div>
+    <div><b>Fecha inicio:</b> {fecha_inicio_esc}</div>
+    <div><b>Cobrador:</b> {cobrador_esc}</div>
   </div>
 
-  <div style="margin:10px 0 16px 0;border-top:1px solid rgba(148,163,184,.35);padding-top:12px;">
-    <h3 style="margin:0 0 8px 0;">📜 Compromiso de Pago</h3>
-    <p style="margin:0 0 8px 0;">
-      El cliente <b>{cliente_nombre}</b> reconoce haber recibido el capital del préstamo y se compromete de manera expresa, voluntaria e irrevocable a pagar la totalidad de la deuda a <b>JDM CASH NOW</b>, incluyendo capital, intereses, cargos y penalidades aplicables, en los plazos establecidos.
+  <hr class="legal-sep">
+  <div class="legal-compromiso">
+    <h3 class="legal-h3">📄 Compromiso de Pago</h3>
+    <p>
+      El cliente <b>{cliente_nombre_esc}</b> reconoce haber recibido el capital del préstamo y se compromete de manera expresa, voluntaria e irrevocable a pagar la totalidad de la deuda a <b>JDM CASH NOW</b>, incluyendo capital, intereses, cargos y penalidades aplicables, en los plazos establecidos.
     </p>
-    <p style="margin:0;">
+    <p>
       El incumplimiento de este compromiso autoriza a <b>JDM CASH NOW</b> a iniciar las acciones legales correspondientes conforme a la ley vigente.
     </p>
   </div>
 
-  <div style="border-top:1px solid rgba(148,163,184,.35);padding-top:12px;">
-    <h3 style="margin:0 0 10px 0;">Cédula del cliente</h3>
-    <div style="display:flex;gap:14px;flex-wrap:wrap;align-items:flex-start;">
-      <div style="flex:1;min-width:240px;">
-        <div style="font-weight:900;margin-bottom:6px; font-size:13px;">Cédula (Frente)</div>
-        <form method="post" enctype="multipart/form-data" action="{url_for('upload_id_front', loan_id=loan_id)}">
-          <input name="id_front" type="file" accept="image/*" required>
-          <button class="btn btn-primary" style="margin-top:8px;" type="submit">Subir frente</button>
-        </form>
-        {preview_front}
-      </div>
-      <div style="flex:1;min-width:240px;">
-        <div style="font-weight:900;margin-bottom:6px; font-size:13px;">Cédula (Parte de atrás)</div>
-        <form method="post" enctype="multipart/form-data" action="{url_for('upload_id_back', loan_id=loan_id)}">
-          <input name="id_back" type="file" accept="image/*" required>
-          <button class="btn btn-primary" style="margin-top:8px;" type="submit">Subir atrás</button>
-        </form>
-        {preview_back}
-      </div>
-    </div>
+  <hr class="legal-sep">
+  <h3 class="legal-h3">Cédula del cliente</h3>
+  <div class="legal-id-grid no-print-legal">
+    <form class="legal-upload-form" method="post" enctype="multipart/form-data" action="{url_for('upload_id_front', loan_id=loan_id)}">
+      <label class="legal-upload-label">
+        <span class="legal-upload-btn">Subir cédula (frente)</span>
+        <input name="id_front" type="file" accept="image/*" required style="display:none" onchange="if(this.files.length)this.form.submit()">
+      </label>
+    </form>
+    <form class="legal-upload-form" method="post" enctype="multipart/form-data" action="{url_for('upload_id_back', loan_id=loan_id)}">
+      <label class="legal-upload-label">
+        <span class="legal-upload-btn">Subir cédula (atrás)</span>
+        <input name="id_back" type="file" accept="image/*" required style="display:none" onchange="if(this.files.length)this.form.submit()">
+      </label>
+    </form>
+  </div>
+  <div style="display:flex;gap:14px;flex-wrap:wrap;justify-content:center;margin-top:12px;">
+    {preview_front}
+    {preview_back}
   </div>
 
-  <div style="border-top:1px solid rgba(148,163,184,.35);padding-top:12px;margin-top:14px;">
-    <h3 style="margin:0 0 10px 0;">Firma del cliente</h3>
+  <hr class="legal-sep">
+  <section id="firmaCliente">
+    <h3 class="legal-h3">Firma del cliente</h3>
+    <div class="legal-firma-actions no-print-legal">
+      <button type="button" class="legal-btn-sign" onclick="legalScrollFirma()">🖊 Firmar documento</button>
+      <button type="button" class="legal-btn-print" onclick="window.print()">🖨 Imprimir contrato</button>
+    </div>
     <form method="post" action="{url_for('sign_legal_document', loan_id=loan_id)}">
-      <div style="background:#fff;border-radius:14px;border:1px solid rgba(0,0,0,.08);padding:10px;">
-        <div style="opacity:.9;font-size:12px;margin-bottom:8px;">Firma (dibuje con el mouse/touch)</div>
-        <canvas id="sigCanvas" style="width:100%;max-width:520px;height:120px;border:1px dashed rgba(0,0,0,.25);border-radius:12px;background:#ffffff;"></canvas>
-        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px;">
+      <div class="legal-sig-box">
+        <div class="hint">Dibuje su firma aquí (mouse o dedo) y pulse Guardar firma.</div>
+        <canvas id="sigCanvas" style="width:100%;max-width:520px;height:130px;border:1px dashed rgba(21,83,45,.35);border-radius:14px;background:#fafafa;display:block;margin:0 auto;"></canvas>
+        <div style="display:flex;gap:10px;flex-wrap:wrap;justify-content:center;margin-top:12px;">
           <button class="btn btn-secondary" type="button" onclick="clearSig()">Limpiar</button>
           <button class="btn btn-primary" type="submit">Guardar firma</button>
         </div>
       </div>
       <input type="hidden" name="signature_b64" id="signature_b64">
     </form>
-    {preview_sig}
-  </div>
+    <div style="text-align:center;margin-top:12px;">{preview_sig}</div>
+  </section>
 </div>
 {signature_script}
-{nav_subfooter()}
+<p class="no-print-legal" style="margin-top:20px"><a class="btn btn-secondary" href="{url_for("dashboard")}">← Dashboard</a>
+<a class="btn btn-secondary" href="{url_for("bank_home")}">Banco</a></p>
 """
     return page(body)
 
@@ -2391,9 +2817,31 @@ def agregar_capital_ruta():
 @app.route("/bank/daily-list", methods=["GET", "POST"])
 @login_required
 def bank_daily_list():
-    rows = loans_for_user(session.get("org_id"), current_user())
-    t = "".join(f"<tr><td>#{L['id']}</td><td>{L.get('status')}</td><td>{fmt_money(L.get('remaining'))}</td></tr>" for L in rows[:50])
-    return page(f'<div class="card"><h2>Lista diaria</h2><table><tr><th>ID</th><th>Estado</th><th>Saldo</th></tr>{t}</table></div>')
+    ensure_org()
+    user = current_user()
+    org_id = session.get("org_id")
+    prox_sab, pack = loans_cobro_sabado_semanal(org_id, user)
+    tr = ""
+    for npd, L, nm in pack:
+        nm_e = html.escape(nm)
+        tr += (
+            f"<tr><td>{nm_e}</td><td>#{L['id']}</td><td>{npd}</td><td>{html.escape(fmt_money(L.get('installment_amount')))}</td>"
+            f"<td>{html.escape(fmt_money(L.get('remaining')))}</td>"
+            f"<td><a class='btn btn-secondary' href='{url_for('loan_detail', loan_id=L['id'])}'>Cobrar</a></td></tr>"
+        )
+    body = (
+        f'<div class="card" style="padding:16px;background:#ecfdf5;border:1px solid rgba(22,163,74,.15);">'
+        f'<h2 style="margin:0 0 8px 0;color:#14532d;">📋 Lista diaria — cobro sábados</h2>'
+        f'<p style="margin:0 0 14px 0;opacity:.92;font-size:14px;color:#166534;">'
+        f"Préstamos <b>semanales</b> activos con cuota a cobrar a más tardar el sábado <b>{prox_sab.strftime('%d/%m/%Y')}</b> "
+        f"(incluye hoy si es sábado). Disponible cualquier día de la semana."
+        f"</p>"
+        f'<div class="table-scroll"><table><tr>'
+        f"<th>Cliente</th><th>Prést.</th><th>Próx. pago</th><th>Cuota est.</th><th>Saldo</th><th></th></tr>"
+        f"{tr or '<tr><td colspan=6 style=\"text-align:center;opacity:.85\">Ninguno para este sábado de cobro</td></tr>'}"
+        f"</table></div>{nav_subfooter()}</div>"
+    )
+    return page(body)
 
 
 @app.route("/bank/expenses", methods=["GET", "POST"])
@@ -2820,7 +3268,107 @@ def bank_routes_history():
 @app.route("/bank/delivery", methods=["GET", "POST"])
 @login_required
 def bank_delivery():
-    return stub_page("Entrega de efectivo")
+    ensure_org()
+    oid = session.get("org_id")
+    user = current_user()
+    puede_registrar = user.get("role") in ("admin", "supervisor") or is_cartera_admin(user)
+
+    if request.method == "POST":
+        if not puede_registrar:
+            flash("Solo administración puede registrar entregas.", "danger")
+            return redirect(url_for("bank_delivery"))
+        collector_id = request.form.get("collector_id", type=int)
+        amt = request.form.get("amount", type=float)
+        note = (request.form.get("note") or "").strip()
+        cob = store.users.get(collector_id) if collector_id else None
+        if not cob or cob.get("organization_id") != oid or cob.get("role") != "cobrador":
+            flash("Seleccione un cobrador válido.", "danger")
+            return redirect(url_for("bank_delivery"))
+        if amt is None or amt <= 0:
+            flash("Monto inválido.", "danger")
+            return redirect(url_for("bank_delivery"))
+        try:
+            apply_cash_movement(
+                movement_type="entrega_cobrador",
+                amount=-float(amt),
+                note=note or f"Entrega efectivo para ruta — {cob.get('username')}",
+                user_id=user["id"],
+                org_id=oid,
+                collector_id=collector_id,
+            )
+        except ValueError as e:
+            flash(str(e), "danger")
+            return redirect(url_for("bank_delivery"))
+        flash(f"Entrega registrada: {fmt_money(amt)} para {cob.get('username')}.", "success")
+        return redirect(url_for("bank_delivery"))
+
+    entregas = sorted(
+        (
+            cr
+            for cr in store.cash_reports.values()
+            if cr.get("organization_id") == oid and cr.get("movement_type") == "entrega_cobrador"
+        ),
+        key=lambda x: x.get("created_at") or datetime.min,
+        reverse=True,
+    )
+    if user.get("role") == "cobrador" and not is_cartera_admin(user):
+        entregas = [e for e in entregas if e.get("collector_id") == user["id"]]
+
+    cobradores = sorted(
+        [u for u in store.users.values() if u.get("organization_id") == oid and u.get("role") == "cobrador"],
+        key=lambda u: (u.get("name") or u.get("username") or "").lower(),
+    )
+    opts = "".join(
+        f'<option value="{u["id"]}">{html.escape(u.get("name") or u.get("username") or "")}</option>' for u in cobradores
+    )
+    tr = ""
+    for cr in entregas[:150]:
+        col_uid = cr.get("collector_id")
+        col = store.users.get(col_uid, {})
+        col_nm = html.escape(col.get("name") or col.get("username") or "—")
+        reg_by = html.escape(store.users.get(cr.get("user_id"), {}).get("username") or "—")
+        m = abs(float(cr.get("amount") or 0))
+        fecha = cr.get("created_at")
+        fecha_s = fecha.strftime("%d/%m/%Y %I:%M %p") if fecha and hasattr(fecha, "strftime") else str(fecha or "—")
+        tr += (
+            f"<tr><td>{html.escape(fecha_s)}</td><td>{col_nm}</td>"
+            f"<td style='text-align:right;font-weight:800;color:#15803d'>{html.escape(fmt_money(m))}</td>"
+            f"<td>{html.escape(cr.get('note') or '')}</td><td>{reg_by}</td></tr>"
+        )
+
+    formulario = ""
+    if puede_registrar:
+        formulario = (
+            f'<div class="card" style="padding:16px;margin-bottom:14px;background:#ecfdf5;border:1px solid rgba(22,163,74,.2)">'
+            f'<h3 style="margin:0 0 8px 0;color:#14532d">Registrar entrega</h3>'
+            f'<p style="margin:0 0 12px 0;font-size:14px;opacity:.92">Efectivo que sale del banco hacia el cobrador antes de la ruta. '
+            f'Los cobros del día siguen sumando al banco; el <a href="{url_for("cierre_semanal")}">cierre semanal</a> sirve para cuadrar.</p>'
+            f'<p style="margin:0 0 10px 0"><b>Banco disponible:</b> {html.escape(fmt_money(get_bank_available(oid)))}</p>'
+            f'<form method="post">'
+            f'<label>Cobrador</label><select name="collector_id" required><option value="">— Elegir —</option>{opts}</select>'
+            f'<label>Monto entregado</label><input name="amount" type="number" step="0.01" min="0.01" required>'
+            f'<label>Nota (opcional)</label><input name="note" type="text" placeholder="Ej. Ruta norte 22/03">'
+            f'<button class="btn btn-primary" type="submit" style="margin-top:10px">Guardar entrega</button>'
+            f"</form></div>"
+        )
+    else:
+        formulario = (
+            f'<div class="card" style="padding:14px;margin-bottom:14px;opacity:.95">'
+            f'<p style="margin:0">Aquí ves las entregas registradas a tu nombre. Solo administración registra nuevas entregas.</p></div>'
+        )
+
+    body = (
+        f"{formulario}"
+        f'<div class="card" style="padding:16px">'
+        f'<h2 style="margin:0 0 6px 0;color:#14532d">💰 Entrega de efectivo</h2>'
+        f'<p style="margin:0 0 14px 0;font-size:14px">Historial de entregas al cobrador para salir a cobrar.</p>'
+        f'<div class="table-scroll"><table><tr>'
+        f"<th>Fecha</th><th>Cobrador</th><th>Monto</th><th>Nota</th><th>Registró</th></tr>"
+        f"{tr or '<tr><td colspan=5 style=\"text-align:center;opacity:.85\">Sin entregas registradas</td></tr>'}"
+        "</table></div>"
+        f"{nav_subfooter()}</div>"
+    )
+    return page(body)
 
 
 @app.route("/bank/delivery/edit/<int:delivery_id>", methods=["GET", "POST"])
@@ -2964,7 +3512,52 @@ def bank_acta():
 @app.route("/bank/routes", methods=["GET", "POST"])
 @login_required
 def bank_routes_list():
-    return stub_page("Capital por ruta")
+    ensure_org()
+    oid = session.get("org_id")
+    user = current_user()
+    by_route = {}
+    for L in loans_for_user(oid, user):
+        if str(L.get("status", "")).upper() != "ACTIVO":
+            continue
+        c = store.clients.get(L.get("client_id"), {})
+        ruta = (c.get("route") or "").strip() or "Sin ruta"
+        if ruta not in by_route:
+            by_route[ruta] = {"remaining": 0.0, "n": 0, "cids": set()}
+        by_route[ruta]["remaining"] += float(L.get("remaining") or 0)
+        by_route[ruta]["n"] += 1
+        cb = L.get("created_by")
+        if cb:
+            by_route[ruta]["cids"].add(cb)
+
+    tr = ""
+    for ruta in sorted(by_route.keys(), key=lambda x: x.lower()):
+        info = by_route[ruta]
+        names = []
+        for uid in info["cids"]:
+            u = store.users.get(uid, {})
+            names.append(u.get("name") or u.get("username") or str(uid))
+        pres = html.escape(", ".join(sorted(names)) if names else "—")
+        tr += (
+            f"<tr><td>{html.escape(ruta)}</td><td style='text-align:center'>{info['n']}</td>"
+            f"<td style='text-align:right;font-weight:800;color:#15803d'>{html.escape(fmt_money(info['remaining']))}</td>"
+            f"<td>{pres}</td></tr>"
+        )
+
+    total_rest = sum(float(x["remaining"]) for x in by_route.values())
+    total_n = sum(int(x["n"]) for x in by_route.values())
+
+    body = (
+        f'<div class="card" style="padding:16px;background:#ecfdf5;border:1px solid rgba(22,163,74,.18)">'
+        f'<h2 style="margin:0 0 8px 0;color:#14532d">🏦 Capital por ruta</h2>'
+        f'<p style="margin:0 0 14px 0;font-size:14px">Saldo vivo (<b>capital pendiente</b>) agrupado por la ruta del cliente.</p>'
+        f'<p style="margin:0 0 12px 0"><b>Total préstamos activos:</b> {total_n} · '
+        f"<b>Capital activo total:</b> {html.escape(fmt_money(total_rest))}</p>"
+        f'<div class="table-scroll"><table>'
+        f"<tr><th>Ruta</th><th># Préstamos</th><th>Capital activo</th><th>Prestamistas</th></tr>"
+        f"{tr or '<tr><td colspan=4 style=\"text-align:center;opacity:.85\">Sin préstamos activos con ruta</td></tr>'}"
+        f"</table></div>{nav_subfooter()}</div>"
+    )
+    return page(body)
 
 
 @app.route("/bank/late")
@@ -3174,32 +3767,18 @@ def cobro_sabado():
     ensure_org()
     user = current_user()
     org_id = session.get("org_id")
-    today = date.today()
-    days_to_sat = (5 - today.weekday()) % 7
-    if days_to_sat == 0:
-        days_to_sat = 7
-    prox_sab = today + timedelta(days=days_to_sat)
-    rows = []
-    for L in loans_for_user(org_id, user):
-        if str(L.get("status", "")).upper() != "ACTIVO":
-            continue
-        if "semanal" not in str(L.get("frequency") or "").lower():
-            continue
-        npd = L.get("next_payment_date")
-        if npd and npd <= prox_sab:
-            cid = L.get("client_id")
-            c = store.clients.get(cid, {})
-            nm = f"{c.get('first_name','')} {c.get('last_name') or ''}".strip()
-            rows.append((npd, L, nm))
-    rows.sort(key=lambda x: x[0] or date.max)
+    prox_sab, rows = loans_cobro_sabado_semanal(org_id, user)
     tr = ""
     for npd, L, nm in rows:
+        nm_e = html.escape(nm or f"Cliente #{L.get('client_id')}")
         tr += (
-            f"<tr><td>{nm}</td><td>#{L['id']}</td><td>{npd}</td><td>{fmt_money(L.get('installment_amount'))}</td>"
+            f"<tr><td>{nm_e}</td><td>#{L['id']}</td><td>{npd}</td><td>{html.escape(fmt_money(L.get('installment_amount')))}</td>"
             f"<td><a class='btn btn-secondary' href='{url_for('loan_detail', loan_id=L['id'])}'>Cobrar</a></td></tr>"
         )
     body = (
-        f'<div class="card"><h2>💰 Cobro sábado</h2><p>Préstamos <b>semanales</b> con cuota hasta el próximo sábado ({prox_sab}).</p>'
+        f'<div class="card"><h2>💰 Cobro sábado</h2>'
+        f"<p>Préstamos <b>semanales</b> con cuota a cobrar a más tardar el sábado "
+        f"<b>{prox_sab.strftime('%d/%m/%Y')}</b> (hoy si ya es sábado).</p>"
         f'<div class="table-scroll"><table><tr><th>Cliente</th><th>Prést.</th><th>Próx. pago</th><th>Cuota est.</th><th></th></tr>'
         f"{tr or '<tr><td colspan=5>Ninguno programado para este ciclo</td></tr>'}</table></div>{nav_subfooter()}</div>"
     )
