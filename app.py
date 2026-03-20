@@ -662,6 +662,8 @@ def login():
             def to_date(x):
                 if not x:
                     return None
+                if isinstance(x, datetime):
+                    return x.date()
                 try:
                     # datetime -> date
                     if hasattr(x, "date") and not isinstance(x, date):
@@ -2552,6 +2554,9 @@ def compute_super_admin_stats(date_from=None, date_to=None):
     def _to_date(x):
         if not x:
             return None
+        # Nota: datetime hereda de date, así que hay que manejar primero datetime.
+        if isinstance(x, datetime):
+            return x.date()
         if isinstance(x, date):
             return x
         try:
