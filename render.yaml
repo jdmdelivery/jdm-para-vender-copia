@@ -1,0 +1,18 @@
+# Render Blueprint - Banca la que nunca falla
+# https://render.com/docs/blueprint-spec
+
+services:
+  - type: web
+    name: banca-la-que-nunca-falla
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: >
+      gunicorn app:app
+      --bind 0.0.0.0:${PORT:-10000}
+      --workers 1
+      --timeout 120
+      --capture-output
+      --log-level info
+      --access-logfile -
+      --error-logfile -
+    healthCheckPath: /health
