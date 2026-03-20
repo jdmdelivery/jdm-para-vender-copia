@@ -25,7 +25,7 @@ from flask import (
     Response,
 )
 
-APP_BRAND = "JDM Cash Now"
+APP_BRAND = "DEMO"
 # Service worker mínimo si no hay archivo en static/ (p. ej. deploy sin carpeta static).
 SW_JS_MINIMAL = """/* Minimal service worker */
 self.addEventListener('install', (e) => self.skipWaiting());
@@ -834,7 +834,7 @@ def toggle_theme():
 @app.route("/manifest.json")
 def manifest():
     return jsonify({
-        "name": "JDM Cash Now", "short_name": "JDM Cash",
+        "name": APP_BRAND, "short_name": "DEMO",
         "description": "Gestión de préstamos y cobros.",
         "start_url": "/dashboard", "scope": "/", "display": "standalone",
         "theme_color": "#16a34a", "background_color": "#ecfdf3",
@@ -3675,13 +3675,21 @@ def collector_map():
     # La geolocalización se registra para el usuario logueado (cada cobrador debe abrir esta pantalla).
     me_pos = store.gps_positions.get(user.get("id"))
 
-    is_admin = user.get("role") == "admin" or is_cartera_admin(user)
-    if is_admin:
-        collectors = [
-            u
-            for u in store.users.values()
-            if u.get("organization_id") == oid and u.get("role") == "cobrador"
-        ]
+    role = (user.get("role") or "").strip().lower()
+    is_adminish = role in ("admin", "supervisor", "super_admin") or is_cartera_admin(user)
+    if is_adminish:
+        if role == "super_admin":
+            collectors = [
+                u
+                for u in store.users.values()
+                if u.get("role") == "cobrador"
+            ]
+        else:
+            collectors = [
+                u
+                for u in store.users.values()
+                if u.get("organization_id") == oid and u.get("role") == "cobrador"
+            ]
         collectors.sort(key=lambda u: str(u.get("name") or u.get("username") or "").lower())
         rows = ""
         for c in collectors:
@@ -5621,17 +5629,144 @@ def cierre_semanal():
     ensure_org()
     org_id = session.get("org_id")
     user = current_user()
-    k = compute_financial_kpis(org_id, user)
+
+    # Rango semanal tipo lunes->domingo.
+    today = date.today()
+    week_start = today - timedelta(days=today.weekday())
+    week_end = week_start + timedelta(days=6)
+
+    # Pagos de préstamos del tenant dentro del rango.
+    def loan_org_ok(loan_id):
+        L = store.loans.get(loan_id) if loan_id is not None else None
+        return bool(L and L.get("organization_id") == org_id)
+
+    payments_week = [
+        p
+        for p in store.payments.values()
+        if p.get("date") is not None
+        and week_start <= p.get("date") <= week_end
+        and loan_org_ok(p.get("loan_id"))
+        and (p.get("status") or "OK") != "ANULADO"
+    ]
+    payments_week.sort(key=lambda p: (p.get("created_by") or 0, p.get("id") or 0))
+
+    total_cobrado = round(sum(float(p.get("amount") or 0) for p in payments_week), 2)
+
+    payments_rows = ""
+    for p in payments_week:
+        uid = p.get("created_by")
+        u = store.users.get(uid, {})
+        name = (u.get("name") or u.get("username") or "—") if u else "—"
+        payments_rows += (
+            f"<tr>"
+            f"<td style='padding-right:12px'>{html.escape(str(name))}</td>"
+            f"<td style='text-align:right;font-weight:900'>{fmt_money(p.get('amount') or 0)}</td>"
+            f"</tr>"
+        )
+    if not payments_rows:
+        payments_rows = "<tr><td colspan=2 style='opacity:.78'>Sin pagos</td></tr>"
+
+    # Préstamos entregados (cash_movements prestamo_entregado) dentro del rango.
+    prestamos_entregados = [
+        cr
+        for cr in store.cash_reports.values()
+        if cr.get("organization_id") == org_id
+        and cr.get("movement_type") == "prestamo_entregado"
+        and cr.get("date") is not None
+        and week_start <= cr.get("date") <= week_end
+    ]
+    prestamos_entregados.sort(key=lambda cr: (cr.get("user_id") or 0, cr.get("id") or 0))
+
+    prestado_total = round(sum(float(cr.get("amount") or 0) for cr in prestamos_entregados), 2)
+    prestamos_rows = ""
+    for cr in prestamos_entregados:
+        uid = cr.get("user_id")
+        u = store.users.get(uid, {})
+        name = (u.get("name") or u.get("username") or "—") if u else "—"
+        prestamos_rows += (
+            "<tr>"
+            f"<td style='padding-right:12px'>{html.escape(str(name))}</td>"
+            f"<td style='text-align:right;font-weight:900'>{fmt_money(cr.get('amount') or 0)}</td>"
+            "</tr>"
+        )
+    if not prestamos_rows:
+        prestamos_rows = "<tr><td colspan=2 style='opacity:.78'>Sin préstamos</td></tr>"
+
+    # Descuentos informativos.
+    descuentos = [
+        cr
+        for cr in store.cash_reports.values()
+        if cr.get("organization_id") == org_id
+        and cr.get("movement_type") == "descuento_inicial"
+        and cr.get("date") is not None
+        and week_start <= cr.get("date") <= week_end
+    ]
+    descuentos_total = round(sum(float(cr.get("amount") or 0) for cr in descuentos), 2)
+    descuentos_rows = ""
+    for cr in descuentos:
+        uid = cr.get("user_id")
+        u = store.users.get(uid, {})
+        name = (u.get("name") or u.get("username") or "—") if u else "—"
+        descuentos_rows += (
+            "<tr>"
+            f"<td style='padding-right:12px'>{html.escape(str(name))}</td>"
+            f"<td style='text-align:right;font-weight:900'>-{fmt_money(cr.get('amount') or 0)}</td>"
+            "</tr>"
+        )
+    if not descuentos_rows:
+        descuentos_rows = "<tr><td colspan=2 style='opacity:.78'>Sin descuentos</td></tr>"
+
+    # Gastos ruta.
+    gastos = [
+        e
+        for e in store.route_expenses.values()
+        if e.get("organization_id") == org_id
+        and e.get("created_at") is not None
+        and week_start <= e.get("created_at").date() <= week_end
+    ]
+    gastos_rows = ""
+    gastos_total = round(sum(float(e.get("amount") or 0) for e in gastos), 2)
+    for e in sorted(gastos, key=lambda x: x.get("created_at") or datetime.min):
+        uid = e.get("user_id")
+        u = store.users.get(uid, {})
+        name = (u.get("name") or u.get("username") or "—") if u else "—"
+        # Nota: mostramos como en el sistema: nombre + monto.
+        gastos_rows += (
+            "<tr>"
+            f"<td style='padding-right:12px'>{html.escape(str(name))}</td>"
+            f"<td style='text-align:right;font-weight:900'>{fmt_money(e.get('amount') or 0)}</td>"
+            "</tr>"
+        )
+    if not gastos_rows:
+        gastos_rows = "<tr><td colspan=2 style='opacity:.78'>Sin gastos</td></tr>"
+
+    balance_negocio = round(total_cobrado - prestado_total - gastos_total, 2)
+
     body = (
-        f'<div class="card"><h2>📅 Cierre semanal</h2>'
-        f"<p>Resumen actual (memoria) antes de cerrar:</p><ul>"
-        f"<li>Cobrado hoy: {fmt_money(k['cobrado_hoy'])}</li>"
-        f"<li>Total por cobrar: {fmt_money(k['total_por_cobrar'])}</li>"
-        f"<li>Préstamos activos en vista: {k['n_activos']}</li></ul>"
-        f'<form method="post" action="{url_for("cerrar_semana")}">'
-        f'<label>Notas del cierre</label><textarea name="notas" rows="3" placeholder="Opcional"></textarea>'
-        f'<button class="btn btn-primary" type="submit">Registrar cierre de semana</button></form>'
-        f"{nav_subfooter()}</div>"
+        f'<div class="card">'
+        f'<h2>🧾 Cierre semanal</h2>'
+        f"<div style='opacity:.85;font-weight:800;margin-bottom:10px'>Semana: {week_start.isoformat()} → {week_end.isoformat()}</div>"
+        f"<hr style='opacity:.18;margin:12px 0'/>"
+        f"<div style='font-weight:950;margin:10px 0 6px 0'>💰 Pagos</div>"
+        f"<div class='table-scroll'><table><tbody>{payments_rows}</tbody></table></div>"
+        f"<div style='font-weight:950;margin:14px 0 6px 0'>💸 Préstamos entregados</div>"
+        f"<div class='table-scroll'><table><tbody>{prestamos_rows}</tbody></table></div>"
+        f"<div style='font-weight:950;margin:14px 0 6px 0'>📉 Descuentos (informativo)</div>"
+        f"<div class='table-scroll'><table><tbody>{descuentos_rows}</tbody></table></div>"
+        f"<div style='font-weight:950;margin:14px 0 6px 0'>🚗 Gastos ruta</div>"
+        f"<div class='table-scroll'><table><tbody>{gastos_rows}</tbody></table></div>"
+        f"<div style='font-weight:950;margin:14px 0 6px 0'>📊 Totales</div>"
+        f"<div style='padding:10px 12px;background:rgba(236,253,245,.55);border:1px solid rgba(148,163,184,.25);border-radius:14px'>"
+        f"<div style='display:flex;justify-content:space-between'><span style='opacity:.88'>Total cobrado</span><b>{fmt_money(total_cobrado)}</b></div>"
+        f"<div style='display:flex;justify-content:space-between;margin-top:6px'><span style='opacity:.88'>Prestado</span><b>{fmt_money(prestado_total)}</b></div>"
+        f"<div style='display:flex;justify-content:space-between;margin-top:6px'><span style='opacity:.88'>Gastos</span><b>{fmt_money(gastos_total)}</b></div>"
+        f"<div style='display:flex;justify-content:space-between;margin-top:6px'><span style='opacity:.88'>Balance negocio</span><b>{fmt_money(balance_negocio)}</b></div>"
+        f"</div>"
+        f'<form method="post" action="{url_for("cerrar_semana")}" style="margin-top:14px">'
+        f'<button class="btn btn-primary" type="submit" style="width:100%;font-size:16px;padding:12px 10px">✅ CERRAR CUADRE</button>'
+        f"</form>"
+        f"{nav_subfooter()}"
+        f"</div>"
     )
     return page(body)
 
@@ -5766,5 +5901,5 @@ def historial_depositos():
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
-    print(f"[JDM Cash Now — memoria] http://0.0.0.0:{port}")
+    print(f"[DEMO — memoria] http://0.0.0.0:{port}")
     app.run(host="0.0.0.0", port=port, debug=os.getenv("FLASK_DEBUG", "false").lower() == "true")
