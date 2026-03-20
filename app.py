@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import json
 import base64
 import html
 import secrets
@@ -660,7 +661,7 @@ def login():
             tenant_status = tenant_admin.get("account_status", ACCOUNT_ACTIVE)
 
             if u_status == ACCOUNT_SUSPENDED or tenant_status == ACCOUNT_SUSPENDED:
-                flash("Cuenta suspendida por falta de pago", "danger")
+                flash("Usuario suspendido por el sistema", "danger")
                 return render_template_string(
                     TPL_LOGIN,
                     flashes=get_flashed_messages(with_categories=True),
@@ -678,7 +679,7 @@ def login():
                 )
 
             if tenant_status != ACCOUNT_ACTIVE:
-                flash("Cuenta suspendida por falta de pago", "danger")
+                flash("Usuario suspendido por el sistema", "danger")
                 return render_template_string(
                     TPL_LOGIN,
                     flashes=get_flashed_messages(with_categories=True),
@@ -2441,6 +2442,120 @@ def audit():
     return page(f'<div class="card"><h2>Auditoría</h2><div class="table-scroll"><table><tr><th>Fecha</th><th>Acción</th><th>Detalle</th></tr>{rows}</table></div></div>')
 
 
+def compute_super_admin_stats():
+    """KPIs globales para el panel Super Admin (multi-tenant)."""
+    admins = [u for u in store.users.values() if u.get("role") == "admin"]
+    tenant_ids = {a.get("id") for a in admins if a.get("id") is not None}
+
+    now = datetime.utcnow()
+    today = date.today()
+
+    # Serie últimos 14 días (intereses cobrados).
+    days = 14
+    start_day = today - timedelta(days=days - 1)
+    income_series = []
+    for i in range(days):
+        d = start_day + timedelta(days=i)
+        s = 0.0
+        for p in store.payments.values():
+            if (p.get("status") or "OK") == "ANULADO":
+                continue
+            if p.get("date") != d:
+                continue
+            loan_id = p.get("loan_id")
+            L = store.loans.get(loan_id) if loan_id is not None else None
+            if not L or L.get("organization_id") not in tenant_ids:
+                continue
+            s += float(p.get("interest") or 0)
+        income_series.append(round(s, 2))
+
+    # Total global de intereses cobrados.
+    interest_total = 0.0
+    for p in store.payments.values():
+        if (p.get("status") or "OK") == "ANULADO":
+            continue
+        loan_id = p.get("loan_id")
+        L = store.loans.get(loan_id) if loan_id is not None else None
+        if not L or L.get("organization_id") not in tenant_ids:
+            continue
+        interest_total += float(p.get("interest") or 0)
+    interest_total = round(interest_total, 2)
+
+    # Ganancia mensual basada en intereses cobrados del mes actual.
+    month_start = date(today.year, today.month, 1)
+    interest_month = 0.0
+    for p in store.payments.values():
+        if (p.get("status") or "OK") == "ANULADO":
+            continue
+        d = p.get("date")
+        if not d or not hasattr(d, "strftime"):
+            continue
+        if d < month_start or d > today:
+            continue
+        loan_id = p.get("loan_id")
+        L = store.loans.get(loan_id) if loan_id is not None else None
+        if not L or L.get("organization_id") not in tenant_ids:
+            continue
+        interest_month += float(p.get("interest") or 0)
+    interest_month = round(interest_month, 2)
+
+    # Dinero prestado vs cobrado (capital).
+    borrowed_total = 0.0
+    for L in store.loans.values():
+        if L.get("organization_id") in tenant_ids:
+            borrowed_total += float(L.get("amount") or 0)
+    borrowed_total = round(borrowed_total, 2)
+
+    collected_capital_total = 0.0
+    for p in store.payments.values():
+        if (p.get("status") or "OK") == "ANULADO":
+            continue
+        loan_id = p.get("loan_id")
+        L = store.loans.get(loan_id) if loan_id is not None else None
+        if not L or L.get("organization_id") not in tenant_ids:
+            continue
+        collected_capital_total += float(p.get("capital") or 0)
+    collected_capital_total = round(collected_capital_total, 2)
+
+    # Alertas (suscripción).
+    upcoming_days = 7
+    expired_admins = []
+    soon_admins = []
+    pending_collectors = 0
+
+    for a in admins:
+        sub_end = a.get("subscription_end")
+        status = a.get("account_status", ACCOUNT_ACTIVE)
+        if not sub_end or not hasattr(sub_end, "strftime"):
+            continue
+        if now > sub_end and status != ACCOUNT_SUSPENDED:
+            expired_admins.append(a)
+        elif now <= sub_end and (sub_end - now).days <= upcoming_days and status == ACCOUNT_ACTIVE:
+            soon_admins.append(a)
+
+    for u in store.users.values():
+        if u.get("role") == "cobrador" and u.get("account_status") == ACCOUNT_PENDING:
+            pending_collectors += 1
+
+    labels = [(start_day + timedelta(days=i)).strftime("%d/%m") for i in range(days)]
+
+    return {
+        "labels": labels,
+        "income_series": income_series,
+        "interest_month": interest_month,
+        "interest_total": interest_total,
+        "borrowed_total": borrowed_total,
+        "collected_capital_total": collected_capital_total,
+        "alerts": {
+            "expired_admins_count": len(expired_admins),
+            "soon_admins_count": len(soon_admins),
+            "pending_collectors_count": pending_collectors,
+            "expired_admins": [{"id": a.get("id"), "username": a.get("username")} for a in expired_admins[:10]],
+            "soon_admins": [{"id": a.get("id"), "username": a.get("username")} for a in soon_admins[:10]],
+        },
+    }
+
+
 @app.route("/super-admin", methods=["GET", "POST"])
 @login_required
 @super_admin_required
@@ -2500,40 +2615,66 @@ def super_admin_panel():
             flash("Cobrador aprobado.", "success")
             return redirect(url_for("super_admin_panel"))
 
+        if act == "toggle_cobrador":
+            if u.get("role") != "cobrador":
+                flash("Solo se puede controlar cobradores.", "danger")
+                return redirect(url_for("super_admin_panel"))
+            new_status = request.form.get("new_status", type=str)
+            if new_status not in (ACCOUNT_ACTIVE, ACCOUNT_SUSPENDED):
+                flash("Estado inválido.", "danger")
+                return redirect(url_for("super_admin_panel"))
+            # No permitir pasar de "pendiente" a "activo" sin aprobación.
+            if u.get("account_status") == ACCOUNT_PENDING and new_status == ACCOUNT_ACTIVE:
+                flash("Primero apruebe el cobrador.", "warning")
+                return redirect(url_for("super_admin_panel"))
+            u["account_status"] = new_status
+            flash("Estado del cobrador actualizado.", "success")
+            return redirect(url_for("super_admin_panel"))
+
         flash("Acción inválida.", "danger")
         return redirect(url_for("super_admin_panel"))
 
+    stats = compute_super_admin_stats()
     admins = [u for u in store.users.values() if u.get("role") == "admin"]
     admins.sort(key=lambda x: x.get("created_at") or datetime.min, reverse=True)
 
-    total_admins = len(admins)
-    pending_admins = sum(1 for u in admins if u.get("account_status") == ACCOUNT_PENDING)
-    suspended_admins = sum(1 for u in admins if u.get("account_status") == ACCOUNT_SUSPENDED)
-    pending_cobradores = sum(
-        1 for u in store.users.values()
-        if u.get("role") == "cobrador" and u.get("account_status") == ACCOUNT_PENDING
-    )
+    tenant_ids = {a.get("id") for a in admins if a.get("id") is not None}
+    total_clients = sum(1 for c in store.clients.values() if c.get("organization_id") in tenant_ids)
+    total_loans = sum(1 for L in store.loans.values() if L.get("organization_id") in tenant_ids)
 
-    # Estadísticas globales (básicas).
-    total_loans = len(store.loans)
-    total_clients = len(store.clients)
-    total_payments_ok = sum(1 for p in store.payments.values() if (p.get("status") or "OK") != "ANULADO")
-    global_bank = 0.0
-    for a in admins:
-        org_id = a.get("organization_id")
-        if org_id is not None:
-            global_bank += float(get_bank_available(org_id) or 0)
-    global_bank = round(global_bank, 2)
+    def esc(x):
+        return html.escape(str(x or "—"))
 
+    def status_badge(status):
+        status = status or ACCOUNT_ACTIVE
+        if status == ACCOUNT_ACTIVE:
+            return '<span class="sa-badge sa-ok">activo</span>'
+        if status == ACCOUNT_PENDING:
+            return '<span class="sa-badge sa-warn">pendiente</span>'
+        if status == ACCOUNT_SUSPENDED:
+            return '<span class="sa-badge sa-bad">suspendido</span>'
+        return f'<span class="sa-badge">{esc(status)}</span>'
+
+    def role_badge(role):
+        role = (role or "").strip().lower()
+        if role == "admin":
+            return '<span class="sa-pill sa-ink">admin</span>'
+        if role == "cobrador":
+            return '<span class="sa-pill sa-amber">cobrador</span>'
+        return f'<span class="sa-pill sa-muted">{esc(role)}</span>'
+
+    # Tabla de admins (tenants)
     admin_rows = ""
     for a in admins:
         aid = a.get("id")
         status = a.get("account_status", ACCOUNT_ACTIVE)
         sub_end = a.get("subscription_end")
-        expired = bool(sub_end and now > sub_end)
         pending_c = sum(
-            1 for u in store.users.values()
-            if u.get("role") == "cobrador" and u.get("organization_id") == aid and u.get("account_status") == ACCOUNT_PENDING
+            1
+            for u in store.users.values()
+            if u.get("role") == "cobrador"
+            and u.get("organization_id") == aid
+            and u.get("account_status") == ACCOUNT_PENDING
         )
         users_total = sum(1 for u in store.users.values() if u.get("organization_id") == aid)
         clients_total = sum(1 for c in store.clients.values() if c.get("organization_id") == aid)
@@ -2541,37 +2682,36 @@ def super_admin_panel():
 
         actions = ""
         if status == ACCOUNT_PENDING:
-            actions += (
+            actions = (
                 f"<form method='post' action='{url_for('super_admin_panel')}' style='display:inline'>"
                 f"<input type='hidden' name='action' value='approve_admin'>"
                 f"<input type='hidden' name='target_id' value='{aid}'>"
-                f"<button class='btn btn-primary' type='submit'>Aprobar admin</button>"
-                f"</form> "
+                f"<button class='sa-btn sa-btn-primary' type='submit'>Aprobar</button>"
+                f"</form>"
             )
-
-        if status == ACCOUNT_ACTIVE:
-            actions += (
+        elif status == ACCOUNT_ACTIVE:
+            actions = (
                 f"<form method='post' action='{url_for('super_admin_panel')}' style='display:inline'>"
                 f"<input type='hidden' name='action' value='toggle_admin'>"
                 f"<input type='hidden' name='target_id' value='{aid}'>"
                 f"<input type='hidden' name='new_status' value='{ACCOUNT_SUSPENDED}'>"
-                f"<button class='btn btn-secondary' type='submit'>Suspender</button>"
-                f"</form> "
+                f"<button class='sa-btn sa-btn-danger' type='submit'>Suspender</button>"
+                f"</form>"
             )
         else:
-            actions += (
+            actions = (
                 f"<form method='post' action='{url_for('super_admin_panel')}' style='display:inline'>"
                 f"<input type='hidden' name='action' value='toggle_admin'>"
                 f"<input type='hidden' name='target_id' value='{aid}'>"
                 f"<input type='hidden' name='new_status' value='{ACCOUNT_ACTIVE}'>"
-                f"<button class='btn btn-primary' type='submit'>Activar</button>"
-                f"</form> "
+                f"<button class='sa-btn sa-btn-primary' type='submit'>Activar</button>"
+                f"</form>"
             )
 
         admin_rows += (
             "<tr>"
-            f"<td>{html.escape(str(a.get('username')))}</td>"
-            f"<td>{status}{' (vencido)' if expired else ''}</td>"
+            f"<td>{esc(a.get('username'))}</td>"
+            f"<td>{status_badge(status)}</td>"
             f"<td>{fmt_sub_end(sub_end)}</td>"
             f"<td style='text-align:right'>{users_total}</td>"
             f"<td style='text-align:right'>{clients_total}</td>"
@@ -2581,97 +2721,391 @@ def super_admin_panel():
             "</tr>"
         )
 
-    pending_cob_rows = ""
-    pending_cob = [u for u in store.users.values() if u.get("role") == "cobrador" and u.get("account_status") == ACCOUNT_PENDING]
-    pending_cob.sort(key=lambda u: u.get("created_at") or datetime.min, reverse=True)
-    for u in pending_cob[:120]:
-        tid = u.get("organization_id")
-        tname = store.users.get(tid, {}).get("username") or f"Admin #{tid}"
-        pending_cob_rows += (
-            "<tr>"
-            f"<td>{html.escape(u.get('username') or '—')}</td>"
-            f"<td>{html.escape(tname)}</td>"
-            f"<td>{u.get('phone') or '—'}</td>"
-            f"<td>{u.get('created_at')}</td>"
-            f"<td>"
-            f"<form method='post' action='{url_for('super_admin_panel')}' style='display:inline'>"
-            f"<input type='hidden' name='action' value='approve_cobrador'>"
-            f"<input type='hidden' name='target_id' value='{u.get('id')}'>"
-            f"<button class='btn btn-primary' type='submit'>Aprobar</button>"
-            f"</form>"
-            "</td>"
-            "</tr>"
-        )
-
-    # Lista global de usuarios por tenant (para que el super admin vea todo).
-    users_rows = ""
-    tenant_ids = {a.get("id") for a in admins}
-    all_users = [u for u in store.users.values() if u.get("role") != "super_admin" and u.get("organization_id") in tenant_ids]
+    # Tabla global de usuarios (admins + cobradores)
+    all_users = [u for u in store.users.values() if u.get("role") in ("admin", "cobrador") and u.get("organization_id") in tenant_ids]
     all_users.sort(key=lambda u: u.get("created_at") or datetime.min, reverse=True)
-    for u in all_users[:220]:
+    users_rows = ""
+    for u in all_users[:280]:
         tid = u.get("organization_id")
         tname = store.users.get(tid, {}).get("username") or f"Admin #{tid}"
         users_rows += (
             "<tr>"
-            f"<td>{html.escape(tname)}</td>"
-            f"<td>{html.escape(u.get('username') or '—')}</td>"
-            f"<td>{html.escape(u.get('role') or '—')}</td>"
-            f"<td>{u.get('account_status', ACCOUNT_ACTIVE)}</td>"
-            f"<td>{u.get('phone') or '—'}</td>"
-            f"<td>{u.get('created_at')}</td>"
+            f"<td>{esc(tname)}</td>"
+            f"<td>{esc(u.get('username'))}</td>"
+            f"<td>{role_badge(u.get('role'))}</td>"
+            f"<td>{status_badge(u.get('account_status', ACCOUNT_ACTIVE))}</td>"
+            f"<td>{esc(u.get('phone') or '—')}</td>"
+            f"<td>{esc(u.get('created_at'))}</td>"
             "</tr>"
         )
 
+    # Sección de cobradores por admin (tenant)
+    collectors_by_admin_html = ""
+    for a in admins:
+        aid = a.get("id")
+        a_name = a.get("username") or f"Admin #{aid}"
+        collectors = [
+            u
+            for u in store.users.values()
+            if u.get("role") == "cobrador" and u.get("organization_id") == aid
+        ]
+        collectors.sort(key=lambda u: u.get("created_at") or datetime.min, reverse=True)
+        if not collectors:
+            continue
+
+        rows = ""
+        for c in collectors[:200]:
+            c_status = c.get("account_status", ACCOUNT_PENDING)
+            actions = ""
+            if c_status == ACCOUNT_PENDING:
+                actions = (
+                    f"<form method='post' action='{url_for('super_admin_panel')}' style='display:inline'>"
+                    f"<input type='hidden' name='action' value='approve_cobrador'>"
+                    f"<input type='hidden' name='target_id' value='{c.get('id')}'>"
+                    f"<button class='sa-btn sa-btn-primary' type='submit'>Aprobar</button>"
+                    f"</form>"
+                )
+            elif c_status == ACCOUNT_ACTIVE:
+                actions = (
+                    f"<form method='post' action='{url_for('super_admin_panel')}' style='display:inline'>"
+                    f"<input type='hidden' name='action' value='toggle_cobrador'>"
+                    f"<input type='hidden' name='target_id' value='{c.get('id')}'>"
+                    f"<input type='hidden' name='new_status' value='{ACCOUNT_SUSPENDED}'>"
+                    f"<button class='sa-btn sa-btn-danger' type='submit'>Suspender</button>"
+                    f"</form>"
+                )
+            else:
+                actions = (
+                    f"<form method='post' action='{url_for('super_admin_panel')}' style='display:inline'>"
+                    f"<input type='hidden' name='action' value='toggle_cobrador'>"
+                    f"<input type='hidden' name='target_id' value='{c.get('id')}'>"
+                    f"<input type='hidden' name='new_status' value='{ACCOUNT_ACTIVE}'>"
+                    f"<button class='sa-btn sa-btn-primary' type='submit'>Activar</button>"
+                    f"</form>"
+                )
+
+            rows += (
+                "<tr>"
+                f"<td>{esc(c.get('username'))}</td>"
+                f"<td>{status_badge(c_status)}</td>"
+                f"<td>{esc(a_name)}</td>"
+                f"<td>{esc(c.get('phone') or '—')}</td>"
+                f"<td>{esc(c.get('created_at'))}</td>"
+                f"<td>{actions}</td>"
+                "</tr>"
+            )
+
+        collectors_by_admin_html += (
+            f'<div class="sa-card sa-section">'
+            f'<div class="sa-section-head"><div><h3 class="sa-h3">Cobradores de {esc(a_name)}</h3><p class="sa-sub">Control por estado y acceso</p></div></div>'
+            f'<div class="table-scroll"><table><tr><th>Cobrador</th><th>Estado</th><th>Admin</th><th>Tel</th><th>Fecha reg.</th><th></th></tr>{rows}</table></div>'
+            f'</div>'
+        )
+
+    expired_admins = stats.get("alerts", {}).get("expired_admins", [])
+    soon_admins = stats.get("alerts", {}).get("soon_admins", [])
+    pending_collectors_count = stats.get("alerts", {}).get("pending_collectors_count", 0)
+    expired_list = ", ".join(esc(a.get("username")) for a in expired_admins) if expired_admins else "Sin admins vencidos"
+    soon_list = ", ".join(esc(a.get("username")) for a in soon_admins) if soon_admins else "Nadie próximo a vencer"
+
+    initial_json = json.dumps(stats)
+    stats_url = url_for("super_admin_stats")
+    charts_js = """
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script>
+const statsUrl = "STATS_URL";
+const initialData = INITIAL_DATA;
+
+let incomeChart = null;
+let prestadoChart = null;
+
+function money(v){
+  const n = Number(v || 0);
+  return 'RD$ ' + n.toLocaleString('es-DO', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+function buildCharts(){
+  const incomeCtx = document.getElementById('chartIncome');
+  const prestCtx = document.getElementById('chartPrestadoCobrado');
+
+  incomeChart = new Chart(incomeCtx, {
+    type: 'line',
+    data: {
+      labels: initialData.labels || [],
+      datasets: [{
+        label: 'Ingresos (intereses cobrados)',
+        data: initialData.income_series || [],
+        borderColor: 'rgba(99,102,241,1)',
+        backgroundColor: 'rgba(99,102,241,.2)',
+        tension: 0.35,
+        fill: true,
+        pointRadius: 2
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { legend: { display: true } },
+      scales: { y: { beginAtZero: true } }
+    }
+  });
+
+  prestadoChart = new Chart(prestCtx, {
+    type: 'bar',
+    data: {
+      labels: ['Prestado (capital)', 'Cobrado (capital)'],
+      datasets: [{
+        label: 'Capital',
+        data: [initialData.borrowed_total || 0, initialData.collected_capital_total || 0],
+        backgroundColor: ['rgba(16,185,129,.75)','rgba(59,130,246,.75)'],
+        borderColor: ['rgba(16,185,129,1)','rgba(59,130,246,1)'],
+        borderWidth: 1
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: { y: { beginAtZero: true } }
+    }
+  });
+}
+
+function updateFrom(data){
+  document.getElementById('gainMonthly').textContent = money(data.interest_month);
+  document.getElementById('gainGlobal').textContent = money(data.interest_total);
+  document.getElementById('prestadoTotal').textContent = money(data.borrowed_total);
+  document.getElementById('cobradoTotal').textContent = money(data.collected_capital_total);
+
+  if (incomeChart && data.labels && data.income_series){
+    incomeChart.data.labels = data.labels;
+    incomeChart.data.datasets[0].data = data.income_series;
+    incomeChart.update();
+  }
+  if (prestadoChart && data.borrowed_total != null){
+    prestadoChart.data.datasets[0].data = [data.borrowed_total || 0, data.collected_capital_total || 0];
+    prestadoChart.update();
+  }
+
+  const alerts = data.alerts || {};
+  document.getElementById('alertExpiredCount').textContent = alerts.expired_admins_count || 0;
+  document.getElementById('alertSoonCount').textContent = alerts.soon_admins_count || 0;
+  document.getElementById('alertPendingCollectorsCount').textContent = alerts.pending_collectors_count || 0;
+}
+
+async function refreshStats(){
+  try{
+    const r = await fetch(statsUrl, { credentials: 'same-origin', cache: 'no-store' });
+    if(!r.ok) return;
+    const data = await r.json();
+    updateFrom(data);
+  } catch(e){}
+}
+
+window.addEventListener('load', () => {
+  buildCharts();
+  updateFrom(initialData);
+  refreshStats();
+  setInterval(refreshStats, 8000);
+});
+</script>
+"""
+    charts_js = charts_js.replace("STATS_URL", stats_url).replace("INITIAL_DATA", initial_json)
+
+    sa_css = """
+    .sa-wrap .sa-top{
+      background: linear-gradient(135deg, rgba(22,163,74,.18), rgba(59,130,246,.14));
+      border: 1px solid rgba(16,185,129,.20);
+      padding: 16px;
+      border-radius: 18px;
+      margin-bottom: 14px;
+    }
+    .sa-top h2{ margin:0; font-size: 20px; font-weight: 900; color:#14532d; letter-spacing:-.01em;}
+    .sa-top p{ margin:6px 0 0 0; opacity:.9;}
+
+    .sa-grid-2{ display:grid; grid-template-columns: 1.15fr .85fr; gap: 14px; align-items:start; }
+    .sa-grid-3{ display:grid; grid-template-columns: repeat(3,1fr); gap: 12px; }
+    .sa-metric{ background: rgba(255,255,255,.92); border:1px solid rgba(148,163,184,.25); border-radius: 16px; padding: 12px; box-shadow: 0 10px 26px rgba(0,0,0,.06); }
+    .sa-metric .k{ font-size: 12px; opacity:.75; margin-bottom: 6px; }
+    .sa-metric .v{ font-size: 20px; font-weight: 950; color:#0f172a; }
+
+    .sa-card{
+      background: rgba(255,255,255,.95);
+      border: 1px solid rgba(148,163,184,.25);
+      border-radius: 18px;
+      box-shadow: 0 10px 28px rgba(0,0,0,.06);
+      overflow:hidden;
+    }
+    .sa-section{ padding: 14px; margin-bottom: 14px; }
+    .sa-section-head{ display:flex; align-items:flex-start; justify-content:space-between; gap: 12px; margin-bottom: 12px; }
+    .sa-h3{ margin:0; font-size: 15px; font-weight: 900; color:#0f766e; }
+    .sa-sub{ margin:6px 0 0 0; font-size: 12px; opacity:.78; }
+
+    .sa-badge{
+      display:inline-block; padding: 4px 10px; border-radius: 999px; font-weight: 800; font-size: 12px;
+      border: 1px solid rgba(148,163,184,.3);
+      background: rgba(148,163,184,.10);
+      color:#111827;
+      white-space:nowrap;
+    }
+    .sa-ok{ background: rgba(34,197,94,.15); border-color: rgba(34,197,94,.35); color: #166534; }
+    .sa-warn{ background: rgba(245,158,11,.18); border-color: rgba(245,158,11,.35); color: #92400e; }
+    .sa-bad{ background: rgba(239,68,68,.14); border-color: rgba(239,68,68,.35); color: #b91c1c; }
+
+    .sa-pill{
+      display:inline-block; padding: 4px 10px; border-radius: 999px; font-weight: 900; font-size: 12px;
+      border: 1px solid rgba(148,163,184,.25);
+      background: rgba(148,163,184,.08);
+      color:#111827;
+      white-space:nowrap;
+    }
+    .sa-ink{ background: rgba(59,130,246,.12); border-color: rgba(59,130,246,.28); color:#1d4ed8; }
+    .sa-amber{ background: rgba(245,158,11,.14); border-color: rgba(245,158,11,.30); color:#b45309; }
+    .sa-muted{ background: rgba(148,163,184,.12); border-color: rgba(148,163,184,.25); color:#334155; }
+
+    .sa-btn{
+      padding: 8px 12px; border-radius: 12px; font-weight: 900; border: 1px solid rgba(0,0,0,.08);
+      cursor:pointer; display:inline-block; font-size: 13px; text-decoration:none;
+    }
+    .sa-btn-primary{ background: #16a34a; border-color: rgba(22,163,74,.65); color:#fff; }
+    .sa-btn-danger{ background: #ef4444; border-color: rgba(239,68,68,.65); color:#fff; }
+    .sa-btn-ghost{ background: rgba(148,163,184,.10); border-color: rgba(148,163,184,.25); color:#0f172a; }
+
+    .sa-table table{ width:100%; border-collapse:collapse; font-size: 13px; }
+    .sa-table th{ background: rgba(236,253,245,.9); padding: 10px; text-align:left; font-weight: 950; color:#064e3b; border-bottom: 1px solid rgba(148,163,184,.25);}
+    .sa-table td{ padding: 10px; border-bottom: 1px solid rgba(148,163,184,.18); vertical-align: middle; }
+    .sa-charts{ display:grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 14px; }
+    .sa-chart-card{ padding: 14px; }
+    .sa-chart-wrap{ height: 280px; position: relative; }
+
+    .sa-alerts{ display:grid; grid-template-columns: repeat(3,1fr); gap: 12px; margin-top: 12px; }
+    .sa-alert-item{ padding: 12px; border-radius: 16px; border:1px solid rgba(148,163,184,.25); background: rgba(255,255,255,.9); box-shadow: 0 10px 24px rgba(0,0,0,.04); }
+    .sa-alert-item .t{ font-size: 12px; opacity:.78; }
+    .sa-alert-item .n{ font-size: 22px; font-weight: 1000; margin-top: 4px; }
+    .sa-alert-item .d{ font-size: 12px; opacity:.82; margin-top: 6px; }
+
+    @media(max-width: 980px){
+      .sa-grid-2{ grid-template-columns: 1fr; }
+      .sa-charts{ grid-template-columns: 1fr; }
+      .sa-alerts{ grid-template-columns: 1fr; }
+      .sa-grid-3{ grid-template-columns: 1fr; }
+    }
+    """
+
     body = f"""
-<div class="card" style="padding:16px;background:#ecfdf5;border:1px solid rgba(22,163,74,.2);">
-  <h2 style="margin:0 0 10px 0;color:#14532d;">🛡️ Panel Super Admin</h2>
-  <p style="margin:0 0 14px 0;opacity:.9;">
-    Total admins: <b>{total_admins}</b> · pendientes: <b>{pending_admins}</b> · suspendidos: <b>{suspended_admins}</b> · cobradores pendientes: <b>{pending_cobradores}</b>
-  </p>
+<div class="sa-wrap">
+  <style>{sa_css}</style>
 
-  <div class="table-scroll">
-    <table>
-      <tr>
-        <th>Admin</th><th>Estado</th><th>Expira</th><th>Usuarios</th><th>Clientes</th><th>Préstamos</th><th>Cobradores pendientes</th><th>Acciones</th>
-      </tr>
-      {admin_rows or "<tr><td colspan='8' style='text-align:center;opacity:.85'>Sin admins</td></tr>"}
-    </table>
-  </div>
-
-  <div style="margin-top:18px;">
-    <h3 style="margin:0 0 10px 0;color:#14532d;">Lista de usuarios por admin (vista global)</h3>
-    <div class="table-scroll">
-      <table>
-        <tr><th>Tenant (admin)</th><th>Usuario</th><th>Rol</th><th>Estado</th><th>Tel</th><th>Fecha reg.</th></tr>
-        {users_rows or "<tr><td colspan='6' style='text-align:center;opacity:.85'>Sin usuarios</td></tr>"}
-      </table>
+  <div class="sa-top">
+    <h2>🛡️ Panel Super Admin</h2>
+    <p>Control multi-tenant con aprobaciones, suspensión y métricas tipo SaaS (memoria).</p>
+    <div class="sa-alerts">
+      <div class="sa-alert-item">
+        <div class="t">Admins con suscripción vencida</div>
+        <div class="n"><span id="alertExpiredCount">{stats.get('alerts', {}).get('expired_admins_count', 0)}</span></div>
+        <div class="d">{expired_list}</div>
+      </div>
+      <div class="sa-alert-item">
+        <div class="t">Admins próximos a vencer (7 días)</div>
+        <div class="n" style="color:#92400e;"><span id="alertSoonCount">{stats.get('alerts', {}).get('soon_admins_count', 0)}</span></div>
+        <div class="d">{soon_list}</div>
+      </div>
+      <div class="sa-alert-item">
+        <div class="t">Cobradores pendientes de aprobación</div>
+        <div class="n" style="color:#1d4ed8;"><span id="alertPendingCollectorsCount">{pending_collectors_count}</span></div>
+        <div class="d">Aprobación manual requerida antes de iniciar sesión.</div>
+      </div>
     </div>
   </div>
 
-  <div style="margin-top:18px;">
-    <h3 style="margin:0 0 10px 0;color:#14532d;">Aprobar cobradores pendientes</h3>
-    <div class="table-scroll">
-      <table>
-        <tr><th>Cobrador</th><th>Admin tenant</th><th>Tel</th><th>Fecha reg.</th><th></th></tr>
-        {pending_cob_rows or "<tr><td colspan='5' style='text-align:center;opacity:.85'>No hay cobradores pendientes</td></tr>"}
-      </table>
+  <div class="sa-grid-3">
+    <div class="sa-metric">
+      <div class="k">Ganancia mensual (intereses cobrados)</div>
+      <div class="v" id="gainMonthly">{fmt_money(stats.get('interest_month', 0))}</div>
+    </div>
+    <div class="sa-metric">
+      <div class="k">Ganancia global</div>
+      <div class="v" id="gainGlobal">{fmt_money(stats.get('interest_total', 0))}</div>
+    </div>
+    <div class="sa-metric">
+      <div class="k">Prestado vs cobrado (capital)</div>
+      <div class="v">{total_loans} préstamos · {total_clients} clientes</div>
     </div>
   </div>
 
-  <div style="margin-top:18px;opacity:.95;">
-    <h3 style="margin:0 0 10px 0;color:#14532d;">Estadísticas globales</h3>
-    <ul style="margin:0;padding-left:18px;">
-      <li>Total clientes: <b>{total_clients}</b></li>
-      <li>Total préstamos: <b>{total_loans}</b></li>
-      <li>Total pagos (no anulados): <b>{total_payments_ok}</b></li>
-      <li>Suma banco (por tenant): <b>{fmt_money(global_bank)}</b></li>
-    </ul>
+  <div class="sa-charts">
+    <div class="sa-card sa-chart-card">
+      <div class="sa-section-head">
+        <div>
+          <h3 class="sa-h3">Ingresos globales (últimos 14 días)</h3>
+          <p class="sa-sub">Intereses cobrados por fecha de pago.</p>
+        </div>
+      </div>
+      <div class="sa-chart-wrap"><canvas id="chartIncome"></canvas></div>
+    </div>
+    <div class="sa-card sa-chart-card">
+      <div class="sa-section-head">
+        <div>
+          <h3 class="sa-h3">Dinero prestado vs cobrado</h3>
+          <p class="sa-sub">Capital total acumulado por tenant.</p>
+        </div>
+      </div>
+      <div style="display:flex;gap:12px;align-items:flex-end;margin-bottom:10px;flex-wrap:wrap">
+        <div style="font-size:12px;opacity:.78">Prestado: <b id="prestadoTotal">{fmt_money(stats.get('borrowed_total', 0))}</b></div>
+        <div style="font-size:12px;opacity:.78">Cobrado: <b id="cobradoTotal">{fmt_money(stats.get('collected_capital_total', 0))}</b></div>
+      </div>
+      <div class="sa-chart-wrap"><canvas id="chartPrestadoCobrado"></canvas></div>
+    </div>
   </div>
+
+  <div class="sa-grid-2">
+    <div class="sa-card sa-section sa-table">
+      <div class="sa-section-head">
+        <div>
+          <h3 class="sa-h3">Tabla de admins (tenants)</h3>
+          <p class="sa-sub">Activación, suspensión y aprobación.</p>
+        </div>
+      </div>
+      <div class="table-scroll">
+        <table>
+          <tr>
+            <th>Admin</th><th>Estado</th><th>Expira</th><th style="text-align:right">Usuarios</th><th style="text-align:right">Clientes</th><th style="text-align:right">Préstamos</th><th style="text-align:right">Pend. cobradores</th><th></th>
+          </tr>
+          {admin_rows or "<tr><td colspan='8' style='text-align:center;opacity:.85'>Sin admins</td></tr>"}
+        </table>
+      </div>
+    </div>
+
+    <div class="sa-card sa-section sa-table">
+      <div class="sa-section-head">
+        <div>
+          <h3 class="sa-h3">Tabla de usuarios</h3>
+          <p class="sa-sub">Vista global por tenant (admin/cobrador).</p>
+        </div>
+      </div>
+      <div class="table-scroll">
+        <table>
+          <tr><th>Tenant</th><th>Usuario</th><th>Rol</th><th>Estado</th><th>Tel</th><th>Fecha</th></tr>
+          {users_rows or "<tr><td colspan='6' style='text-align:center;opacity:.85'>Sin usuarios</td></tr>"}
+        </table>
+      </div>
+    </div>
+  </div>
+
+  {collectors_by_admin_html or "<div class='sa-card sa-section'><h3 class='sa-h3'>Cobradores</h3><p class='sa-sub'>No hay cobradores aún.</p></div>"}
 
   {nav_subfooter()}
+  {charts_js}
 </div>
 """
     return page(body)
+
+
+@app.route("/super-admin/stats")
+@login_required
+@super_admin_required
+def super_admin_stats():
+    return jsonify(compute_super_admin_stats())
 
 
 @app.route("/reportes", methods=["GET", "POST"])
