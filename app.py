@@ -1415,13 +1415,61 @@ def client_detail(client_id):
     org_id = session.get("org_id")
     sd = calc_client_score(client_id, org_id)
     mx = calc_max_credito(sd["prestamos_pagados"], sd["score"])
+    score = int(sd.get("score") or 0)
+    nivel = sd.get("nivel") or "—"
+    nivel_letter = (str(nivel).split("—", 1)[0] or "—").strip()
+    if score >= 80:
+        score_color = "#16a34a"
+        score_label_color = "#16a34a"
+    elif score >= 60:
+        score_color = "#fbbf24"
+        score_label_color = "#a16207"
+    else:
+        score_color = "#ef4444"
+        score_label_color = "#dc2626"
+
     score_html = (
-        f'<div class="card" style="margin-bottom:12px;">'
-        f'<h3 style="margin-top:0;margin-bottom:8px">🔎 Score de crédito</h3>'
-        f'<p style="margin:0;"><b>Score:</b> {sd["score"]} &nbsp; <b>Nivel:</b> {sd["nivel"]}</p>'
-        f'<p style="margin:6px 0 0 0;"><b>Préstamos pagados:</b> {sd["prestamos_pagados"]} &nbsp; <b>Atrasos:</b> {sd["atrasos"]}</p>'
-        f'<p style="margin:10px 0 0 0;"><b>Crédito recomendado:</b> {fmt_money(mx)}</p>'
-        f'</div>'
+        f"""
+        <div class="client-card client-score" data-animate="1">
+          <div class="client-score-head">
+            <div class="client-score-ico" aria-hidden="true">
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 2v4"/>
+                <path d="M12 18v4"/>
+                <path d="M4.93 4.93l2.83 2.83"/>
+                <path d="M16.24 16.24l2.83 2.83"/>
+                <path d="M2 12h4"/>
+                <path d="M18 12h4"/>
+                <path d="M4.93 19.07l2.83-2.83"/>
+                <path d="M16.24 7.76l2.83-2.83"/>
+                <circle cx="12" cy="12" r="3"/>
+              </svg>
+            </div>
+            <div class="client-score-headtxt">
+              <div class="client-score-title">Score de crédito</div>
+              <div class="client-score-levelwrap">
+                <span class="level-pill" style="color:{score_label_color}; border-color: rgba(148,163,184,.35);">{nivel_letter}</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="client-score-metric">
+            <div class="client-score-score" style="color:{score_label_color};">{score}</div>
+            <div class="client-score-nivel">{html.escape(str(nivel))}</div>
+          </div>
+
+          <div class="client-progress" role="progressbar" aria-valuenow="{score}" aria-valuemin="0" aria-valuemax="100">
+            <div class="client-progress-fill" style="width:{score}%; background:{score_color};"></div>
+          </div>
+
+          <div class="client-score-substats">
+            <div><b>Pagados:</b> {sd.get("prestamos_pagados")}</div>
+            <div><b>Atrasos:</b> {sd.get("atrasos")}</div>
+          </div>
+
+          <div class="client-score-reco"><b>Crédito recomendado:</b> {fmt_money(mx)}</div>
+        </div>
+        """
     )
     loans = [L for L in store.loans.values() if L.get("client_id") == client_id]
 
@@ -1441,22 +1489,51 @@ def client_detail(client_id):
         upfront_pct = float(L.get("upfront_percent") or 0.0)
         inicio = fmt_date_ddmmyyyy(L.get("start_date"))
 
+        term_count_l = int(L.get("term_count") or 1)
+        cuota_count = count_loan_cuota_payments(L.get("id"))
+        loan_is_closed = cuota_count >= term_count_l
+        status_badge = (
+            "<span class='status-badge status-closed'>Cerrado</span>"
+            if loan_is_closed
+            else "<span class='status-badge status-active'>Activo</span>"
+        )
+
         del_form = (
             f"<form method='post' action='{url_for('delete_loan', loan_id=L['id'])}' "
             f"style='margin:0' onsubmit=\"return confirm('¿Eliminar préstamo #{L['id']}?');\">"
-            f"<button class='btn btn-secondary' type='submit' style='padding:6px 10px'>Eliminar</button>"
+            f"<button class='btn btn-danger btn-action' type='submit'>"
+            f"<span class='btn-ic' aria-hidden='true'>"
+            f"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' width='18' height='18' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'>"
+            f"<path d='M3 6h18' /><path d='M8 6V4h8v2' /><path d='M19 6l-1 14H6L5 6' />"
+            f"</svg>"
+            f"</span>Eliminar</button>"
             f"</form>"
         )
 
         if can_admin:
             actions = (
-                f"<a class='btn btn-secondary' style='padding:6px 10px' href='{url_for('loan_detail', loan_id=L['id'])}'>Ver</a> "
-                f"<a class='btn btn-primary' style='padding:6px 10px' href='{url_for('edit_loan', loan_id=L['id'])}'>Editar</a> "
+                f"<a class='btn btn-secondary btn-action' href='{url_for('loan_detail', loan_id=L['id'])}'>"
+                f"<span class='btn-ic' aria-hidden='true'>"
+                f"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' width='18' height='18' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'>"
+                f"<path d='M2 12s4-8 10-8 10 8 10 8-4 8-10 8S2 12 2 12z' /><circle cx='12' cy='12' r='3' />"
+                f"</svg>"
+                f"</span>Ver</a> "
+                f"<a class='btn btn-primary btn-action' href='{url_for('edit_loan', loan_id=L['id'])}'>"
+                f"<span class='btn-ic' aria-hidden='true'>"
+                f"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' width='18' height='18' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'>"
+                f"<path d='M12 20h9' /><path d='M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z' />"
+                f"</svg>"
+                f"</span>Editar</a> "
                 f"{del_form}"
             )
         else:
             actions = (
-                f"<a class='btn btn-secondary' style='padding:6px 10px' href='{url_for('loan_detail', loan_id=L['id'])}'>Ver</a>"
+                f"<a class='btn btn-secondary btn-action' href='{url_for('loan_detail', loan_id=L['id'])}'>"
+                f"<span class='btn-ic' aria-hidden='true'>"
+                f"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' width='18' height='18' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'>"
+                f"<path d='M2 12s4-8 10-8 10 8 10 8-4 8-10 8S2 12 2 12z' /><circle cx='12' cy='12' r='3' />"
+                f"</svg>"
+                f"</span>Ver</a>"
             )
 
         loan_rows.append(
@@ -1468,7 +1545,7 @@ def client_detail(client_id):
             f"<td>{L.get('frequency') or '—'}</td>"
             f"<td>{inicio}</td>"
             f"<td>{fmt_money(paid_interest)}</td>"
-            f"<td>{L.get('status') or '—'}</td>"
+            f"<td>{status_badge}</td>"
             f"<td>{actions}</td>"
             "</tr>"
         )
@@ -1482,36 +1559,228 @@ def client_detail(client_id):
         if u.get("role") == "cobrador" and u.get("organization_id") == org_id
     )
 
+    style_block = """
+<style>
+  .client-shell{max-width:1040px;margin:0 auto;padding:16px 10px 30px}
+  .client-top-grid{display:grid;gap:14px}
+  @media(min-width:860px){.client-top-grid{grid-template-columns: 1.4fr .9fr; align-items:start}}
+
+  .client-card{
+    background: rgba(255,255,255,.92);
+    border: 1px solid rgba(148,163,184,.35);
+    border-radius: 18px;
+    box-shadow: 0 10px 24px rgba(0,0,0,.06);
+    padding: 16px;
+  }
+  body.theme-dark .client-card{
+    background: rgba(15,23,42,.92);
+    border-color: rgba(148,163,184,.25);
+    box-shadow: 0 14px 34px rgba(0,0,0,.35);
+  }
+
+  [data-animate]{opacity:0;transform: translateY(10px);transition: opacity .35s ease, transform .35s ease}
+  [data-animate].is-visible{opacity:1;transform: translateY(0)}
+
+  .client-hero{display:flex;gap:14px;justify-content:space-between;flex-wrap:wrap;align-items:flex-start}
+  .client-hero-left{display:flex;gap:14px;align-items:center}
+  .client-avatar{
+    width:56px;height:56px;border-radius:16px;
+    background: linear-gradient(135deg, rgba(22,163,74,.95), rgba(99,102,241,.85));
+    color:#fff;font-weight:1000;font-size:22px;
+    display:flex;align-items:center;justify-content:center;
+    box-shadow: 0 12px 26px rgba(22,163,74,.18);
+  }
+  .client-name{font-size:26px;font-weight:1000;line-height:1.15;margin:0 0 6px}
+  .client-lines{display:grid;gap:8px;margin-top:6px}
+  .client-line{display:flex;gap:10px;align-items:flex-start;color:#0f172a}
+  body.theme-dark .client-line{color:#e5e7eb}
+  .client-line .ic{flex:0 0 auto;margin-top:2px;opacity:.9}
+  .client-line .txt{font-size:14px;opacity:.95}
+  .client-actions{display:flex;flex-direction:column;gap:10px;min-width:280px}
+
+  .btn-action{display:inline-flex;align-items:center;gap:8px;padding:8px 12px;border-radius:14px;border:1px solid transparent;transition: transform .12s ease, box-shadow .12s ease, filter .12s ease}
+  .btn-ic{display:inline-flex;align-items:center;justify-content:center;opacity:.95}
+  .btn-action:hover{transform: translateY(-1px);box-shadow: 0 10px 24px rgba(0,0,0,.08);filter: brightness(1.02)}
+  .btn-action:active{transform: translateY(0) scale(.99);box-shadow:none}
+
+  .btn{cursor:pointer}
+  .btn-primary.btn-action{background: rgba(16,185,129,.14); border-color: rgba(16,185,129,.35); color:#047857}
+  body.theme-dark .btn-primary.btn-action{background: rgba(16,185,129,.12); border-color: rgba(16,185,129,.25); color:#34d399}
+  .btn-secondary.btn-action{background: rgba(59,130,246,.12); border-color: rgba(59,130,246,.25); color:#1d4ed8}
+  body.theme-dark .btn-secondary.btn-action{background: rgba(59,130,246,.10); border-color: rgba(59,130,246,.22); color:#60a5fa}
+  .btn-danger.btn-action{background: rgba(239,68,68,.10); border-color: rgba(239,68,68,.30); color:#dc2626}
+  body.theme-dark .btn-danger.btn-action{background: rgba(239,68,68,.08); border-color: rgba(239,68,68,.22); color:#fb7185}
+
+  .client-cta-row{display:flex;justify-content:flex-end;gap:10px;flex-wrap:wrap}
+  .client-move{border-top: 1px solid rgba(148,163,184,.35); padding-top: 10px; margin-top: 8px}
+  body.theme-dark .client-move{border-top-color: rgba(148,163,184,.22)}
+  .client-move label{font-weight:900; margin-right: 6px; opacity:.95}
+  .client-move select{
+    padding: 9px 10px; border-radius: 12px; border: 1px solid rgba(148,163,184,.35);
+    background: rgba(255,255,255,.8); color:#0f172a;
+  }
+  body.theme-dark .client-move select{background: rgba(2,6,23,.55); color:#e5e7eb}
+
+  .client-score{position:relative}
+  .client-score-head{display:flex;gap:12px;align-items:flex-start}
+  .client-score-ico{width:34px;height:34px;border-radius:12px;background: rgba(59,130,246,.12); border:1px solid rgba(59,130,246,.22); display:flex;align-items:center;justify-content:center; color:#1d4ed8}
+  body.theme-dark .client-score-ico{background: rgba(59,130,246,.10); border-color: rgba(59,130,246,.18)}
+  .client-score-title{font-weight:1000}
+  .client-score-ico svg{display:block}
+  .client-score-headtxt{flex:1}
+  .client-score-title{font-weight:1000}
+  .client-score-levelwrap{margin-top:6px}
+  .level-pill{
+    display:inline-flex;align-items:center;justify-content:center;
+    width:30px;height:30px;border-radius: 999px;
+    border:1px solid rgba(148,163,184,.35);
+    background: rgba(255,255,255,.35);
+    font-weight:1000;
+    font-size: 13px;
+  }
+  .client-score-metric{display:flex;align-items:baseline;gap:14px;margin-top:12px}
+  .client-score-score{font-size: 44px; font-weight:1000; line-height:1}
+  .client-score-nivel{font-weight:900; opacity:.9}
+  .client-score-substats{display:flex;justify-content:space-between;gap:10px;margin-top:10px;opacity:.95; font-size:13px}
+  .client-score-reco{margin-top: 10px; padding-top: 10px; border-top:1px solid rgba(148,163,184,.25); font-weight:900; font-size:14px}
+
+  .client-progress{
+    height: 12px;
+    border-radius: 999px;
+    background: rgba(148,163,184,.22);
+    overflow:hidden;
+    margin-top: 14px;
+    border: 1px solid rgba(148,163,184,.25);
+  }
+  .client-progress-fill{height:100%; border-radius: 999px; transition: width .6s ease}
+
+  .status-badge{
+    display:inline-flex;align-items:center;gap:8px;
+    padding: 6px 10px;border-radius: 999px;
+    font-size: 12px; font-weight: 1000;
+    border: 1px solid transparent;
+  }
+  .status-active{background: rgba(16,185,129,.12); color:#047857; border-color: rgba(16,185,129,.30)}
+  .status-closed{background: rgba(59,130,246,.10); color:#1d4ed8; border-color: rgba(59,130,246,.25)}
+  body.theme-dark .status-closed{background: rgba(59,130,246,.08); color:#60a5fa; border-color: rgba(59,130,246,.22)}
+
+  .client-loans{margin-top:14px}
+  .client-loans-head{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:10px}
+  .client-loans-title{font-size:18px;font-weight:1000}
+  .client-table{width:100%;border-collapse:separate;border-spacing:0;font-size:13px}
+  .client-table thead th{
+    text-align:left;padding:10px 10px;
+    border-bottom:2px solid rgba(148,163,184,.25);
+    color: rgba(15,23,42,.92);
+    background: rgba(2,132,199,.06);
+    position: sticky; top: 0;
+  }
+  body.theme-dark .client-table thead th{color: rgba(229,231,235,.95); background: rgba(59,130,246,.08); border-bottom-color: rgba(148,163,184,.18)}
+  .client-table tbody td{padding:12px 10px;border-bottom:1px solid rgba(148,163,184,.18); vertical-align: middle}
+  body.theme-dark .client-table tbody td{border-bottom-color: rgba(148,163,184,.14)}
+
+  .table-scroll{overflow:auto;border-radius:14px}
+  .fade-soft{animation: fadeSoft .35s ease both}
+  @keyframes fadeSoft{from{opacity:.0; transform: translateY(6px)} to{opacity:1; transform: translateY(0)}}
+</style>
+"""
+
+    full_name = f"{c.get('first_name') or ''} {c.get('last_name') or ''}".strip() or f"Cliente #{client_id}"
+    avatar_letter = (c.get("first_name") or full_name[:1] or "?").strip()[:1].upper()
+
     header = (
-        f'<div class="card" style="margin-bottom:12px;">'
-        f'<h2 style="margin-top:0;margin-bottom:10px">{c["first_name"]} {c.get("last_name") or ""}</h2>'
-        f"<p style='margin:6px 0;'><b>Tel:</b> {c.get('phone') or '—'}</p>"
-        f"<p style='margin:6px 0;'><b>Dirección:</b> {c.get('address') or '—'}</p>"
-        f"<p style='margin:6px 0;'><b>Documento:</b> {c.get('document_id') or '—'}</p>"
-        f"<p style='margin:6px 0;'><b>Ruta:</b> {c.get('route') or '—'}</p>"
-        f'<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;margin-bottom:10px;">'
-        f'<a class="btn btn-secondary" href="{url_for("edit_client", client_id=client_id)}">Editar</a> '
-        f'<form method="post" action="{url_for("delete_client", client_id=client_id)}" style="margin:0" onsubmit="return confirm(\'¿Borrar cliente?\');">'
-        f'<button class="btn btn-secondary" type="submit">Eliminar</button></form>'
-        f"</div>"
-        f"<div style='border-top:1px solid rgba(148,163,184,.35); padding-top:10px;'>"
-        f"<form method='post' action='{url_for('reassign_single_client', client_id=client_id)}' style='display:flex;gap:8px;flex-wrap:wrap;align-items:center;'>"
-        f"<label style='margin:0;'><b>Reasignar cobrador:</b></label>"
-        f"<select name='collector_id'>{collectors_opts}</select>"
-        f"<button class='btn btn-primary' type='submit'>Mover cliente</button>"
-        f"</form>"
-        f"</div>"
-        f"</div>"
+        f"""
+        <div class="client-hero client-card data-animate" data-animate="1">
+          <div class="client-hero-left">
+            <div class="client-avatar" aria-hidden="true">{html.escape(avatar_letter)}</div>
+            <div>
+              <div class="client-name">{html.escape(full_name)}</div>
+              <div class="client-lines">
+                <div class="client-line"><span class="ic" aria-hidden="true">
+                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 16.92v3a2 2 0 0 1-2.18 2A19.8 19.8 0 0 1 3 5.18 2 2 0 0 1 5.11 3h3a2 2 0 0 1 2 1.72c.12.86.31 1.7.57 2.5a2 2 0 0 1-.45 2.11L9.09 10.91a16 16 0 0 0 4 4l1.58-1.12a2 2 0 0 1 2.11-.45c.8.26 1.64.45 2.5.57A2 2 0 0 1 22 16.92z"/></svg>
+                </span><span class="txt"><b>Tel:</b> {html.escape(str(c.get('phone') or '—'))}</span></div>
+                <div class="client-line"><span class="ic" aria-hidden="true">
+                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 21s-7-4.35-7-11a7 7 0 0 1 14 0c0 6.65-7 11-7 11z"/><circle cx="12" cy="10" r="2"/></svg>
+                </span><span class="txt"><b>Dirección:</b> {html.escape(str(c.get('address') or '—'))}</span></div>
+                <div class="client-line"><span class="ic" aria-hidden="true">
+                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15V3a2 2 0 0 0-2-2H7a2 2 0 0 0-2 2v18a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2z"/><path d="M3 15h18"/><path d="M8 7h5"/><path d="M8 11h7"/></svg>
+                </span><span class="txt"><b>Documento:</b> {html.escape(str(c.get('document_id') or '—'))}</span></div>
+                <div class="client-line"><span class="ic" aria-hidden="true">
+                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 17l6-6 4 4 8-8"/><path d="M14 5h7v7"/></svg>
+                </span><span class="txt"><b>Ruta:</b> {html.escape(str(c.get('route') or '—'))}</span></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="client-actions">
+            <div class="client-cta-row">
+              <a class="btn btn-secondary btn-action" href="{url_for("edit_client", client_id=client_id)}">
+                <span class="btn-ic" aria-hidden="true">
+                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z"/></svg>
+                </span>Editar</a>
+              <form method="post" action="{url_for("delete_client", client_id=client_id)}" style="margin:0" onsubmit="return confirm('¿Borrar cliente?');">
+                <button class="btn btn-danger btn-action" type="submit">
+                  <span class="btn-ic" aria-hidden="true">
+                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/></svg>
+                  </span>Eliminar</button>
+              </form>
+            </div>
+
+            <div class="client-move">
+              <form method="post" action="{url_for('reassign_single_client', client_id=client_id)}" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;">
+                <label>Reasignar cobrador:</label>
+                <select name="collector_id">{collectors_opts}</select>
+                <button class="btn btn-primary btn-action" type="submit">
+                  <span class="btn-ic" aria-hidden="true">
+                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11H3"/><path d="M4 11l7-7"/><path d="M4 11l7 7"/></svg>
+                  </span>Mover cliente</button>
+              </form>
+            </div>
+          </div>
+        </div>
+        """
+    )
+
+    new_loan_href = url_for("new_loan") + "?client_id=" + str(client_id)
+    toggle_href = url_for("toggle_theme")
+    theme_now = get_theme()
+    toggle_label = "Claro" if theme_now == "dark" else "Oscuro"
+    script_block = (
+        "<script>"
+        "document.addEventListener('DOMContentLoaded', () => "
+        "document.querySelectorAll('[data-animate]').forEach(el => el.classList.add('is-visible'))"
+        ");"
+        "</script>"
     )
 
     body = (
-        header
+        style_block
+        + "<div class=\"client-shell\">"
+        + "<div class=\"client-top-grid\">"
+        + header
         + score_html
-        + f'<div class="card">'
-        f'<a class="btn btn-primary" href="{url_for("new_loan")}?client_id={client_id}">Nuevo préstamo</a>'
-        f'<div class="table-scroll" style="margin-top:12px;">'
-        f"<table><tr><th>ID</th><th>Monto</th><th>Restante</th><th>%</th><th>Frecuencia</th><th>Inicio</th><th>Interés pagado</th><th>Estado</th><th>Acciones</th></tr>{lr}</table>"
-        f"</div></div>"
+        + "</div>"
+        + "<div class=\"client-card client-loans data-animate\" data-animate=\"1\">"
+        + "<div class=\"client-loans-head\">"
+        + "<div><div class=\"client-loans-title\">Préstamos del cliente</div>"
+        + "<div style=\"font-size:13px;opacity:.9;margin-top:4px\">Historial, estado y acciones.</div></div>"
+        + "<a class=\"btn btn-secondary btn-action\" href=\"" + toggle_href + "\">"
+        + "<span class=\"btn-ic\" aria-hidden=\"true\">"
+        + "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\" width=\"18\" height=\"18\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z\"/></svg>"
+        + "</span>" + toggle_label + "</a>"
+        + "<a class=\"btn btn-primary btn-action\" href=\"" + new_loan_href + "\">"
+        + "<span class=\"btn-ic\" aria-hidden=\"true\">"
+        + "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\" width=\"18\" height=\"18\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M12 5v14\"/><path d=\"M5 12h14\"/></svg>"
+        + "</span>Nuevo préstamo</a>"
+        + "</div>"
+        + "<div class=\"table-scroll\" style=\"margin-top:12px;\">"
+        + "<table class=\"client-table\">"
+        + "<thead><tr>"
+        + "<th>ID</th><th>Monto</th><th>Restante</th><th>%</th><th>Frecuencia</th><th>Inicio</th><th>Interés pagado</th><th>Estado</th><th>Acciones</th>"
+        + "</tr></thead>"
+        + "<tbody>" + lr + "</tbody>"
+        + "</table></div></div></div>"
+        + script_block
     )
     return page(body)
 
@@ -1594,8 +1863,9 @@ def loans():
         nm_raw = f"{cl.get('first_name','')} {cl.get('last_name') or ''}".strip() or f"Cliente #{cid}"
         nm = html.escape(nm_raw)
         freq = loan_frequency_label(L.get("frequency"))
-        st = str(L.get("status") or "").upper()
-        if st == "CERRADO" or float(L.get("remaining") or 0) <= 0:
+        term_count = int(L.get("term_count") or 1)
+        pagadas = count_loan_cuota_payments(L["id"])
+        if pagadas >= term_count:
             badge = '<span class="loan-card-badge loan-card-badge-done">Cerrado</span>'
         else:
             badge = '<span class="loan-card-badge">Activo</span>'
@@ -1968,11 +2238,10 @@ def loan_detail(loan_id):
     next_pago_disp = fmt_date(next_pago)
 
     estado_pago = "Pendiente"
-    loan_is_closed = (
-        str(L.get("status") or "").lower() == "cerrado"
-        or float(L.get("remaining") or 0) <= 0
-        or pagadas >= term_count
-    )
+    # Regla de cierre por cuotas: solo cerramos cuando completa todas las cuotas.
+    # Si por datos previos el campo `status` quedó en `cerrado`, esto evita
+    # que se bloquee el cobro antes de completar `term_count`.
+    loan_is_closed = pagadas >= term_count
     if loan_is_closed:
         estado_pago = "Cerrado"
 
@@ -2024,28 +2293,39 @@ def loan_detail(loan_id):
     # =========================
     interval_days = freq_interval_days(L.get("frequency"))
     first_due = next_pago if hasattr(next_pago, "strftime") else date.today()
+    # Normalizar a `date` para evitar comparaciones datetime vs date.
+    first_due_d = first_due.date() if hasattr(first_due, "hour") else first_due
 
     cuota_items_html = ""
     for i in range(1, term_count + 1):
-        due_i = first_due + timedelta(days=interval_days * (i - 1))
-        cuota_estado = "Pagada" if i <= pagadas else "Pendiente"
-        color = "#16a34a" if i <= pagadas else "#d97706"
+        due_i = first_due_d + timedelta(days=interval_days * (i - 1))
+        if i <= pagadas:
+            cuota_estado = "Pagada"
+            state_class = "is-pagada"
+        else:
+            # Si la fecha ya pasó y no está pagada, se considera atrasada.
+            if due_i < date.today():
+                cuota_estado = "Atrasada"
+                state_class = "is-atrasada"
+            else:
+                cuota_estado = "Pendiente"
+                state_class = "is-pendiente"
         cuota_items_html += (
-            f"<div class='card' style='margin:0; padding:12px; min-width:170px; flex:1 1 170px; background:#f8fafc;'>"
-            f"<div style='font-weight:900; margin-bottom:6px;'>Cuota {i}</div>"
+            f"<div class='cuota {state_class}'>"
+            f"<div class='cuota-k'>Cuota {i}</div>"
             f"<div><b>{fmt_date(due_i)}</b></div>"
-            f"<div style='margin-top:6px; opacity:.9; font-weight:900;'>Estado: <span style='color:{color}'>{cuota_estado}</span></div>"
+            f"<div class='cuota-estado'>Estado: {cuota_estado}</div>"
             f"</div>"
         )
 
     # Siguiente pago = primera cuota pendiente
     if pagadas < term_count:
         next_idx = pagadas + 1
-        next_due = first_due + timedelta(days=interval_days * (next_idx - 1))
+        next_due = first_due_d + timedelta(days=interval_days * (next_idx - 1))
         next_status = "Pendiente"
     else:
         next_idx = term_count
-        next_due = first_due + timedelta(days=interval_days * (term_count - 1))
+        next_due = first_due_d + timedelta(days=interval_days * (term_count - 1))
         next_status = "Cerrado"
 
     siguiente_pago_html = (
@@ -2097,6 +2377,39 @@ def loan_detail(loan_id):
 .loan-details summary {{ font-weight: 900; cursor: pointer; }}
 .loan-details details {{ margin-top: 10px; }}
 .loan-pill {{ display:inline-block; padding: 3px 10px; border-radius: 999px; background: rgba(255,255,255,.18); font-weight: 800; font-size: 11px; margin-left: 8px; }}
+
+/* Calendario cuotas (estilo premium) */
+.cuota {{
+  margin: 0;
+  padding: 12px;
+  min-width: 170px;
+  flex: 1 1 170px;
+  border-radius: 16px;
+  box-shadow: 0 8px 20px rgba(0,0,0,.05);
+  border: 1px solid rgba(148,163,184,.35);
+  transition: transform .12s ease, box-shadow .12s ease;
+  background: #f8fafc;
+  color: #0f172a;
+}}
+.cuota:hover {{
+  transform: translateY(-1px) scale(1.02);
+  box-shadow: 0 12px 26px rgba(0,0,0,.08);
+}}
+.cuota:nth-child(5n+1) {{ background: #d4edda; }}
+.cuota:nth-child(5n+2) {{ background: #d1ecf1; }}
+.cuota:nth-child(5n+3) {{ background: #fff3cd; }}
+.cuota:nth-child(5n+4) {{ background: #e2d6f3; }}
+.cuota:nth-child(5n+5) {{ background: #f8d7da; }}
+
+.cuota.is-pagada {{ border: 2px solid #16a34a; }}
+.cuota.is-pendiente {{ border: 2px solid #fbbf24; }}
+.cuota.is-atrasada {{ border: 2px solid #ef4444; }}
+
+.cuota-k {{ font-weight: 900; margin-bottom: 6px; }}
+.cuota-estado {{ margin-top: 6px; opacity: .9; font-weight: 900; }}
+.cuota.is-pagada .cuota-estado {{ color: #16a34a; }}
+.cuota.is-pendiente .cuota-estado {{ color: #a16207; }}
+.cuota.is-atrasada .cuota-estado {{ color: #dc2626; }}
 </style>
 
 <div class="card loan-wrap">
@@ -2198,8 +2511,7 @@ def new_payment(loan_id):
     # Regla: cuando se alcanzan las cuotas (ej. 10), el préstamo se cierra
     # y no se permite registrar más pagos.
     cuota_count = count_loan_cuota_payments(loan_id)
-    loan_status = str(L.get("status") or "").lower()
-    if loan_status == "cerrado" or cuota_count >= term_count:
+    if cuota_count >= term_count:
         flash("Préstamo cerrado. No se permite registrar más pagos.", "warning")
         return redirect(url_for("loan_detail", loan_id=loan_id))
 
@@ -2238,17 +2550,45 @@ def new_payment(loan_id):
             flash(str(e), "danger")
             return redirect(url_for("loan_detail", loan_id=loan_id))
 
+        # Separar capital e interés para que `remaining` (capital pendiente)
+        # no llegue a 0 antes de completar todas las cuotas.
+        total_interest = float(L.get("total_interest") or 0)
+        interest_per_cuota = round(total_interest / max(term_count, 1), 2)
+        if typ_l in ("cuota", "adelanto"):
+            # En esta versión el interés por cuota es constante (modelo simple).
+            adv_mult = int(weeks_adv or 1) if typ_l == "adelanto" else 1
+            interest_part = round(min(amt, interest_per_cuota * adv_mult), 2)
+            capital_part = round(amt - interest_part, 2)
+        elif typ_l == "capital":
+            capital_part = round(amt, 2)
+            interest_part = 0.0
+        elif typ_l == "interes":
+            capital_part = 0.0
+            interest_part = round(amt, 2)
+        else:
+            # Fallback: reparto 50/50
+            capital_part = round(amt * 0.5, 2)
+            interest_part = round(amt - capital_part, 2)
+
         pid = store.nid("payments")
         store.payments[pid] = {
-            "id": pid, "loan_id": loan_id, "amount": amt, "type": typ, "date": date.today(),
-            "created_by": current_user()["id"], "capital": amt * 0.5, "interest": amt * 0.5,
-            "status": "OK", "weeks_advanced": weeks_adv,
+            "id": pid,
+            "loan_id": loan_id,
+            "amount": amt,
+            "type": typ,
+            "date": date.today(),
+            "created_by": current_user()["id"],
+            "capital": capital_part,
+            "interest": interest_part,
+            "status": "OK",
+            "weeks_advanced": weeks_adv,
             "created_at": datetime.utcnow(),
         }
-        rem = float(L.get("remaining") or 0) - amt
+
+        rem = float(L.get("remaining") or 0) - capital_part
         L["remaining"] = max(0, rem)
-        if L["remaining"] <= 0:
-            L["status"] = "cerrado"
+        if "remaining_capital" in L:
+            L["remaining_capital"] = max(0, float(L.get("remaining_capital") or 0) - capital_part)
         # Si se registra una cuota, avanzamos la próxima fecha automáticamente.
         if typ_l == "cuota":
             interval_days = freq_interval_days(L.get("frequency"))
@@ -2267,6 +2607,10 @@ def new_payment(loan_id):
             if cuota_count_after >= term_count:
                 L["status"] = "cerrado"
                 L["next_payment_date"] = None
+            else:
+                # Mientras no complete `term_count`, el préstamo sigue activo aunque
+                # el capital pendiente llegue a 0 antes (por interés en las últimas cuotas).
+                L["status"] = "ACTIVO"
         flash("Pago registrado.", "success")
         return redirect(url_for("loan_detail", loan_id=loan_id))
     body = (
@@ -2419,6 +2763,9 @@ def delete_payment(payment_id):
         weeks = 1
 
     amt = float(p.get("amount") or 0)
+    # `remaining` representa capital pendiente. Al revertir, sumamos el capital
+    # que se había descontado originalmente (no el monto total).
+    capital_back = float(p.get("capital") or 0)
     try:
         apply_cash_movement(
             movement_type="reverso_pago_prestamo",
@@ -2432,9 +2779,9 @@ def delete_payment(payment_id):
         return redirect(url_for("loan_detail", loan_id=loan_id))
 
     # Ajustar préstamo (saldo y fechas) para que no quede inconsistente.
-    L["remaining"] = float(L.get("remaining") or 0) + amt
+    L["remaining"] = float(L.get("remaining") or 0) + capital_back
     if "remaining_capital" in L:
-        L["remaining_capital"] = float(L.get("remaining_capital") or 0) + amt
+        L["remaining_capital"] = float(L.get("remaining_capital") or 0) + capital_back
     term_count = int(L.get("term_count") or 1)
     # Recuento de cuotas después de eliminar este pago (excluimos el payment actual).
     cuota_count_after = len(
@@ -2448,10 +2795,8 @@ def delete_payment(payment_id):
     )
     if cuota_count_after >= term_count:
         L["status"] = "cerrado"
-    elif float(L.get("remaining") or 0) > 0:
-        L["status"] = "ACTIVO"
     else:
-        L["status"] = "cerrado"
+        L["status"] = "ACTIVO"
 
     interval_days = freq_interval_days(L.get("frequency"))
     current_due = L.get("next_payment_date")
@@ -3679,7 +4024,7 @@ def prestamos_pagados():
     org_id = session.get("org_id")
     rows = [
         L for L in loans_for_user(org_id, user)
-        if str(L.get("status", "")).lower() == "cerrado"
+        if count_loan_cuota_payments(L.get("id")) >= int(L.get("term_count") or 1)
     ]
     tr = ""
     for L in rows:
@@ -5696,6 +6041,9 @@ def cierre_semanal():
     ensure_org()
     org_id = session.get("org_id")
     user = current_user()
+    mode = (request.args.get("mode") or "").strip().lower()
+    is_print = mode in ("print", "pdf", "imprimir")
+    is_58mm = mode in ("58mm", "58", "t59", "recibo-58mm")
 
     # Rango semanal tipo lunes->domingo.
     today = date.today()
@@ -5719,19 +6067,90 @@ def cierre_semanal():
 
     total_cobrado = round(sum(float(p.get("amount") or 0) for p in payments_week), 2)
 
-    payments_rows = ""
+    # =========================
+    # Pagos agrupados por cliente
+    # =========================
+    # Importante: NO mostramos el "admin" que registró el pago. Mostramos
+    # el cliente real asociado al préstamo: payment.loan_id -> loan.client_id.
+    payments_by_client = {}  # cid -> {client_name, total, items[{loan_id, amount, date}]}
     for p in payments_week:
-        uid = p.get("created_by")
-        u = store.users.get(uid, {})
-        name = (u.get("name") or u.get("username") or "—") if u else "—"
-        payments_rows += (
-            f"<tr>"
-            f"<td style='padding-right:12px'>{html.escape(str(name))}</td>"
-            f"<td style='text-align:right;font-weight:900'>{fmt_money(p.get('amount') or 0)}</td>"
-            f"</tr>"
+        loan_id = p.get("loan_id")
+        L = store.loans.get(loan_id) if loan_id is not None else None
+        if not L or L.get("organization_id") != org_id:
+            continue
+        cid = L.get("client_id")
+        cl = store.clients.get(cid, {}) if cid is not None else {}
+        client_name = (
+            f"{cl.get('first_name') or ''} {cl.get('last_name') or ''}".strip()
+            or (f"Cliente #{cid}" if cid is not None else "—")
         )
-    if not payments_rows:
-        payments_rows = "<tr><td colspan=2 style='opacity:.78'>Sin pagos</td></tr>"
+        group = payments_by_client.get(cid)
+        if not group:
+            group = {"client_name": client_name, "total": 0.0, "items": []}
+            payments_by_client[cid] = group
+        amt = float(p.get("amount") or 0)
+        group["total"] += amt
+        group["items"].append({"loan_id": loan_id, "amount": amt, "date": p.get("date")})
+
+    # Orden estable: por nombre de cliente.
+    client_groups = sorted(
+        payments_by_client.values(),
+        key=lambda g: str(g.get("client_name") or "").lower(),
+    )
+
+    if not client_groups:
+        client_groups_html = "<div style='opacity:.78'>Sin pagos</div>"
+        client_print_html = "<div style='opacity:.78'>Sin pagos</div>"
+    else:
+        def payment_li(item):
+            return (
+                f"<li>"
+                f"<span style='font-weight:950'>Préstamo #{item.get('loan_id')}</span>"
+                f"<span style='float:right; font-weight:950'>{fmt_money(item.get('amount') or 0)}</span>"
+                f"<div style='clear:both; opacity:.85; font-size:12px; margin-top:2px'>Fecha: {item.get('date') or '—'}</div>"
+                f"</li>"
+            )
+
+        # Vista normal (fintech).
+        cards = []
+        for g in client_groups:
+            items = sorted(g["items"], key=lambda x: (x.get("date") or date.min, x.get("loan_id") or 0))
+            items_html = "".join(payment_li(it) for it in items)
+            cards.append(
+                "<div class='pay-client-card fade-soft'>"
+                f"<div class='pay-client-head'>"
+                f"<div class='pay-client-name'>{html.escape(g['client_name'])}</div>"
+                f"<div class='pay-client-total'>Total: <b>{fmt_money(g['total'])}</b></div>"
+                f"</div>"
+                f"<ul class='pay-client-list'>{items_html}</ul>"
+                f"</div>"
+            )
+        client_groups_html = "".join(cards)
+
+        # Vista 58mm (recibo térmico).
+        lines = []
+        # Nota: para 58mm priorizamos legibilidad y un layout vertical.
+        for g in client_groups:
+            items = sorted(g["items"], key=lambda x: (x.get("date") or date.min, x.get("loan_id") or 0))
+            lines.append(
+                "<div class='receipt58-block'>"
+                f"<div class='receipt58-title'>{html.escape(g['client_name'])}</div>"
+                f"<div class='receipt58-sub'>Total: <b>{fmt_money(g['total'])}</b></div>"
+                "<div class='receipt58-items'>"
+                + "".join(
+                    "<div class='receipt58-line'>"
+                    f"<span style='font-weight:900'>#{it.get('loan_id')}</span>"
+                    f"<span style='float:right; font-weight:900'>{fmt_money(it.get('amount') or 0)}</span>"
+                    "<div style='clear:both; font-size:12px; opacity:.85; margin-top:2px'>"
+                    f"Fecha: {it.get('date') or '—'}"
+                    "</div>"
+                    "</div>"
+                    for it in items
+                )
+                + "</div>"
+                "</div>"
+            )
+        client_print_html = "".join(lines)
 
     # Préstamos entregados (cash_movements prestamo_entregado) dentro del rango.
     prestamos_entregados = [
@@ -5841,32 +6260,222 @@ def cierre_semanal():
 
     balance_negocio = round(total_cobrado - prestado_total - gastos_total, 2)
 
-    body = (
-        f'<div class="card">'
-        f'<h2>🧾 Cierre semanal</h2>'
-        f"<div style='opacity:.85;font-weight:800;margin-bottom:10px'>Semana: {week_start.isoformat()} → {week_end.isoformat()}</div>"
-        f"<hr style='opacity:.18;margin:12px 0'/>"
-        f"<div style='font-weight:950;margin:10px 0 6px 0'>💰 Pagos</div>"
-        f"<div class='table-scroll'><table><tbody>{payments_rows}</tbody></table></div>"
-        f"<div style='font-weight:950;margin:14px 0 6px 0'>💸 Préstamos entregados</div>"
-        f"<div class='table-scroll'><table><tbody>{prestamos_rows}</tbody></table></div>"
-        f"<div style='font-weight:950;margin:14px 0 6px 0'>📉 Descuentos (informativo)</div>"
-        f"<div class='table-scroll'><table><tbody>{descuentos_rows}</tbody></table></div>"
-        f"<div style='font-weight:950;margin:14px 0 6px 0'>🚗 Gastos ruta</div>"
-        f"<div class='table-scroll'><table><tbody>{gastos_rows}</tbody></table></div>"
-        f"<div style='font-weight:950;margin:14px 0 6px 0'>📊 Totales</div>"
-        f"<div style='padding:10px 12px;background:rgba(236,253,245,.55);border:1px solid rgba(148,163,184,.25);border-radius:14px'>"
-        f"<div style='display:flex;justify-content:space-between'><span style='opacity:.88'>Total cobrado</span><b>{fmt_money(total_cobrado)}</b></div>"
-        f"<div style='display:flex;justify-content:space-between;margin-top:6px'><span style='opacity:.88'>Prestado</span><b>{fmt_money(prestado_total)}</b></div>"
-        f"<div style='display:flex;justify-content:space-between;margin-top:6px'><span style='opacity:.88'>Gastos</span><b>{fmt_money(gastos_total)}</b></div>"
-        f"<div style='display:flex;justify-content:space-between;margin-top:6px'><span style='opacity:.88'>Balance negocio</span><b>{fmt_money(balance_negocio)}</b></div>"
-        f"</div>"
-        f'<form method="post" action="{url_for("cerrar_semana")}" style="margin-top:14px">'
-        f'<button class="btn btn-primary" type="submit" style="width:100%;font-size:16px;padding:12px 10px">✅ CERRAR CUADRE</button>'
-        f"</form>"
-        f"{nav_subfooter()}"
-        f"</div>"
+    report_brand_name = "JDM Cash Now"
+    logo_svg = (
+        "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64' width='34' height='34' "
+        "fill='none' stroke='currentColor' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'>"
+        "<path d='M12 48V16a8 8 0 0 1 8-8h24a8 8 0 0 1 8 8v32'/>"
+        "<path d='M18 44h28'/>"
+        "<path d='M20 28l12-12 12 12'/>"
+        "</svg>"
     )
+
+    chart_vals = {
+        "total_cobrado": total_cobrado,
+        "total_prestado": prestado_total,
+        "ganancias": balance_negocio,
+    }
+    chart_vals_json = json.dumps(chart_vals)
+    charts_js = (
+        "<script src='https://cdn.jsdelivr.net/npm/chart.js'></script>"
+        "<script>"
+        "const chartVals = CHART_VALS;"
+        "const ctx = document.getElementById('cierreChart');"
+        "if(ctx){"
+        "const data = {"
+        "labels:['Total cobrado','Total prestado','Ganancias'],"
+        "datasets:[{label:'RD$',data:[chartVals.total_cobrado,chartVals.total_prestado,chartVals.ganancias],"
+        "backgroundColor:['rgba(34,197,94,.35)','rgba(59,130,246,.35)','rgba(99,102,241,.35)'],"
+        "borderColor:['rgba(34,197,94,1)','rgba(59,130,246,1)','rgba(99,102,241,1)'],"
+        "borderWidth:1}]};"
+        "new Chart(ctx,{type:'bar',data:data,options:{responsive:true,maintainAspectRatio:false,"
+        "plugins:{legend:{display:false}},scales:{y:{beginAtZero:true}}}});"
+        "}"
+        "</script>"
+    ).replace("CHART_VALS", chart_vals_json)
+
+    # CSS extra del reporte.
+    report_css = f"""
+<style>
+  .cierre-wrap{{max-width:1080px;margin:0 auto;padding:12px 0 26px}}
+  .cierre-head{{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;flex-wrap:wrap}}
+  .cierre-brand{{display:flex;gap:12px;align-items:center}}
+  .cierre-brandtxt{{display:flex;flex-direction:column;line-height:1.1}}
+  .cierre-brandtxt .t{{font-weight:1000;font-size:18px}}
+  .cierre-brandtxt .s{{opacity:.85;font-size:13px;font-weight:800}}
+  .cierre-sub{{opacity:.85;font-weight:800;margin:8px 0 10px 0}}
+
+  .cierre-grid{{display:grid;grid-template-columns: 1fr; gap:14px; margin-top:12px}}
+  @media(min-width:920px){{.cierre-grid{{grid-template-columns: 1fr .95fr;}}}}
+
+  .cierre-card{{background:rgba(255,255,255,.92);border:1px solid rgba(148,163,184,.35);border-radius:18px;box-shadow:0 10px 24px rgba(0,0,0,.06);padding:14px}}
+  body.theme-dark .cierre-card{{background:rgba(15,23,42,.92);border-color:rgba(148,163,184,.25);box-shadow:0 14px 34px rgba(0,0,0,.35)}}
+  .cierre-title{{font-weight:1000;margin:0 0 8px 0; font-size:16px}}
+  .cierre-sectionhr{{opacity:.18;margin:10px 0}}
+
+  .pay-client-card{{border:1px solid rgba(148,163,184,.22);background:rgba(248,250,252,.85);border-radius:16px;padding:12px;box-shadow:0 8px 20px rgba(0,0,0,.04);margin-bottom:10px}}
+  body.theme-dark .pay-client-card{{background:rgba(2,6,23,.45);border-color:rgba(148,163,184,.18)}}
+  .pay-client-head{{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;margin-bottom:6px}}
+  .pay-client-name{{font-weight:1000;font-size:15px}}
+  .pay-client-total{{opacity:.9;font-weight:900}}
+  .pay-client-list{{list-style:none;padding-left:0;margin:0;display:flex;flex-direction:column;gap:8px}}
+  .pay-client-list li{{padding:10px 10px;border-radius:14px;background:rgba(255,255,255,.65);border:1px solid rgba(148,163,184,.18)}}
+  body.theme-dark .pay-client-list li{{background:rgba(15,23,42,.55);border-color:rgba(148,163,184,.14)}}
+
+  .no-print{{}}
+  @media print{{
+    header.topbar, #sideMenu, #menuOverlay, .premium-btn, .menu-overlay, .no-print{{display:none!important}}
+    .container{{padding:0!important}}
+    .cierre-wrap{{padding:0!important}}
+  }}
+
+  /* 58mm recibo */
+  .receipt58-wrap{{width:58mm; margin:0 auto; padding:0 0 14px}}
+  @page{{ size:58mm auto; margin:0; }}
+  .receipt58-block{{border:1px dashed rgba(148,163,184,.35);padding:10px;border-radius:10px;margin:10px 0}}
+  .receipt58-title{{font-weight:1000; font-size:14px}}
+  .receipt58-sub{{opacity:.9; font-weight:900; font-size:12px; margin-top:4px}}
+  .receipt58-line{{margin-top:8px;}}
+</style>
+"""
+
+    # -------------------------
+    # Render por modo
+    # -------------------------
+    if is_58mm:
+        body = (
+            report_css
+            + "<div class='receipt58-wrap'>"
+            + "<div style='display:flex;align-items:center;gap:10px;padding:12px 0'>"
+            + "<div style='color:#16a34a;font-weight:1000'>" + logo_svg + "</div>"
+            + "<div>"
+            + f"<div style='font-weight:1000;font-size:15px'>{report_brand_name}</div>"
+            + f"<div style='opacity:.85;font-size:12px;font-weight:900'>Cierre semanal</div>"
+            + f"<div style='opacity:.85;font-size:11px'>Semana: {week_start.isoformat()} → {week_end.isoformat()}</div>"
+            + "</div>"
+            + "</div>"
+            + "<div style='font-weight:1000;opacity:.95; padding:0 0 8px 0'>Pagos por cliente</div>"
+            + client_print_html
+            + "<div style='margin-top:10px;border-top:1px solid rgba(148,163,184,.35);padding-top:10px'>"
+            + f"<div style='display:flex;justify-content:space-between'><span style='opacity:.85;font-weight:900'>Total cobrado</span><b>{fmt_money(total_cobrado)}</b></div>"
+            + f"<div style='display:flex;justify-content:space-between;margin-top:6px'><span style='opacity:.85;font-weight:900'>Prestado</span><b>{fmt_money(prestado_total)}</b></div>"
+            + f"<div style='display:flex;justify-content:space-between;margin-top:6px'><span style='opacity:.85;font-weight:900'>Ganancias</span><b>{fmt_money(balance_negocio)}</b></div>"
+            + "</div>"
+            + f"<div style='margin-top:10px;opacity:.85;font-size:11px'>Fecha reporte: {date.today().isoformat()}</div>"
+            + "<script>window.print();</script>"
+            + "</div>"
+        )
+        return page(body)
+
+    if is_print:
+        # Vista imprimible (bank style). Incluye todas las secciones.
+        body = (
+            report_css
+            + "<div class='cierre-wrap'>"
+            + "<div class='cierre-head'>"
+            + "<div class='cierre-brand'>"
+            + "<div style='color:#16a34a'>" + logo_svg + "</div>"
+            + "<div class='cierre-brandtxt'>"
+            + f"<div class='t'>{report_brand_name}</div>"
+            + "<div class='s'>Reporte financiero - Cierre semanal</div>"
+            + "</div>"
+            + "</div>"
+            + f"<div class='cierre-sub'>Semana: {week_start.isoformat()} → {week_end.isoformat()}<br/>Fecha reporte: {date.today().isoformat()}</div>"
+            + "</div>"
+            + "<div class='cierre-grid'>"
+            + "<div class='cierre-card'>"
+            + "<div class='cierre-title'>💰 Pagos (agrupados por cliente)</div>"
+            + client_groups_html
+            + "<hr class='cierre-sectionhr'/>"
+            + "<div class='cierre-title'>💸 Préstamos entregados</div>"
+            + "<div class='table-scroll'><table><tbody>" + prestamos_rows + "</tbody></table></div>"
+            + "<hr class='cierre-sectionhr'/>"
+            + "<div class='cierre-title'>📉 Descuentos (informativo)</div>"
+            + "<div class='table-scroll'><table><tbody>" + descuentos_rows + "</tbody></table></div>"
+            + "<hr class='cierre-sectionhr'/>"
+            + "<div class='cierre-title'>🚗 Gastos ruta</div>"
+            + "<div class='table-scroll'><table><tbody>" + gastos_rows + "</tbody></table></div>"
+            + "</div>"
+            + "<div class='cierre-card'>"
+            + "<div class='cierre-title'>📊 Totales</div>"
+            + f"<div style='padding:10px 12px;background:rgba(236,253,245,.55);border:1px solid rgba(148,163,184,.25);border-radius:14px'>"
+            + f"<div style='display:flex;justify-content:space-between'><span style='opacity:.88'>Total cobrado</span><b>{fmt_money(total_cobrado)}</b></div>"
+            + f"<div style='display:flex;justify-content:space-between;margin-top:6px'><span style='opacity:.88'>Prestado</span><b>{fmt_money(prestado_total)}</b></div>"
+            + f"<div style='display:flex;justify-content:space-between;margin-top:6px'><span style='opacity:.88'>Gastos</span><b>{fmt_money(gastos_total)}</b></div>"
+            + f"<div style='display:flex;justify-content:space-between;margin-top:6px'><span style='opacity:.88'>Ganancias</span><b>{fmt_money(balance_negocio)}</b></div>"
+            + "</div>"
+            + "<hr class='cierre-sectionhr'/>"
+            + "<div class='cierre-title'>Gráficas</div>"
+            + "<div style='height:220px' class='no-print'><div style='height:220px'></div></div>"
+            + "<script>window.print();</script>"
+            + "</div>"
+            + "</div>"
+            + "</div>"
+        )
+        return page(body)
+
+    # -------------------------
+    # Vista normal (con gráficos + acciones)
+    # -------------------------
+    print_href = url_for("cierre_semanal") + "?mode=print"
+    print58_href = url_for("cierre_semanal") + "?mode=58mm"
+
+    body = (
+        report_css
+        + "<div class='cierre-wrap'>"
+        + "<div class='cierre-head'>"
+        + "<div class='cierre-brand'>"
+        + "<div style='color:#16a34a'>" + logo_svg + "</div>"
+        + "<div class='cierre-brandtxt'>"
+        + f"<div class='t'>{report_brand_name}</div>"
+        + "<div class='s'>Reporte financiero - Cierre semanal</div>"
+        + "</div>"
+        + "</div>"
+        + "<div class='cierre-actions no-print' style='display:flex;gap:10px;flex-wrap:wrap;align-items:center'>"
+        + "<a class='btn btn-secondary btn-action' href='" + print_href + "'>"
+        + "<span class='btn-ic' aria-hidden='true'><svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' width='18' height='18' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M6 9V2h12v7'/><path d='M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2'/><path d='M6 14h12v10H6z'/></svg></span>Imprimir</a>"
+        + "<a class='btn btn-primary btn-action' href='" + print58_href + "' style='color:#047857'>"
+        + "<span class='btn-ic' aria-hidden='true'><svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' width='18' height='18' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M7 10V3h10v7'/><path d='M7 21h10v-8H7v8z'/><path d='M9 13h6'/></svg></span>58mm</a>"
+        + "</div>"
+        + "</div>"
+        + f"<div class='cierre-sub'>Semana: {week_start.isoformat()} → {week_end.isoformat()}<br/>Fecha reporte: {date.today().isoformat()}</div>"
+        + "<div class='cierre-grid'>"
+        + "<div class='cierre-card'>"
+        + "<div class='cierre-title'>💰 Pagos (agrupados por cliente)</div>"
+        + client_groups_html
+        + "<hr class='cierre-sectionhr'/>"
+        + "<div class='cierre-title'>💸 Préstamos entregados</div>"
+        + "<div class='table-scroll'><table><tbody>" + prestamos_rows + "</tbody></table></div>"
+        + "<hr class='cierre-sectionhr'/>"
+        + "<div class='cierre-title'>📉 Descuentos (informativo)</div>"
+        + "<div class='table-scroll'><table><tbody>" + descuentos_rows + "</tbody></table></div>"
+        + "<hr class='cierre-sectionhr'/>"
+        + "<div class='cierre-title'>🚗 Gastos ruta</div>"
+        + "<div class='table-scroll'><table><tbody>" + gastos_rows + "</tbody></table></div>"
+        + "</div>"
+        + "<div class='cierre-card'>"
+        + "<div class='cierre-title'>📊 Totales</div>"
+        + f"<div style='padding:10px 12px;background:rgba(236,253,245,.55);border:1px solid rgba(148,163,184,.25);border-radius:14px'>"
+        + f"<div style='display:flex;justify-content:space-between'><span style='opacity:.88'>Total cobrado</span><b>{fmt_money(total_cobrado)}</b></div>"
+        + f"<div style='display:flex;justify-content:space-between;margin-top:6px'><span style='opacity:.88'>Prestado</span><b>{fmt_money(prestado_total)}</b></div>"
+        + f"<div style='display:flex;justify-content:space-between;margin-top:6px'><span style='opacity:.88'>Gastos</span><b>{fmt_money(gastos_total)}</b></div>"
+        + f"<div style='display:flex;justify-content:space-between;margin-top:6px'><span style='opacity:.88'>Ganancias</span><b>{fmt_money(balance_negocio)}</b></div>"
+        + "</div>"
+        + "<div style='height:18px'></div>"
+        + "<div class='cierre-title'>📈 Gráficas</div>"
+        + "<div style='height:260px; margin-top:8px' class='no-print'>"
+        + "<div style='height:260px'><canvas id='cierreChart'></canvas></div>"
+        + "</div>"
+        + charts_js
+        + "<form method='post' action=\"" + url_for("cerrar_semana") + "\" style='margin-top:14px' class='no-print'>"
+        + "<button class='btn btn-primary' type='submit' style='width:100%;font-size:16px;padding:12px 10px'>✅ CERRAR CUADRE</button>"
+        + "</form>"
+        + "</div>"
+        + "</div>"
+        + nav_subfooter()
+        + "</div>"
+    )
+
     return page(body)
 
 
