@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# JDM Cash Now — datos solo en memoria (sin base de datos). Se pierden al reiniciar el servidor.
+# JDM Cash Now — datos en memoria (sin base de datos persistente). Se pierden al reiniciar el servidor.
 from __future__ import annotations
 
 import os
@@ -256,9 +256,11 @@ class Store:
         self.weekly_closures = {}
         self.deposit_history = []
         self.closure_history = []
-        # Banco inicial del sistema (solo para demo en memoria).
-        # El banco real se calcula como: starting_bank + suma de cash_reports.amount.
-        self.starting_bank = 50000.0
+        # Saldo inicial del banco (0 por defecto). Opcional: variable de entorno STARTING_BANK.
+        try:
+            self.starting_bank = float(os.getenv("STARTING_BANK", "0") or 0)
+        except ValueError:
+            self.starting_bank = 0.0
         self._seq = {
             "users": 1,
             "clients": 0,
@@ -279,30 +281,16 @@ class Store:
         return self._seq[key]
 
     def _seed(self):
+        """Solo administrador inicial; clientes, préstamos y demás usuarios se crean desde la app."""
         self.users[1] = {
-            "id": 1, "username": "admin", "password_hash": generate_password_hash("admin"),
-            "role": "admin", "phone": "", "organization_id": ORG_ID, "created_at": datetime.utcnow(), "name": None,
-        }
-        uid = self.nid("users")
-        self.users[uid] = {
-            "id": uid, "username": "cobrador", "password_hash": generate_password_hash("cobrador"),
-            "role": "cobrador", "phone": "", "organization_id": ORG_ID, "created_at": datetime.utcnow(), "name": None,
-        }
-        cid = self.nid("clients")
-        self.clients[cid] = {
-            "id": cid, "first_name": "Demo", "last_name": "Cliente", "document_id": "000-0000000-0",
-            "phone": "8090000000", "address": "Santo Domingo", "route": "Ruta 1",
-            "created_by": uid, "organization_id": ORG_ID, "created_at": datetime.utcnow(),
-        }
-        lid = self.nid("loans")
-        self.loans[lid] = {
-            "id": lid, "client_id": cid, "amount": 10000, "rate": 10, "frequency": "semanal",
-            "start_date": date.today(), "next_payment_date": date.today() + timedelta(days=7),
-            "created_by": uid, "remaining": 8000, "remaining_capital": 8000,
-            "total_interest_paid": 0, "status": "ACTIVO", "term_count": 10,
-            "organization_id": ORG_ID, "total_interest": 2000, "total_to_pay": 12000,
-            "upfront_percent": 0, "installment_amount": 1200,
-            "signature_b64": None, "id_photo_b64": None, "id_photo_back_b64": None,
+            "id": 1,
+            "username": "admin",
+            "password_hash": generate_password_hash("admin"),
+            "role": "admin",
+            "phone": "",
+            "organization_id": ORG_ID,
+            "created_at": datetime.utcnow(),
+            "name": None,
         }
 
     def reset_all(self):
@@ -592,7 +580,7 @@ def toggle_theme():
 def manifest():
     return jsonify({
         "name": "JDM Cash Now", "short_name": "JDM Cash",
-        "description": "Sistema en memoria (demo).",
+        "description": "Gestión de préstamos y cobros.",
         "start_url": "/dashboard", "scope": "/", "display": "standalone",
         "theme_color": "#16a34a", "background_color": "#ecfdf3",
     })
@@ -849,7 +837,7 @@ body.theme-dark .dash-h2 {{ color: #86efac; }}
 <div class="dash-wrap">
   <div class="dash-top">
     <h1>💵 {APP_BRAND} 💵</h1>
-    <p>Panel principal · datos en memoria</p>
+    <p>Panel principal</p>
   </div>
 
   <p class="dash-h2">Resumen financiero</p>
@@ -958,7 +946,7 @@ def delete_user(user_id):
 @role_required("admin", "supervisor")
 def reassign_clients():
     if request.method == "POST":
-        flash("Reasignación guardada en memoria (demo).", "info")
+        flash("Reasignación guardada.", "info")
         return redirect(url_for("clients"))
     opts = "".join(f"<option value='{u['id']}'>{u['username']}</option>" for u in store.users.values() if u.get("role") == "cobrador")
     body = f'<div class="card"><h2>Reasignar rutas</h2><select>{opts}</select><p><a class="btn btn-secondary" href="{url_for("clients")}">Volver</a></p></div>'
@@ -1832,7 +1820,7 @@ def bank_home():
     """
     adm = ""
     if user.get("role") == "admin":
-        adm = f'<form method="post" action="{url_for("admin_clear_all")}" onsubmit="return confirm(\'¿Resetear datos?\');" style="margin-top:12px"><button class="btn btn-secondary" type="submit">Reiniciar datos demo</button></form>'
+        adm = f'<form method="post" action="{url_for("admin_clear_all")}" onsubmit="return confirm(\'¿Vaciar todos los datos en memoria? Se cerrará la sesión.\');" style="margin-top:12px"><button class="btn btn-secondary" type="submit">Vaciar datos (memoria)</button></form>'
     body = (
         f'<h2 style="text-align:center">🏦 Banco</h2><style>'
         f'.bank-menu{{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;align-items:stretch;padding:8px 4px 14px}}'
