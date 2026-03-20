@@ -598,6 +598,12 @@ def manifest():
     })
 
 
+@app.route("/healthz")
+def healthz():
+    """Sin auth — para health checks de Render u otros balanceadores."""
+    return Response("ok\n", mimetype="text/plain; charset=utf-8")
+
+
 @app.route("/sw.js")
 def service_worker():
     folder = app.static_folder
