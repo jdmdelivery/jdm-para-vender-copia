@@ -33,6 +33,10 @@ self.addEventListener('activate', (e) => e.waitUntil(self.clients.claim()));
 ADMIN_PIN = os.getenv("ADMIN_PIN", "5555")
 CURRENCY = "RD$"
 ADMIN_WHATSAPP = os.getenv("ADMIN_WHATSAPP", "3128565688")
+# Recibo térmico (impresión); sobreescribibles en producción.
+RECEIPT_BUSINESS_NAME = os.getenv("RECEIPT_BUSINESS_NAME", "JDMCASHNOW")
+RECEIPT_SUBTITLE = os.getenv("RECEIPT_SUBTITLE", "LA FACTORIA DEL POZO")
+RECEIPT_COMPANY_TEL = os.getenv("RECEIPT_COMPANY_TEL", "8495788819")
 CARTERA_ADMIN_USER_ID = 60
 ORG_ID = 1
 ROLES = ("admin", "supervisor", "cobrador")
@@ -44,6 +48,37 @@ def fmt_money(val):
     except (TypeError, ValueError):
         v = 0.0
     return f"{CURRENCY} {v:,.2f}"
+
+
+def receipt_cuotas_label(p, L):
+    """Etiqueta tipo 3/10 para el recibo (solo cuenta pagos tipo cuota)."""
+    loan_id = L.get("id") or p.get("loan_id")
+    term_count = int(L.get("term_count") or 1)
+    if str(p.get("type") or "").strip().lower() != "cuota":
+        return f"—/{term_count}"
+    cuotas = [
+        x
+        for x in store.payments.values()
+        if x.get("loan_id") == loan_id
+        and (x.get("status") or "OK") != "ANULADO"
+        and str(x.get("type") or "").strip().lower() == "cuota"
+    ]
+    cuotas.sort(key=lambda x: (x.get("date") or date.min, x.get("id") or 0))
+    for i, x in enumerate(cuotas, start=1):
+        if x.get("id") == p.get("id"):
+            return f"{i}/{term_count}"
+    return f"—/{term_count}"
+
+
+def receipt_payment_when(p):
+    """Fecha/hora para el recibo (DD/MM/YYYY HH:MM AM/PM RD)."""
+    ts = p.get("created_at")
+    if ts and hasattr(ts, "strftime"):
+        return ts.strftime("%d/%m/%Y %I:%M %p") + " RD"
+    d = p.get("date")
+    if hasattr(d, "strftime"):
+        return d.strftime("%d/%m/%Y") + " 12:00 PM RD"
+    return str(d or "—") + " RD"
 
 
 def freq_interval_days(freq):
@@ -1650,10 +1685,110 @@ def new_payment(loan_id):
 @app.route("/payment/<int:payment_id>/print")
 @login_required
 def print_payment(payment_id):
+    ensure_org()
+    user = current_user()
+    oid = session.get("org_id")
     p = store.payments.get(payment_id)
     if not p:
         return "Pago no encontrado", 404
-    return f"<html><body><h1>Recibo pago #{payment_id}</h1><p>Monto {fmt_money(p.get('amount'))}</p></body></html>"
+    loan_id = p.get("loan_id")
+    L = store.loans.get(loan_id) if loan_id is not None else None
+    if not L:
+        return "Préstamo no encontrado", 404
+    if L.get("organization_id") != oid:
+        return "Sin acceso.", 403
+    if user.get("role") == "cobrador" and not is_cartera_admin(user) and L.get("created_by") != user.get("id"):
+        return "Sin acceso.", 403
+
+    cid = L.get("client_id")
+    client = store.clients.get(cid, {})
+    cli_name = html.escape(
+        f"{client.get('first_name', '')} {client.get('last_name') or ''}".strip() or f"Cliente #{cid}"
+    )
+    cli_phone = html.escape(str(client.get("phone") or "—"))
+
+    cob_uid = L.get("created_by")
+    cob = store.users.get(cob_uid, {}) if cob_uid else {}
+    cob_name = html.escape(str(cob.get("name") or cob.get("username") or "—"))
+    cob_phone = html.escape(str(cob.get("phone") or RECEIPT_COMPANY_TEL or "—"))
+
+    capital_prest = float(L.get("amount") or 0)
+    interes_total = float(L.get("total_interest") or 0)
+    total_prest = float(L.get("total_to_pay") or (capital_prest + interes_total))
+    term_count = int(L.get("term_count") or 1)
+    cuota_prog = float(L.get("installment_amount") or 0)
+    if cuota_prog <= 0 and total_prest and term_count:
+        cuota_prog = total_prest / float(term_count)
+
+    head1 = html.escape(RECEIPT_BUSINESS_NAME.upper())
+    head2 = html.escape(RECEIPT_SUBTITLE)
+    tel_emp = html.escape(str(RECEIPT_COMPANY_TEL))
+    dash = "--------------------------------"
+
+    cuotas_lbl = receipt_cuotas_label(p, L)
+    when = html.escape(receipt_payment_when(p))
+
+    amt_m = html.escape(fmt_money(p.get("amount")))
+    cap_pay = html.escape(fmt_money(p.get("capital")))
+    int_pay = html.escape(fmt_money(p.get("interest")))
+
+    sep = f'<div class="rc-sep">{dash}</div>'
+
+    html_page = f"""<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Recibo #{payment_id}</title>
+<style>
+html,body{{margin:0;padding:0;background:#fff}}
+.rc-wrap{{font-family:'Courier New',Courier,monospace;font-size:13px;max-width:320px;margin:0 auto;padding:16px 12px 24px;color:#111;box-sizing:border-box}}
+.rc-wrap *{{box-sizing:border-box}}
+.rc-c{{text-align:center;margin:2px 0;line-height:1.35}}
+.rc-sep{{text-align:center;margin:10px 0;font-size:11px;letter-spacing:0;overflow:hidden;white-space:nowrap;color:#222}}
+.rc-h{{font-weight:700;text-align:center;margin:8px 0 6px;text-transform:uppercase}}
+.rc-row{{display:flex;justify-content:space-between;gap:8px;margin:3px 0;align-items:baseline}}
+.rc-row span:first-child{{flex:0 1 auto}}
+.rc-row span:last-child{{flex:0 0 auto;text-align:right;font-weight:700}}
+@media print{{
+body{{background:#fff}}
+.rc-wrap{{max-width:100%;padding:8px}}
+.no-print{{display:none!important}}
+}}
+</style>
+</head>
+<body>
+<div class="rc-wrap">
+  <div class="rc-c" style="font-weight:800;font-size:14px">{head1}</div>
+  <div class="rc-c">{head2}</div>
+  <div class="rc-c">TEL EMPRESA: {tel_emp}</div>
+  {sep}
+  <div>Cliente: {cli_name}</div>
+  <div>Teléfono: {cli_phone}</div>
+  <div>Fecha: {when}</div>
+  {sep}
+  <div>Cobrador: {cob_name}</div>
+  <div>Tel Cobrador: {cob_phone}</div>
+  {sep}
+  <div class="rc-h">RESUMEN DEL PRESTAMO</div>
+  <div class="rc-row"><span>Capital</span><span>{html.escape(fmt_money(capital_prest))}</span></div>
+  <div class="rc-row"><span>Interés</span><span>{html.escape(fmt_money(interes_total))}</span></div>
+  <div class="rc-row"><span>TOTAL</span><span>{html.escape(fmt_money(total_prest))}</span></div>
+  <div class="rc-row"><span>Cuota</span><span>{html.escape(fmt_money(cuota_prog))}</span></div>
+  <div class="rc-row"><span>Cuotas</span><span>{html.escape(cuotas_lbl)}</span></div>
+  {sep}
+  <div class="rc-h">PAGO REALIZADO</div>
+  <div class="rc-row"><span>Monto</span><span>{amt_m}</span></div>
+  <div class="rc-row"><span>Capital</span><span>{cap_pay}</span></div>
+  <div class="rc-row"><span>Interés</span><span>{int_pay}</span></div>
+  {sep}
+  <div class="rc-c" style="font-weight:700">GRACIAS POR SU PAGO</div>
+  <div class="rc-c" style="margin-top:4px">{head1}</div>
+</div>
+<p class="no-print" style="text-align:center;margin-top:12px"><button type="button" onclick="window.print()">Imprimir</button></p>
+</body>
+</html>"""
+    return html_page
 
 
 @app.route("/payment/delete/<int:payment_id>", methods=["POST"])
