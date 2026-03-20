@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import base64
+import html
 import secrets
 from datetime import datetime, date, timedelta
 from functools import wraps
@@ -55,6 +56,39 @@ def freq_interval_days(freq):
     if "mens" in s:
         return 30
     return 7
+
+
+# Tipos de gasto de ruta (iconos + etiqueta para UI).
+ROUTE_EXPENSE_KINDS = {
+    "gasolina": ("Gasolina", "⛽"),
+    "peaje": ("Peaje", "🛣️"),
+    "comida": ("Comida", "🍔"),
+    "otros": ("Otros", "⚙️"),
+}
+
+
+def route_expense_kind_info(kind):
+    k = (kind or "otros").strip().lower()
+    return ROUTE_EXPENSE_KINDS.get(k, ROUTE_EXPENSE_KINDS["otros"])
+
+
+def fmt_expense_datetime(dt):
+    if not dt:
+        return "—"
+    try:
+        return dt.strftime("%Y-%m-%d %I:%M %p")
+    except Exception:
+        return str(dt)
+
+
+def fmt_advance_datetime(dt):
+    """Fecha/hora para lista de adelantos (DD/MM/YYYY HH:MM AM/PM)."""
+    if not dt:
+        return "—"
+    try:
+        return dt.strftime("%d/%m/%Y %I:%M %p")
+    except Exception:
+        return str(dt)
 
 
 def get_theme():
@@ -399,6 +433,17 @@ def payments_in_scope(org_id, user):
     return [p for p in store.payments.values() if p.get("loan_id") in lids]
 
 
+def count_loan_cuota_payments(loan_id):
+    """Pagos tipo cuota válidos (para numerar la cuota vencida siguiente)."""
+    return sum(
+        1
+        for p in store.payments.values()
+        if p.get("loan_id") == loan_id
+        and (p.get("status") or "OK") != "ANULADO"
+        and str(p.get("type") or "").strip().lower() == "cuota"
+    )
+
+
 def compute_financial_kpis(org_id, user):
     """Métricas alineadas al panel «Resumen financiero» (memoria)."""
     L = loans_for_user(org_id, user)
@@ -577,7 +622,8 @@ def dashboard():
     daily_row = (
         f'<div class="daily-card g"><span class="dk">Cobrado hoy</span><span class="dv">{fmt_money(k["cobrado_hoy"])}</span></div>'
         f'<div class="daily-card g"><span class="dk">Interés hoy</span><span class="dv">{fmt_money(k["interes_hoy"])}</span></div>'
-        f'<div class="daily-card r"><span class="dk">⚠️ Atrasados</span><span class="dv">{k["atrasados"]}</span></div>'
+        f'<a class="daily-card r" href="{url_for("bank_late")}" style="text-decoration:none;color:inherit;display:block;cursor:pointer">'
+        f'<span class="dk">⚠️ Atrasados</span><span class="dv">{k["atrasados"]}</span></a>'
     )
 
     def op_tile(href, icon, title, subtitle="", badge=""):
@@ -594,7 +640,8 @@ def dashboard():
         + op_tile(url_for("credit_history"), "📁", "Historial de crédito", "", "")
         + op_tile(url_for("client_scores"), "⭐", "Score de clientes", "", "")
         + op_tile(url_for("cobro_sabado"), "💰", "Cobro sábado", "", "")
-        + op_tile(url_for("bank_ranking"), "⚠️", "Ranking morosos", "", "")
+        + op_tile(url_for("bank_late"), "⚠️", "Cuotas atrasadas", "", str(k["atrasados"]))
+        + op_tile(url_for("bank_ranking"), "📉", "Ranking morosos", "", "")
         + op_tile(url_for("bank_resumen"), "📊", "Resumen financiero", "", "")
         + op_tile(url_for("check_client"), "🔍", "Consultar por cédula", "", "")
         + op_tile(url_for("prestamos_pagados"), "✅", "Préstamos pagados", "", "")
@@ -865,7 +912,30 @@ def reassign_clients():
 @login_required
 @role_required("admin", "supervisor")
 def reassign_single_client(client_id):
-    flash("Cliente reasignado (memoria).", "success")
+    ensure_org()
+    oid = session.get("org_id")
+    c = store.clients.get(client_id)
+    if not c or c.get("organization_id") != oid:
+        flash("Cliente no encontrado.", "danger")
+        return redirect(url_for("clients"))
+
+    collector_id = request.form.get("collector_id", type=int)
+    if not collector_id:
+        flash("Seleccione un cobrador.", "danger")
+        return redirect(url_for("client_detail", client_id=client_id))
+
+    new_collector = store.users.get(collector_id)
+    if not new_collector or new_collector.get("role") != "cobrador" or new_collector.get("organization_id") != oid:
+        flash("Cobrador inválido.", "danger")
+        return redirect(url_for("client_detail", client_id=client_id))
+
+    # Reasignar el "dueño" del cliente y también los préstamos existentes.
+    c["created_by"] = collector_id
+    for L in store.loans.values():
+        if L.get("client_id") == client_id and L.get("organization_id") == oid:
+            L["created_by"] = collector_id
+
+    flash("Cliente y préstamos reasignados.", "success")
     return redirect(url_for("client_detail", client_id=client_id))
 
 
@@ -984,22 +1054,98 @@ def client_detail(client_id):
     org_id = session.get("org_id")
     sd = calc_client_score(client_id, org_id)
     mx = calc_max_credito(sd["prestamos_pagados"], sd["score"])
-    score_html = f'<div class="card"><h3>Score</h3><p>{sd["score"]} — {sd["nivel"]}</p><p>Crédito sugerido: {fmt_money(mx)}</p></div>'
-    loans = [L for L in store.loans.values() if L.get("client_id") == client_id]
-    lr = "".join(
-        f"<tr><td>#{L['id']}</td><td>{fmt_money(L.get('amount'))}</td><td>{L.get('status')}</td>"
-        f"<td><a class='btn btn-secondary' href='{url_for('loan_detail', loan_id=L['id'])}'>Ver</a></td></tr>"
-        for L in loans
+    score_html = (
+        f'<div class="card" style="margin-bottom:12px;">'
+        f'<h3 style="margin-top:0;margin-bottom:8px">🔎 Score de crédito</h3>'
+        f'<p style="margin:0;"><b>Score:</b> {sd["score"]} &nbsp; <b>Nivel:</b> {sd["nivel"]}</p>'
+        f'<p style="margin:6px 0 0 0;"><b>Préstamos pagados:</b> {sd["prestamos_pagados"]} &nbsp; <b>Atrasos:</b> {sd["atrasos"]}</p>'
+        f'<p style="margin:10px 0 0 0;"><b>Crédito recomendado:</b> {fmt_money(mx)}</p>'
+        f'</div>'
     )
+    loans = [L for L in store.loans.values() if L.get("client_id") == client_id]
+
+    def fmt_date(d):
+        return d.strftime("%Y-%m-%d") if hasattr(d, "strftime") else str(d)
+
+    def fmt_date_ddmmyyyy(d):
+        return d.strftime("%d/%m/%Y") if hasattr(d, "strftime") else str(d)
+
+    # Tabla de préstamos (alineada al formato de tu otro sistema).
+    loan_rows = []
+    for L in sorted(loans, key=lambda x: -x.get("id", 0)):
+        paid_interest = round(
+            sum(float(p.get("interest") or 0) for p in store.payments.values() if p.get("loan_id") == L.get("id")),
+            2,
+        )
+        upfront_pct = float(L.get("upfront_percent") or 0.0)
+        inicio = fmt_date_ddmmyyyy(L.get("start_date"))
+
+        del_form = (
+            f"<form method='post' action='{url_for('delete_loan', loan_id=L['id'])}' "
+            f"style='margin:0' onsubmit=\"return confirm('¿Eliminar préstamo #{L['id']}?');\">"
+            f"<button class='btn btn-secondary' type='submit' style='padding:6px 10px'>Eliminar</button>"
+            f"</form>"
+        )
+
+        actions = (
+            f"<a class='btn btn-secondary' style='padding:6px 10px' href='{url_for('loan_detail', loan_id=L['id'])}'>Ver</a> "
+            f"<a class='btn btn-primary' style='padding:6px 10px' href='{url_for('edit_loan', loan_id=L['id'])}'>Editar</a> "
+            f"{del_form}"
+        )
+
+        loan_rows.append(
+            "<tr>"
+            f"<td>{L['id']}</td>"
+            f"<td>{fmt_money(L.get('amount'))}</td>"
+            f"<td>{fmt_money(L.get('remaining'))}</td>"
+            f"<td>{upfront_pct:.2f}%</td>"
+            f"<td>{L.get('frequency') or '—'}</td>"
+            f"<td>{inicio}</td>"
+            f"<td>{fmt_money(paid_interest)}</td>"
+            f"<td>{L.get('status') or '—'}</td>"
+            f"<td>{actions}</td>"
+            "</tr>"
+        )
+
+    lr = "".join(loan_rows) if loan_rows else "<tr><td colspan='9' style='opacity:.85; text-align:center'>Sin préstamos</td></tr>"
+
+    # Dropdown para reasignar cobrador.
+    collectors_opts = "".join(
+        f"<option value='{u['id']}'{' selected' if u['id'] == c.get('created_by') else ''}>{u.get('username')}</option>"
+        for u in store.users.values()
+        if u.get("role") == "cobrador" and u.get("organization_id") == org_id
+    )
+
+    header = (
+        f'<div class="card" style="margin-bottom:12px;">'
+        f'<h2 style="margin-top:0;margin-bottom:10px">{c["first_name"]} {c.get("last_name") or ""}</h2>'
+        f"<p style='margin:6px 0;'><b>Tel:</b> {c.get('phone') or '—'}</p>"
+        f"<p style='margin:6px 0;'><b>Dirección:</b> {c.get('address') or '—'}</p>"
+        f"<p style='margin:6px 0;'><b>Documento:</b> {c.get('document_id') or '—'}</p>"
+        f"<p style='margin:6px 0;'><b>Ruta:</b> {c.get('route') or '—'}</p>"
+        f'<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;margin-bottom:10px;">'
+        f'<a class="btn btn-secondary" href="{url_for("edit_client", client_id=client_id)}">Editar</a> '
+        f'<form method="post" action="{url_for("delete_client", client_id=client_id)}" style="margin:0" onsubmit="return confirm(\'¿Borrar cliente?\');">'
+        f'<button class="btn btn-secondary" type="submit">Eliminar</button></form>'
+        f"</div>"
+        f"<div style='border-top:1px solid rgba(148,163,184,.35); padding-top:10px;'>"
+        f"<form method='post' action='{url_for('reassign_single_client', client_id=client_id)}' style='display:flex;gap:8px;flex-wrap:wrap;align-items:center;'>"
+        f"<label style='margin:0;'><b>Reasignar cobrador:</b></label>"
+        f"<select name='collector_id'>{collectors_opts}</select>"
+        f"<button class='btn btn-primary' type='submit'>Mover cliente</button>"
+        f"</form>"
+        f"</div>"
+        f"</div>"
+    )
+
     body = (
-        score_html
-        + f'<div class="card"><h2>{c["first_name"]} {c.get("last_name") or ""}</h2>'
-        + f"<p>{c.get('phone') or ''} · {c.get('route') or ''}</p>"
-        + f'<div class="table-scroll"><table><tr><th>ID</th><th>Monto</th><th>Estado</th><th></th></tr>{lr}</table></div>'
-        + f'<a class="btn btn-primary" href="{url_for("new_loan")}?client_id={client_id}">Nuevo préstamo</a> '
-        + f'<a class="btn btn-secondary" href="{url_for("edit_client", client_id=client_id)}">Editar</a>'
-        + f'<form method="post" action="{url_for("delete_client", client_id=client_id)}" style="margin-top:8px" onsubmit="return confirm(\'¿Borrar cliente?\');">'
-        + f'<button class="btn btn-secondary" type="submit">Eliminar cliente</button></form></div>'
+        header
+        + score_html
+        + f'<div class="card">'
+        f'<a class="btn btn-primary" href="{url_for("new_loan")}?client_id={client_id}">Nuevo préstamo</a>'
+        f'<div class="table-scroll" style="margin-top:12px;">'
+        f"<table><tr><th>ID</th><th>Monto</th><th>Restante</th><th>%</th><th>Frecuencia</th><th>Inicio</th><th>Interés pagado</th><th>Estado</th><th>Acciones</th></tr>{lr}</table>"
+        f"</div></div>"
     )
     return page(body)
 
@@ -1428,12 +1574,22 @@ def new_payment(loan_id):
             flash("Monto inválido.", "danger")
             return redirect(url_for("new_payment", loan_id=loan_id))
 
+        typ_l = str(typ or "").strip().lower()
+        weeks_adv = None
+        if typ_l == "adelanto":
+            weeks_adv = request.form.get("weeks_advanced", type=int) or 1
+            weeks_adv = max(1, min(int(weeks_adv), 52))
+
+        pay_note = f"Pago préstamo #{loan_id}"
+        if typ_l == "adelanto":
+            pay_note = f"Pago adelantado préstamo #{loan_id} ({weeks_adv} sem.)"
+
         # Registrar movimiento en el banco (siempre suma).
         try:
             apply_cash_movement(
                 movement_type="pago_prestamo",
                 amount=amt,
-                note=f"Pago préstamo #{loan_id}",
+                note=pay_note,
                 user_id=current_user()["id"],
                 org_id=session.get("org_id"),
             )
@@ -1445,26 +1601,38 @@ def new_payment(loan_id):
         store.payments[pid] = {
             "id": pid, "loan_id": loan_id, "amount": amt, "type": typ, "date": date.today(),
             "created_by": current_user()["id"], "capital": amt * 0.5, "interest": amt * 0.5,
-            "status": "OK", "weeks_advanced": None,
+            "status": "OK", "weeks_advanced": weeks_adv,
+            "created_at": datetime.utcnow(),
         }
         rem = float(L.get("remaining") or 0) - amt
         L["remaining"] = max(0, rem)
         if L["remaining"] <= 0:
             L["status"] = "cerrado"
         # Si se registra una cuota, avanzamos la próxima fecha automáticamente.
-        if str(typ or "").strip().lower() == "cuota":
+        if typ_l == "cuota":
             interval_days = freq_interval_days(L.get("frequency"))
             current_due = L.get("next_payment_date") or date.today()
             if hasattr(current_due, "strftime"):
                 L["next_payment_date"] = current_due + timedelta(days=interval_days)
+        elif typ_l == "adelanto" and weeks_adv:
+            interval_days = freq_interval_days(L.get("frequency"))
+            current_due = L.get("next_payment_date") or date.today()
+            if hasattr(current_due, "strftime"):
+                L["next_payment_date"] = current_due + timedelta(days=interval_days * weeks_adv)
         flash("Pago registrado.", "success")
         return redirect(url_for("loan_detail", loan_id=loan_id))
     body = (
-        f'<div class="card"><h2>Pago — préstamo #{loan_id}</h2><form method="post">'
+        f'<div class="card"><h2>Pago — préstamo #{loan_id}</h2><form method="post" id="payForm">'
         f'<p style="margin:6px 0 10px 0; opacity:.95;"><b>Cuota recomendada:</b> {fmt_money(scheduled_payment)}</p>'
         f'<label>Monto</label><input name="amount" type="number" step="0.01" value="{scheduled_payment}" required>'
-        f'<label>Tipo</label><select name="type"><option value="cuota">Cuota</option><option value="capital">Capital</option><option value="interes">Interés</option></select>'
-        f'<button class="btn btn-primary" type="submit">Registrar</button></form></div>'
+        f'<label>Tipo</label><select name="type" id="payType"><option value="cuota">Cuota</option>'
+        f'<option value="adelanto">Adelanto</option><option value="capital">Capital</option><option value="interes">Interés</option></select>'
+        f'<div id="weeksWrap" style="display:none;margin-top:8px"><label>Semanas adelantadas</label>'
+        f'<input name="weeks_advanced" type="number" min="1" max="52" value="1" id="weeksInp"></div>'
+        f'<button class="btn btn-primary" type="submit">Registrar</button></form>'
+        f"<script>document.getElementById('payType').addEventListener('change',function(){{"
+        f"document.getElementById('weeksWrap').style.display=this.value==='adelanto'?'block':'none';}});"
+        f"document.getElementById('weeksWrap').style.display=document.getElementById('payType').value==='adelanto'?'block':'none';</script></div>"
     )
     return page(body)
 
@@ -1646,8 +1814,55 @@ def collector_map():
 @app.route("/advance/delete/<int:payment_id>", methods=["POST"])
 @login_required
 def delete_advance(payment_id):
+    ensure_org()
+    oid = session.get("org_id")
+    user = current_user()
+    p = store.payments.get(payment_id)
+    if not p:
+        flash("Pago no encontrado.", "danger")
+        return redirect(url_for("bank_advance"))
+    loan_id = p.get("loan_id")
+    L = store.loans.get(loan_id) if loan_id else None
+    if L and L.get("organization_id") != oid:
+        flash("Sin acceso.", "danger")
+        return redirect(url_for("bank_advance"))
+    if L and loan_id not in loan_ids_visible(oid, user):
+        flash("Sin acceso.", "danger")
+        return redirect(url_for("bank_advance"))
+
+    is_adv = str(p.get("type") or "").strip().lower() == "adelanto" or int(p.get("weeks_advanced") or 0) > 0
+    if not is_adv:
+        flash("Este registro no es un adelanto.", "danger")
+        return redirect(url_for("bank_advance"))
+
+    amt = float(p.get("amount") or 0)
+    weeks = int(p.get("weeks_advanced") or 0)
+    if str(p.get("type") or "").strip().lower() == "adelanto" and weeks < 1:
+        weeks = 1
+
+    # Revertir ingreso al banco por ese pago.
+    try:
+        apply_cash_movement(
+            movement_type="reverso_adelanto",
+            amount=-amt,
+            note=f"Reverso adelanto pago #{payment_id} préstamo #{loan_id}",
+            user_id=user["id"],
+            org_id=oid,
+        )
+    except ValueError as e:
+        flash(str(e), "danger")
+        return redirect(url_for("bank_advance"))
+
+    if L:
+        L["remaining"] = float(L.get("remaining") or 0) + amt
+        if str(L.get("status") or "").lower() == "cerrado" and L["remaining"] > 0:
+            L["status"] = "ACTIVO"
+        if weeks > 0 and L.get("next_payment_date") and hasattr(L.get("next_payment_date"), "strftime"):
+            interval = freq_interval_days(L.get("frequency"))
+            L["next_payment_date"] = L["next_payment_date"] - timedelta(days=weeks * interval)
+
     store.payments.pop(payment_id, None)
-    flash("Adelanto eliminado.", "info")
+    flash("Adelanto eliminado.", "success")
     return redirect(url_for("bank_advance"))
 
 
@@ -1942,7 +2157,83 @@ def sign_legal_document(loan_id):
 @app.route("/bank/advance", methods=["GET", "POST"])
 @login_required
 def bank_advance():
-    return stub_page("Adelantos de pago")
+    ensure_org()
+    oid = session.get("org_id")
+    user = current_user()
+
+    def payment_ts(p):
+        ts = p.get("created_at")
+        if ts:
+            return fmt_advance_datetime(ts)
+        d = p.get("date")
+        if hasattr(d, "strftime"):
+            return d.strftime("%d/%m/%Y") + " 12:00 AM"
+        return "—"
+
+    advances = []
+    for p in payments_in_scope(oid, user):
+        if (p.get("status") or "OK") == "ANULADO":
+            continue
+        typ = str(p.get("type") or "").strip().lower()
+        wk = int(p.get("weeks_advanced") or 0)
+        if typ != "adelanto" and wk <= 0:
+            continue
+        advances.append(p)
+
+    advances.sort(key=lambda x: (x.get("created_at") or datetime.min, x.get("id", 0)), reverse=True)
+
+    rows = []
+    for p in advances[:300]:
+        lid = p.get("loan_id")
+        L = store.loans.get(lid, {})
+        cid = L.get("client_id")
+        cl = store.clients.get(cid, {})
+        nm = f"{cl.get('first_name','')} {cl.get('last_name') or ''}".strip() or f"Cliente #{cid}"
+        wk_disp = int(p.get("weeks_advanced") or 1)
+        del_form = (
+            f'<form method="post" action="{url_for("delete_advance", payment_id=p["id"])}" style="display:inline; margin:0" '
+            f'onsubmit="return confirm(\'¿Eliminar este adelanto?\');">'
+            f'<button type="submit" class="btn-adv-del">🗑 Eliminar</button></form>'
+        )
+        rows.append(
+            "<tr>"
+            f"<td>{lid}</td>"
+            f"<td>{nm}</td>"
+            f"<td>{wk_disp}</td>"
+            f"<td class='adv-monto'>{fmt_money(p.get('amount'))}</td>"
+            f"<td class='adv-fecha'>{payment_ts(p)}</td>"
+            f"<td>{del_form}</td>"
+            "</tr>"
+        )
+
+    tbody = "".join(rows) if rows else (
+        "<tr><td colspan='6' style='text-align:center;opacity:.85;padding:16px'>Sin pagos adelantados</td></tr>"
+    )
+
+    body = f"""
+<div class="card adv-wrap" style="padding:16px;background:#ecfdf5;border:1px solid rgba(22,163,74,.18);">
+  <style>
+    .adv-wrap h2{{margin:0 0 14px 0;font-size:1.35rem;font-weight:900;color:#14532d}}
+    .adv-table{{width:100%;border-collapse:collapse;background:#fff;border-radius:14px;overflow:hidden;box-shadow:0 4px 18px rgba(0,0,0,.06)}}
+    .adv-table th{{text-align:left;padding:12px 14px;background:#dcfce7;color:#14532d;font-weight:900;font-size:13px}}
+    .adv-table td{{padding:11px 14px;border-bottom:1px solid rgba(148,163,184,.2);font-size:14px}}
+    .adv-table tr:last-child td{{border-bottom:none}}
+    .adv-monto{{color:#16a34a;font-weight:900}}
+    .adv-fecha{{font-variant-numeric:tabular-nums;color:#334155}}
+    .btn-adv-del{{background:#dc2626;color:#fff;border:none;border-radius:999px;padding:8px 14px;font-weight:800;cursor:pointer;font-size:13px}}
+    .btn-adv-del:hover{{filter:brightness(1.05)}}
+  </style>
+  <h2>⏩ Pagos adelantados</h2>
+  <div class="table-scroll">
+    <table class="adv-table">
+      <tr><th>Préstamo</th><th>Cliente</th><th>Semanas adelantadas</th><th>Monto</th><th>Fecha</th><th>Acción</th></tr>
+      {tbody}
+    </table>
+  </div>
+  {nav_subfooter()}
+</div>
+"""
+    return page(body)
 
 
 @app.route("/ruta/agregar-capital", methods=["POST"])
@@ -1965,26 +2256,100 @@ def bank_daily_list():
 def bank_expenses():
     ensure_org()
     oid = session.get("org_id")
-    rows = "".join(
-        f"<tr><td>{e.get('route') or '—'}</td><td>{e.get('amount') and fmt_money(e.get('amount')) or ''}</td>"
-        f"<td>{e.get('note') or ''}</td><td>{e.get('created_at') or ''}</td>"
-        f"<td><form method='post' action='{url_for('delete_route_expense', expense_id=e['id'])}' onsubmit=\"return confirm('¿Eliminar gasto?');\">"
-        f"<button class='btn btn-secondary' type='submit'>Borrar</button></form></td></tr>"
-        for e in reversed(list(store.route_expenses.values()))
-        if e.get("organization_id") == oid
+
+    kind_options = "".join(
+        f'<option value="{k}">{ico} {lbl}</option>' for k, (lbl, ico) in ROUTE_EXPENSE_KINDS.items()
     )
-    if not rows:
-        rows = "<tr><td colspan=5 style='opacity:.85'>Sin gastos aún</td></tr>"
-    body = (
-        f'<div class="card"><h2>🧾 Gastos de ruta</h2>'
-        f'<form method="post" action="{url_for("add_route_expense")}">'
-        f'<label>Ruta</label><input name="route" placeholder="Ej. Ruta 1">'
-        f'<label>Monto</label><input name="amount" type="number" step="0.01" required>'
-        f'<label>Nota</label><input name="note" placeholder="Ej. Transporte / comida"></form>'
-        f'<button class="btn btn-primary" type="submit">Registrar gasto</button>'
-        f'<div class="table-scroll" style="margin-top:12px"><table><tr><th>Ruta</th><th>Monto</th><th>Nota</th><th>Fecha</th><th></th></tr>{rows}</table></div>'
-        f"{nav_subfooter()}</div>"
+
+    expense_list = sorted(
+        (e for e in store.route_expenses.values() if e.get("organization_id") == oid),
+        key=lambda x: x.get("created_at") or datetime.min,
+        reverse=True,
     )
+
+    tbody_rows = []
+    for idx, e in enumerate(expense_list):
+        kind = e.get("kind") or "otros"
+        lbl, ico = route_expense_kind_info(kind)
+        row_bg = "#ecfdf5" if idx % 2 == 0 else "#ffffff"
+        edit_btn = f'<a class="route-act route-act-edit" href="{url_for("edit_expense", expense_id=e["id"])}" title="Editar">✏</a>'
+        del_form = (
+            f'<form method="post" action="{url_for("delete_route_expense", expense_id=e["id"])}" style="display:inline" '
+            f'onsubmit="return confirm(\'¿Eliminar este gasto?\');">'
+            f'<button type="submit" class="route-act route-act-del" title="Eliminar">🗑</button></form>'
+        )
+        tbody_rows.append(
+            f"<tr style='background:{row_bg};'>"
+            f"<td>{e.get('route') or '—'}</td>"
+            f"<td><span class='route-tipo'>{ico} {lbl}</span></td>"
+            f"<td class='route-monto'>💵 {fmt_money(e.get('amount'))}</td>"
+            f"<td>{e.get('note') or '—'}</td>"
+            f"<td class='route-fecha'>{fmt_expense_datetime(e.get('created_at'))}</td>"
+            f"<td style='white-space:nowrap'>{edit_btn} {del_form}</td>"
+            f"</tr>"
+        )
+
+    rows = "".join(tbody_rows) if tbody_rows else (
+        "<tr><td colspan='6' style='opacity:.85;text-align:center;padding:16px'>Sin gastos registrados</td></tr>"
+    )
+
+    body = f"""
+<div class="card route-exp-wrap" style="padding:16px;background:linear-gradient(180deg,#ecfdf5,#f8fffc);border:1px solid rgba(22,163,74,.2);">
+  <style>
+    .route-exp-wrap h2{{margin:0 0 4px 0;font-size:1.25rem;font-weight:900;color:#14532d}}
+    .route-exp-wrap h3{{margin:18px 0 10px 0;font-size:1.05rem;font-weight:900;color:#14532d}}
+    .route-form-row{{display:flex;flex-wrap:wrap;gap:12px 16px;align-items:flex-end;margin-top:10px}}
+    .route-field{{flex:1 1 140px;min-width:120px}}
+    .route-field label{{display:block;font-size:12px;font-weight:800;color:#166534;margin-bottom:4px}}
+    .route-field input,.route-field select{{width:100%;padding:10px 12px;border-radius:12px;border:1px solid rgba(22,101,52,.25);background:#fff;font-size:14px}}
+    .route-save{{flex:0 0 auto;padding:11px 20px;border-radius:999px;border:none;background:#16a34a;color:#fff;font-weight:900;cursor:pointer;box-shadow:0 4px 14px rgba(22,163,74,.35)}}
+    .route-save:hover{{filter:brightness(1.05)}}
+    .route-table{{width:100%;border-collapse:collapse;font-size:14px;margin-top:6px}}
+    .route-table th{{text-align:left;padding:10px 12px;background:#dcfce7;color:#14532d;font-weight:900;border-bottom:2px solid rgba(22,163,74,.25)}}
+    .route-table td{{padding:10px 12px;border-bottom:1px solid rgba(148,163,184,.25);vertical-align:middle}}
+    .route-monto{{color:#16a34a;font-weight:900}}
+    .route-fecha{{font-variant-numeric:tabular-nums;color:#334155}}
+    .route-act{{display:inline-flex;align-items:center;justify-content:center;width:36px;height:36px;border-radius:50%;border:none;cursor:pointer;text-decoration:none;font-size:16px;line-height:1}}
+    .route-act-edit{{background:#fb923c;color:#fff}}
+    .route-act-del{{background:#d946ef;color:#fff}}
+  </style>
+
+  <h2>📋 Registrar gasto de ruta</h2>
+  <form method="post" action="{url_for("add_route_expense")}">
+    <div class="route-form-row">
+      <div class="route-field">
+        <label>Ruta</label>
+        <input name="route" type="text" placeholder="Ej: Ruta Norte" autocomplete="off">
+      </div>
+      <div class="route-field">
+        <label>Tipo de gasto</label>
+        <select name="tipo">{kind_options}</select>
+      </div>
+      <div class="route-field">
+        <label>Monto</label>
+        <input name="amount" type="number" step="0.01" min="0.01" required placeholder="0.00">
+      </div>
+      <div class="route-field" style="flex:2 1 200px">
+        <label>Nota</label>
+        <input name="note" type="text" placeholder="Opcional" autocomplete="off">
+      </div>
+      <div class="route-field" style="flex:0 0 auto">
+        <label style="opacity:0">.</label>
+        <button class="route-save" type="submit">➕ Guardar gasto</button>
+      </div>
+    </div>
+  </form>
+
+  <h3>📄 Gastos registrados</h3>
+  <div class="table-scroll">
+    <table class="route-table">
+      <tr><th>Ruta</th><th>Tipo</th><th>Monto</th><th>Nota</th><th>Fecha</th><th></th></tr>
+      {rows}
+    </table>
+  </div>
+  {nav_subfooter()}
+</div>
+"""
     return page(body)
 
 
@@ -2006,7 +2371,78 @@ def delete_route_expense(expense_id):
 @app.route("/bank/expenses/edit/<int:expense_id>", methods=["GET", "POST"])
 @login_required
 def edit_expense(expense_id):
-    return stub_page("Editar gasto")
+    ensure_org()
+    oid = session.get("org_id")
+    exp = store.route_expenses.get(expense_id)
+    if not exp or exp.get("organization_id") != oid:
+        flash("Gasto no encontrado.", "danger")
+        return redirect(url_for("bank_expenses"))
+
+    if request.method == "POST":
+        route = (request.form.get("route") or "").strip()
+        note = (request.form.get("note") or "").strip()
+        kind = (request.form.get("tipo") or "otros").strip().lower()
+        if kind not in ROUTE_EXPENSE_KINDS:
+            kind = "otros"
+        lbl, ico = route_expense_kind_info(kind)
+        new_amt = request.form.get("amount", type=float)
+        if new_amt is None or new_amt <= 0:
+            flash("Monto inválido.", "danger")
+            return redirect(url_for("edit_expense", expense_id=expense_id))
+
+        old_amt = float(exp.get("amount") or 0)
+        old_cash_id = exp.get("cash_report_id")
+
+        projected = get_bank_available(oid) + old_amt - new_amt
+        if projected < -1e-9:
+            flash("Banco insuficiente para este cambio de monto.", "danger")
+            return redirect(url_for("edit_expense", expense_id=expense_id))
+
+        old_entry = store.cash_reports.get(old_cash_id) if old_cash_id is not None else None
+        if old_cash_id is not None:
+            store.cash_reports.pop(old_cash_id, None)
+
+        cash_note = f"{ico} {lbl} — {route or '—'}" + (f" · {note}" if note else "")
+        try:
+            new_cash_id = apply_cash_movement(
+                movement_type="gasto_ruta",
+                amount=-new_amt,
+                note=cash_note + " (editado)",
+                user_id=current_user()["id"],
+                org_id=oid,
+            )
+        except ValueError as e:
+            if old_entry is not None and old_cash_id is not None:
+                store.cash_reports[old_cash_id] = old_entry
+            flash(str(e), "danger")
+            return redirect(url_for("edit_expense", expense_id=expense_id))
+
+        exp["route"] = route
+        exp["kind"] = kind
+        exp["amount"] = round(float(new_amt), 2)
+        exp["note"] = note or "—"
+        exp["cash_report_id"] = new_cash_id
+        flash("Gasto actualizado.", "success")
+        return redirect(url_for("bank_expenses"))
+
+    cur_kind = exp.get("kind") or "otros"
+    kind_options = "".join(
+        f"<option value='{k}'{' selected' if k == cur_kind else ''}>{ico} {html.escape(lbl)}</option>"
+        for k, (lbl, ico) in ROUTE_EXPENSE_KINDS.items()
+    )
+    body = (
+        f'<div class="card route-exp-wrap" style="padding:16px;background:#ecfdf5;">'
+        f"<h2 style='margin-top:0'>Editar gasto #{expense_id}</h2>"
+        f"<form method='post'>"
+        f"<label>Ruta</label><input name='route' value='{html.escape(exp.get('route') or '')}'>"
+        f"<label>Tipo de gasto</label><select name='tipo'>{kind_options}</select>"
+        f"<label>Monto</label><input name='amount' type='number' step='0.01' value='{exp.get('amount')}'>"
+        f"<label>Nota</label><input name='note' value='{html.escape((exp.get('note') or '') if exp.get('note') != '—' else '')}'>"
+        f"<p style='margin-top:12px'><button class='btn btn-primary' type='submit'>Guardar</button> "
+        f"<a class='btn btn-secondary' href='{url_for('bank_expenses')}'>Volver</a></p>"
+        f"</form></div>"
+    )
+    return page(body)
 
 
 @app.route("/route/expenses/new", methods=["POST"])
@@ -2015,18 +2451,23 @@ def add_route_expense():
     ensure_org()
     org_id = session.get("org_id")
     route = (request.form.get("route") or "").strip()
-    note = (request.form.get("note") or "").strip() or "Gasto de ruta"
+    note = (request.form.get("note") or "").strip()
+    kind = (request.form.get("tipo") or "otros").strip().lower()
+    if kind not in ROUTE_EXPENSE_KINDS:
+        kind = "otros"
+    lbl, ico = route_expense_kind_info(kind)
     exp_amount = request.form.get("amount", type=float)
     if exp_amount is None or exp_amount <= 0:
         flash("Monto inválido.", "danger")
         return redirect(url_for("bank_expenses"))
 
+    cash_note = f"{ico} {lbl} — {route or '—'}" + (f" · {note}" if note else "")
     # Movimiento negativo del banco (gasto).
     try:
         cash_id = apply_cash_movement(
             movement_type="gasto_ruta",
             amount=-exp_amount,
-            note=f"Gasto de ruta ({route or '—'})",
+            note=cash_note,
             user_id=current_user()["id"],
             org_id=org_id,
         )
@@ -2038,9 +2479,10 @@ def add_route_expense():
     store.route_expenses[eid] = {
         "id": eid,
         "route": route,
+        "kind": kind,
         "expense_type": "gasto_ruta",
         "amount": round(float(exp_amount), 2),
-        "note": note,
+        "note": note or "—",
         "user_id": current_user()["id"],
         "created_at": datetime.utcnow(),
         "organization_id": org_id,
@@ -2387,28 +2829,72 @@ def bank_late():
     user = current_user()
     org_id = session.get("org_id")
     today = date.today()
-    late = [
-        L for L in loans_for_user(org_id, user)
-        if str(L.get("status", "")).upper() == "ACTIVO"
-        and L.get("next_payment_date")
-        and L["next_payment_date"] < today
-    ]
-    late.sort(key=lambda x: x.get("next_payment_date") or today)
-    rows = ""
-    for L in late:
+
+    rows_pack = []
+    for L in loans_for_user(org_id, user):
+        if str(L.get("status", "")).upper() != "ACTIVO":
+            continue
+        if float(L.get("remaining") or 0) <= 0:
+            continue
+        npd = L.get("next_payment_date")
+        if not npd or not hasattr(npd, "strftime"):
+            continue
+        if npd >= today:
+            continue
+        days_late = (today - npd).days
+        cuota_n = count_loan_cuota_payments(L["id"]) + 1
+        rows_pack.append((days_late, L, cuota_n, npd))
+
+    rows_pack.sort(key=lambda x: -x[0])
+
+    rows = []
+    for days_late, L, cuota_n, npd in rows_pack[:400]:
         cid = L.get("client_id")
         c = store.clients.get(cid, {})
         nm = f"{c.get('first_name','')} {c.get('last_name') or ''}".strip() or f"Cliente #{cid}"
-        rows += (
-            f"<tr><td>#{L['id']}</td><td>{nm}</td><td>{L.get('next_payment_date')}</td>"
-            f"<td>{fmt_money(L.get('remaining'))}</td>"
-            f"<td><a class='btn btn-secondary' href='{url_for('loan_detail', loan_id=L['id'])}'>Ver</a></td></tr>"
+        phone = (c.get("phone") or "").strip() or "—"
+        due_s = npd.strftime("%d/%m/%Y")
+        pay_href = url_for("new_payment", loan_id=L["id"])
+        rows.append(
+            "<tr>"
+            f"<td>{nm}</td>"
+            f"<td>Cuota atrasada #{cuota_n}</td>"
+            f"<td>{phone}</td>"
+            f"<td class='late-days'><b>{days_late} días</b></td>"
+            f"<td class='late-saldo'>{fmt_money(L.get('remaining'))}</td>"
+            f"<td class='late-fecha'>{due_s}</td>"
+            f"<td><a class='btn-late-pay' href='{pay_href}'>💸 Pagar</a></td>"
+            "</tr>"
         )
-    body = (
-        f'<div class="card"><h2>⚠️ Préstamos atrasados</h2>'
-        f'<div class="table-scroll"><table><tr><th>ID</th><th>Cliente</th><th>Vencía</th><th>Saldo</th><th></th></tr>'
-        f"{rows or '<tr><td colspan=5>Sin atrasos</td></tr>'}</table></div>{nav_subfooter()}</div>"
+
+    tbody = "".join(rows) if rows else (
+        "<tr><td colspan='7' style='text-align:center;opacity:.85;padding:16px'>Sin cuotas atrasadas</td></tr>"
     )
+
+    body = f"""
+<div class="card late-wrap" style="padding:16px;background:#fffbeb;border:1px solid rgba(217,119,6,.22);">
+  <style>
+    .late-wrap h2{{margin:0 0 14px 0;font-size:1.35rem;font-weight:900;color:#78350f}}
+    .late-table{{width:100%;border-collapse:collapse;background:#fff;border-radius:14px;overflow:hidden;box-shadow:0 4px 18px rgba(0,0,0,.06)}}
+    .late-table th{{text-align:left;padding:12px 14px;background:#fef3c7;color:#78350f;font-weight:900;font-size:13px}}
+    .late-table td{{padding:11px 14px;border-bottom:1px solid rgba(148,163,184,.2);font-size:14px}}
+    .late-table tr:last-child td{{border-bottom:none}}
+    .late-days{{color:#dc2626;font-variant-numeric:tabular-nums}}
+    .late-saldo{{color:#16a34a;font-weight:900}}
+    .late-fecha{{font-variant-numeric:tabular-nums;color:#334155}}
+    .btn-late-pay{{background:#dc2626;color:#fff;border-radius:999px;padding:8px 14px;font-weight:800;font-size:13px;text-decoration:none;display:inline-block}}
+    .btn-late-pay:hover{{filter:brightness(1.06)}}
+  </style>
+  <h2>⚠️ Cuotas Atrasadas</h2>
+  <div class="table-scroll">
+    <table class="late-table">
+      <tr><th>Cliente</th><th>Cuota</th><th>Teléfono</th><th>Días atraso</th><th>Saldo</th><th>Fecha vencida</th><th>Acción</th></tr>
+      {tbody}
+    </table>
+  </div>
+  {nav_subfooter()}
+</div>
+"""
     return page(body)
 
 
