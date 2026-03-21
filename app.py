@@ -2381,9 +2381,18 @@ def new_loan():
         discount_cash_id = None
         disbursement_cash_id = None
 
-        # 1) Descuento inicial entra al sistema y SUMA al banco.
-        # 2) Se entrega al cliente SOLO el monto neto (amount - descuento) y RESTA del banco.
+        # Fórmula: caja = caja - capital + descuento
+        # 1) Se resta el capital completo del banco (préstamo entregado).
+        # 2) El descuento inicial vuelve a caja (se suma).
         try:
+            if amount > 0:
+                disbursement_cash_id = apply_cash_movement(
+                    movement_type="prestamo_entregado",
+                    amount=-float(amount),
+                    note=f"Préstamo entregado cliente #{client_id}",
+                    user_id=user["id"],
+                    org_id=org_id,
+                )
             if discount_amount > 0:
                 discount_cash_id = apply_cash_movement(
                     movement_type="descuento_inicial",
@@ -2403,14 +2412,6 @@ def new_loan():
                     )
                 except Exception:
                     pass
-            if monto_entregado > 0:
-                disbursement_cash_id = apply_cash_movement(
-                    movement_type="prestamo_entregado",
-                    amount=-monto_entregado,
-                    note=f"Préstamo entregado cliente #{client_id}",
-                    user_id=user["id"],
-                    org_id=org_id,
-                )
         except ValueError as e:
             flash(str(e), "danger")
             return redirect(url_for("new_loan"))
