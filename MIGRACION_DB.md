@@ -4,7 +4,7 @@
 
 **Implementado:**
 - Modelos SQLAlchemy: `admins`, `usuarios`, `clientes`, `prestamos`, `pagos`, `banco`, `gastos`, `atrasos`, `pagos_admin`, `descuentos`, `cierres`, `auditoria`
-- Capa de repositorio (`appdb/repository.py`) y operaciones (`appdb/ops.py`). El paquete se llama `appdb` (no `db`) para que Git no lo ignore.
+- Capa PostgreSQL en **`credimapa_pg.py`** (un solo módulo en la raíz del repo para que Render/Git no dependan de la carpeta `appdb/`). Opcionalmente sigue existiendo el paquete `appdb/` en desarrollo local.
 - Inicialización con `init_db.py`
 - Integración parcial en `app.py`:
   - Login, current_user

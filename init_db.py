@@ -14,8 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from werkzeug.security import generate_password_hash
 from datetime import datetime, timedelta
 
-from appdb.database import init_db, session_scope
-from appdb.models import Admin, Usuario
+from credimapa_pg import init_db, session_scope, Admin, Usuario
 
 # Config desde env (igual que app.py)
 SUPER_ADMIN_USERNAME = os.getenv("SUPER_ADMIN_USERNAME", "super_admin")

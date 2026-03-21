@@ -407,7 +407,7 @@ app.secret_key = os.getenv("SECRET_KEY", secrets.token_hex(16))
 
 USE_DATABASE = bool(os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL"))
 if USE_DATABASE:
-    from appdb import init_app
+    from credimapa_pg import init_app
     init_app(app)
 
 
@@ -416,7 +416,7 @@ def current_user():
     if not uid:
         return None
     if USE_DATABASE:
-        from appdb.ops import get_user
+        from credimapa_pg import get_user
         return get_user(uid)
     return store.users.get(uid)
 
@@ -458,7 +458,7 @@ def log_action(user_id, action, detail="", module=""):
     """
     try:
         if USE_DATABASE and user_id:
-            from appdb.ops import get_user
+            from credimapa_pg import get_user
             u = get_user(user_id) or {}
         else:
             u = store.users.get(user_id, {}) if user_id else {}
@@ -487,7 +487,7 @@ def log_action(user_id, action, detail="", module=""):
             "device": device,
         }
         if USE_DATABASE:
-            from appdb.ops import save_audit
+            from credimapa_pg import save_audit
             save_audit(data)
         else:
             data["id"] = store.nid("audit")
@@ -558,7 +558,7 @@ def stub_page(title, extra=""):
 
 def loans_for_user(org_id, user):
     if USE_DATABASE:
-        from appdb.ops import get_loans
+        from credimapa_pg import get_loans
         rows = list(get_loans([org_id]).values())
     else:
         rows = [L for L in store.loans.values() if L.get("organization_id") == org_id]
@@ -569,7 +569,7 @@ def loans_for_user(org_id, user):
 
 def clients_for_user(org_id, user):
     if USE_DATABASE:
-        from appdb.ops import get_clients
+        from credimapa_pg import get_clients
         rows = list(get_clients([org_id]).values())
     else:
         rows = [c for c in store.clients.values() if c.get("organization_id") == org_id]
@@ -643,7 +643,7 @@ def bank_org_id(org_id=None):
 def get_bank_available(org_id=None):
     oid = bank_org_id(org_id)
     if USE_DATABASE:
-        from appdb.ops import get_bank_available as _db_bank
+        from credimapa_pg import get_bank_available as _db_bank
         return _db_bank(oid)
     total = float(getattr(store, "starting_banks", {}).get(oid, 0.0) or 0.0)
     for cr in store.cash_reports.values():
@@ -659,7 +659,7 @@ def apply_cash_movement(movement_type, amount, note, user_id=None, org_id=None, 
     Aplica un movimiento al banco (ledger). Valida que nunca quede negativo.
     """
     if USE_DATABASE:
-        from appdb.ops import add_banco_movement as _db_add
+        from credimapa_pg import add_banco_movement as _db_add
         return _db_add(movement_type, amount, note, user_id, org_id, collector_id)
     oid = bank_org_id(org_id)
     amt = float(amount or 0)
@@ -688,7 +688,7 @@ def loan_ids_visible(org_id, user):
 def payments_in_scope(org_id, user):
     lids = loan_ids_visible(org_id, user)
     if USE_DATABASE:
-        from appdb.ops import get_payments
+        from credimapa_pg import get_payments
         pmts = get_payments([org_id])
         return [p for p in (pmts or {}).values() if p.get("loan_id") in lids]
     return [p for p in store.payments.values() if p.get("loan_id") in lids]
@@ -699,15 +699,14 @@ def _revert_loan_financials(loan_id, oid, user_id):
     Revierte todos los movimientos financieros de un préstamo.
     """
     if USE_DATABASE:
-        from appdb.database import get_session
-        from appdb import repository as _repo
-        L = _repo.get_prestamo(get_session(), loan_id)
+        from credimapa_pg import get_session, get_prestamo
+        L = get_prestamo(get_session(), loan_id)
     else:
         L = store.loans.get(loan_id)
     if not L:
         return
     if USE_DATABASE:
-        from appdb.ops import get_payments
+        from credimapa_pg import get_payments
         payments_src = list(get_payments([oid]).values())
     else:
         payments_src = list(store.payments.values())
@@ -726,22 +725,21 @@ def _revert_loan_financials(loan_id, oid, user_id):
             except ValueError:
                 pass
         if USE_DATABASE:
-            from appdb import repository as _repo
-            from appdb.database import get_session as _gs
-            _repo.delete_pago(_gs(), p.get("id"))
+            from credimapa_pg import delete_pago, get_session as _gs
+            delete_pago(_gs(), p.get("id"))
         else:
             store.payments.pop(p.get("id"), None)
     disc_id = L.get("discount_cash_report_id") or L.get("discount_banco_id")
     disb_id = L.get("disbursement_cash_report_id") or L.get("disbursement_banco_id")
     if disc_id:
         if USE_DATABASE:
-            from appdb.ops import pop_banco_movement
+            from credimapa_pg import pop_banco_movement
             pop_banco_movement(disc_id)
         else:
             store.cash_reports.pop(disc_id, None)
     if disb_id:
         if USE_DATABASE:
-            from appdb.ops import pop_banco_movement
+            from credimapa_pg import pop_banco_movement
             pop_banco_movement(disb_id)
         else:
             store.cash_reports.pop(disb_id, None)
@@ -785,7 +783,7 @@ def compute_financial_kpis(org_id, user):
             atrasados += 1
 
     if USE_DATABASE:
-        from appdb.ops import get_users
+        from credimapa_pg import get_users
         users_iter = get_users().values()
     else:
         users_iter = store.users.values()
@@ -828,7 +826,7 @@ def login():
         username = (request.form.get("username") or "").strip()
         password = (request.form.get("password") or "").strip()
         if USE_DATABASE:
-            from appdb.ops import get_user_by_username
+            from credimapa_pg import get_user_by_username
             user = get_user_by_username(username)
         else:
             user = next((u for u in store.users.values() if u.get("username") == username), None)
@@ -849,7 +847,7 @@ def login():
         else:
             tenant_id = user.get("organization_id") or user.get("admin_id") or ORG_ID
             if USE_DATABASE:
-                from appdb.ops import get_users
+                from credimapa_pg import get_users
                 tenant_admin = get_users().get(tenant_id, user)
             else:
                 tenant_admin = store.users.get(tenant_id, user) if tenant_id else user
@@ -1077,7 +1075,7 @@ def api_notification_check():
     org_id = session.get("org_id")
     user = current_user()
     if USE_DATABASE:
-        from appdb.ops import get_loans, get_loan_arrears
+        from credimapa_pg import get_loans, get_loan_arrears
         _loans = get_loans([org_id]) if org_id else {}
         _arrears = get_loan_arrears(org_id) or {}
         morosos = sum(
