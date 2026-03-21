@@ -11,6 +11,16 @@ import secrets
 from datetime import datetime, date, timedelta
 from functools import wraps
 
+from rd_time import (
+    FORMAT_RD_DATETIME,
+    combine_date_at_rd_midnight,
+    format_dt_rd,
+    format_payment_receipt_when,
+    get_current_time_rd,
+    today_rd,
+    utc_now_for_db,
+)
+
 from werkzeug.security import generate_password_hash, check_password_hash
 from flask import (
     Flask,
@@ -91,14 +101,8 @@ def receipt_cuotas_label(p, L):
 
 
 def receipt_payment_when(p):
-    """Fecha/hora para el recibo (DD/MM/YYYY HH:MM AM/PM RD)."""
-    ts = p.get("created_at")
-    if ts and hasattr(ts, "strftime"):
-        return ts.strftime("%d/%m/%Y %I:%M %p") + " RD"
-    d = p.get("date")
-    if hasattr(d, "strftime"):
-        return d.strftime("%d/%m/%Y") + " 12:00 PM RD"
-    return str(d or "—") + " RD"
+    """Fecha/hora para el recibo en hora de Santo Domingo (UTC en BD → RD al mostrar)."""
+    return format_payment_receipt_when(p)
 
 
 def freq_interval_days(freq):
@@ -137,7 +141,7 @@ def loan_frequency_label(freq):
 
 def proximo_sabado_cobro(d=None):
     """Sábado objetivo de la ruta: hoy si ya es sábado; si no, el próximo sábado."""
-    today = d or date.today()
+    today = d or today_rd()
     ahead = (5 - today.weekday()) % 7
     return today if ahead == 0 else today + timedelta(days=ahead)
 
@@ -147,7 +151,7 @@ def loans_cobro_sabado_semanal(org_id, user, ref_date=None):
     Préstamos semanales activos cuya próxima cuota vence a más tardar el sábado de cobro.
     Misma criterio que la lista de cobro de sábados.
     """
-    today = ref_date or date.today()
+    today = ref_date or today_rd()
     prox_sab = proximo_sabado_cobro(today)
     rows = []
     for L in loans_for_user(org_id, user):
@@ -183,17 +187,17 @@ def fmt_expense_datetime(dt):
     if not dt:
         return "—"
     try:
-        return dt.strftime("%Y-%m-%d %I:%M %p")
+        return format_dt_rd(dt, "%Y-%m-%d %I:%M %p")
     except Exception:
         return str(dt)
 
 
 def fmt_advance_datetime(dt):
-    """Fecha/hora para lista de adelantos (DD/MM/YYYY HH:MM AM/PM)."""
+    """Fecha/hora para lista de adelantos (America/Santo_Domingo)."""
     if not dt:
         return "—"
     try:
-        return dt.strftime("%d/%m/%Y %I:%M %p")
+        return format_dt_rd(dt, FORMAT_RD_DATETIME)
     except Exception:
         return str(dt)
 
@@ -272,6 +276,12 @@ body.theme-dark .premium-btn{background:rgba(15,23,42,.65);color:#e5e7eb}
 <button type="button" class="premium-btn" onclick="toggleMenu()"><span>☰</span><span style="font-size:11px;font-weight:700">Menú</span></button>
 {% endif %}
 <div class="topbar-title">{{ app_brand }}</div>
+{% if user %}
+<div style="position:absolute;right:14px;top:50%;transform:translateY(-50%);font-size:10px;opacity:.92;text-align:right;line-height:1.25">
+  <div>Hora RD</div>
+  <div style="font-weight:800">{{ time_rd_label }}</div>
+</div>
+{% endif %}
 </header>
 {% if user %}
 <div id="menuOverlay" class="menu-overlay" onclick="closeMenu()"></div>
@@ -367,7 +377,7 @@ class Store:
 
     def _seed(self):
         """Solo administrador inicial; clientes, préstamos y demás usuarios se crean desde la app."""
-        created = datetime.utcnow()
+        created = utc_now_for_db()
         sub_end = created + timedelta(days=DEFAULT_TENANT_SUBSCRIPTION_DAYS)
 
         # SUPER ADMIN (plataforma).
@@ -513,7 +523,7 @@ def log_action(user_id, action, detail="", module=""):
             save_audit(data)
         else:
             data["id"] = store.nid("audit")
-            data["created_at"] = datetime.utcnow()
+            data["created_at"] = utc_now_for_db()
             store.audit_log.append(data)
     except Exception:
         return
@@ -584,8 +594,14 @@ def evaluate_loan(score, prestamos_activos):
 
 def page(body, user=None):
     return render_template_string(
-        TPL_LAYOUT, body=body, user=user if user is not None else current_user(),
-        app_brand=APP_BRAND, flashes=get_flashed_messages(with_categories=True), theme=get_theme(),
+        TPL_LAYOUT,
+        body=body,
+        user=user if user is not None else current_user(),
+        app_brand=APP_BRAND,
+        flashes=get_flashed_messages(with_categories=True),
+        theme=get_theme(),
+        time_rd_label=format_dt_rd(get_current_time_rd()),
+        time_rd_zone="America/Santo_Domingo",
     )
 
 
@@ -757,9 +773,9 @@ def apply_cash_movement(movement_type, amount, note, user_id=None, org_id=None, 
         raise ValueError(f"Banco insuficiente. Disponible: {get_bank_available(oid)} | Requerido adicional: {abs(amt)}")
     rid = store.nid("cash")
     rec = {
-        "id": rid, "user_id": user_id, "date": date.today(),
+        "id": rid, "user_id": user_id, "date": today_rd(),
         "amount": round(amt, 2), "note": note or movement_type,
-        "created_at": datetime.utcnow(), "organization_id": oid,
+        "created_at": utc_now_for_db(), "organization_id": oid,
         "movement_type": movement_type,
     }
     if collector_id is not None:
@@ -874,7 +890,7 @@ def compute_financial_kpis(org_id, user):
     interes_pendiente = max(interes_total - interes_cobrado, 0)
     total_por_cobrar = capital_pendiente + interes_pendiente
 
-    today = date.today()
+    today = today_rd()
     cobrado_hoy = sum(float(p.get("amount") or 0) for p in ok if p.get("date") == today)
     interes_hoy = sum(float(p.get("interest") or 0) for p in ok if p.get("date") == today)
 
@@ -953,7 +969,7 @@ def login():
                 tenant_admin = get_users().get(tenant_id, user)
             else:
                 tenant_admin = store.users.get(tenant_id, user) if tenant_id else user
-            now = datetime.utcnow()
+            now = utc_now_for_db()
 
             def to_date(x):
                 if not x:
@@ -970,7 +986,7 @@ def login():
                     return x
                 return None
 
-            now_d = now.date()
+            now_d = today_rd()
             u_status = user.get("account_status", ACCOUNT_ACTIVE)
             tenant_status = tenant_admin.get("account_status", ACCOUNT_ACTIVE)
 
@@ -1068,7 +1084,7 @@ def register_admin():
         if days < 1:
             days = DEFAULT_TENANT_SUBSCRIPTION_DAYS
 
-        created = datetime.utcnow()
+        created = utc_now_for_db()
         sub_end = created + timedelta(days=days)
 
         uid = store.nid("users")
@@ -1186,7 +1202,7 @@ def api_notification_check():
         )
         hoy = sum(
             1 for L in _loans.values()
-            if L.get("organization_id") == org_id and str(L.get("status", "")).upper() == "ACTIVO" and L.get("next_payment_date") == date.today()
+            if L.get("organization_id") == org_id and str(L.get("status", "")).upper() == "ACTIVO" and L.get("next_payment_date") == today_rd()
         )
         if user_is_cobrador_limited(user):
             morosos = sum(
@@ -1195,7 +1211,7 @@ def api_notification_check():
             )
             hoy = sum(
                 1 for L in _loans.values()
-                if L.get("created_by") == user["id"] and str(L.get("status", "")).upper() == "ACTIVO" and L.get("next_payment_date") == date.today()
+                if L.get("created_by") == user["id"] and str(L.get("status", "")).upper() == "ACTIVO" and L.get("next_payment_date") == today_rd()
             )
     else:
         morosos = sum(
@@ -1204,7 +1220,7 @@ def api_notification_check():
         )
         hoy = sum(
             1 for L in store.loans.values()
-            if L.get("organization_id") == org_id and str(L.get("status", "")).upper() == "ACTIVO" and L.get("next_payment_date") == date.today()
+            if L.get("organization_id") == org_id and str(L.get("status", "")).upper() == "ACTIVO" and L.get("next_payment_date") == today_rd()
         )
         if user_is_cobrador_limited(user):
             morosos = sum(
@@ -1213,7 +1229,7 @@ def api_notification_check():
             )
             hoy = sum(
                 1 for L in store.loans.values()
-                if L.get("created_by") == user["id"] and str(L.get("status", "")).upper() == "ACTIVO" and L.get("next_payment_date") == date.today()
+                if L.get("created_by") == user["id"] and str(L.get("status", "")).upper() == "ACTIVO" and L.get("next_payment_date") == today_rd()
             )
     if morosos > 0:
         return jsonify({"show": True, "title": "Atrasos", "body": f"{morosos} registro(s)"})
@@ -1543,7 +1559,7 @@ def new_user():
         if role in ("cobrador", "cajero"):
             raw_inicio = (request.form.get("fecha_inicio") or "").strip()
             raw_fin = (request.form.get("fecha_fin") or "").strip()
-            today = date.today()
+            today = today_rd()
             default_inicio = today
             default_fin = today + timedelta(days=30)
             try:
@@ -1578,7 +1594,7 @@ def new_user():
                 "role": role,
                 "phone": phone,
                 "organization_id": org_id,
-                "created_at": datetime.utcnow(),
+                "created_at": utc_now_for_db(),
                 "name": None,
                 "account_status": status,
                 "fecha_inicio": fecha_inicio,
@@ -1618,8 +1634,8 @@ def new_user():
         f'<label>Contraseña</label><input type="password" name="password" required>'
         f'<label>Teléfono</label><input name="phone">'
         f'<label>Rol</label><select name="role">{role_opts}</select>'
-        f'<label>Fecha inicio (cobradores/cajeros)</label><input name="fecha_inicio" type="date" value="{date.today().strftime("%Y-%m-%d")}">'
-        f'<label>Fecha fin (cobradores/cajeros)</label><input name="fecha_fin" type="date" value="{(date.today()+timedelta(days=30)).strftime("%Y-%m-%d")}">'
+        f'<label>Fecha inicio (cobradores/cajeros)</label><input name="fecha_inicio" type="date" value="{today_rd().strftime("%Y-%m-%d")}">'
+        f'<label>Fecha fin (cobradores/cajeros)</label><input name="fecha_fin" type="date" value="{(today_rd()+timedelta(days=30)).strftime("%Y-%m-%d")}">'
         f'<label>PIN admin</label><input name="pin" required>'
         f'<button class="btn btn-primary" type="submit">Crear</button></form></div>'
     )
@@ -1857,7 +1873,7 @@ def new_client():
                 "route": route,
                 "created_by": user["id"],
                 "organization_id": oid,
-                "created_at": datetime.utcnow(),
+                "created_at": utc_now_for_db(),
             }
             if os.getenv("DEBUG_CLIENTS"):
                 app.logger.info(
@@ -2817,7 +2833,7 @@ def new_loan():
         f'<label>Tasa %</label><input name="rate" type="number" step="0.01" value="10">'
         f'<label>Descuento inicial (%)</label><input name="upfront_percent" type="number" step="0.01" value="0" min="0" max="100">'
         f'<label>Frecuencia</label><select name="frequency"><option>semanal</option><option>diario</option><option>quincenal</option><option>mensual</option></select>'
-        f'<label>Inicio</label><input name="start_date" type="date" value="{date.today().isoformat()}" required>'
+        f'<label>Inicio</label><input name="start_date" type="date" value="{today_rd().isoformat()}" required>'
         f'<label>Cuotas</label><input name="term_count" type="number" value="10" min="1">'
         f'<button class="btn btn-primary" type="submit">Crear</button></form></div>'
     )
@@ -2978,7 +2994,7 @@ def loan_detail(loan_id):
     cuota_label = L.get("frequency") or "semanal"
 
     # Siguiente pago (simplificado)
-    next_pago = L.get("next_payment_date") or date.today()
+    next_pago = L.get("next_payment_date") or today_rd()
     def fmt_date(d):
         return d.strftime("%d/%m/%Y") if hasattr(d, "strftime") else str(d)
     next_pago_disp = fmt_date(next_pago)
@@ -3046,7 +3062,7 @@ def loan_detail(loan_id):
     # Calendario de cuotas (10/12 semanas)
     # =========================
     interval_days = freq_interval_days(L.get("frequency"))
-    first_due = next_pago if hasattr(next_pago, "strftime") else date.today()
+    first_due = next_pago if hasattr(next_pago, "strftime") else today_rd()
     # Normalizar a `date` para evitar comparaciones datetime vs date.
     first_due_d = first_due.date() if hasattr(first_due, "hour") else first_due
 
@@ -3058,7 +3074,7 @@ def loan_detail(loan_id):
             state_class = "is-pagada"
         else:
             # Si la fecha ya pasó y no está pagada, se considera atrasada.
-            if due_i < date.today():
+            if due_i < today_rd():
                 cuota_estado = "Atrasada"
                 state_class = "is-atrasada"
             else:
@@ -3341,7 +3357,7 @@ def new_payment(loan_id):
         pay_payload = {
             "amount": amt,
             "type": typ,
-            "date": date.today(),
+            "date": today_rd(),
             "created_by": current_user()["id"],
             "capital": capital_part,
             "interest": interest_part,
@@ -3377,12 +3393,12 @@ def new_payment(loan_id):
         # Si se registra una cuota, avanzamos la próxima fecha automáticamente.
         if typ_l == "cuota":
             interval_days = freq_interval_days(L_state.get("frequency"))
-            current_due = L_state.get("next_payment_date") or date.today()
+            current_due = L_state.get("next_payment_date") or today_rd()
             if hasattr(current_due, "strftime"):
                 L_state["next_payment_date"] = current_due + timedelta(days=interval_days)
         elif typ_l == "adelanto" and weeks_adv:
             interval_days = freq_interval_days(L_state.get("frequency"))
-            current_due = L_state.get("next_payment_date") or date.today()
+            current_due = L_state.get("next_payment_date") or today_rd()
             if hasattr(current_due, "strftime"):
                 L_state["next_payment_date"] = current_due + timedelta(days=interval_days * weeks_adv)
 
@@ -3403,7 +3419,7 @@ def new_payment(loan_id):
             pid = store.nid("payments")
             pay_payload["id"] = pid
             pay_payload["loan_id"] = loan_id
-            pay_payload["created_at"] = datetime.utcnow()
+            pay_payload["created_at"] = utc_now_for_db()
             store.payments[pid] = pay_payload
 
         flash("Pago registrado.", "success")
@@ -3864,7 +3880,7 @@ def audit():
         sev = severity(a)
         bg, fg = color_map[sev]
         created_dt = a.get("created_at")
-        dt_txt = created_dt.strftime("%Y-%m-%d %H:%M:%S") if hasattr(created_dt, "strftime") else str(created_dt or "")
+        dt_txt = format_dt_rd(created_dt) if isinstance(created_dt, datetime) else str(created_dt or "")
         rows_html += (
             "<tr class='audit-row' style='background:{};'>"
             "<td style='font-variant-numeric:tabular-nums;white-space:nowrap;color:{}'>{}</td>"
@@ -3945,7 +3961,7 @@ def compute_super_admin_stats(date_from=None, date_to=None):
     admins = [u for u in store.users.values() if u.get("role") == "admin"]
     tenant_ids = {a.get("id") for a in admins if a.get("id") is not None}
 
-    today = date.today()
+    today = today_rd()
     if date_from is None:
         date_from = today - timedelta(days=29)
     if date_to is None:
@@ -4076,7 +4092,7 @@ def compute_super_admin_stats(date_from=None, date_to=None):
     expired_admins = []
     soon_admins = []
     upcoming_days = 3
-    now = datetime.utcnow()
+    now = utc_now_for_db()
     for a in admins:
         a_status = a.get("account_status", ACCOUNT_ACTIVE)
         f_ini = _to_date(a.get("fecha_inicio") or a.get("subscription_start") or None)
@@ -4152,10 +4168,10 @@ def compute_super_admin_stats(date_from=None, date_to=None):
 def super_admin_panel():
     ensure_org()  # no-op para super_admin (solo para no romper otras dependencias)
     user = current_user()
-    now = datetime.utcnow()
+    now = utc_now_for_db()
 
     # Filtro por fecha (aplica a gráficas, estadísticas y ganancias).
-    today_d = date.today()
+    today_d = today_rd()
     df = today_d - timedelta(days=29)
     dt = today_d
     raw_desde = request.args.get("desde", type=str)
@@ -4240,8 +4256,8 @@ def super_admin_panel():
             else:
                 extend_from = payment_date
 
-            if extend_from < date.today():
-                extend_from = date.today()
+            if extend_from < today_rd():
+                extend_from = today_rd()
 
             new_fin = extend_from + timedelta(days=PAYMENT_EXTENSION_DAYS)
             if not admin_u.get("fecha_inicio"):
@@ -4265,7 +4281,7 @@ def super_admin_panel():
                     "amount": round(float(amount), 2),
                     "payment_date": payment_date,
                     "method": method,
-                    "created_at": datetime.utcnow(),
+                    "created_at": utc_now_for_db(),
                 }
             )
             try:
@@ -4620,7 +4636,7 @@ def super_admin_panel():
             f"<td>{role_badge(u.get('role'))}</td>"
             f"<td>{subscription_state_badge(u.get('account_status', ACCOUNT_ACTIVE), u.get('fecha_fin') or u.get('subscription_end'))}</td>"
             f"<td>{esc(u.get('phone') or '—')}</td>"
-            f"<td>{esc(u.get('created_at'))}</td>"
+            f"<td>{esc(format_dt_rd(u.get('created_at')))}</td>"
             "</tr>"
         )
 
@@ -4694,7 +4710,7 @@ def super_admin_panel():
                 f"<td>{subscription_state_badge(c_status, c_fin)}</td>"
                 f"<td>{esc(a_name)}</td>"
                 f"<td>{esc(c.get('phone') or '—')}</td>"
-                f"<td>{esc(c.get('created_at'))}</td>"
+                f"<td>{esc(format_dt_rd(c.get('created_at')))}</td>"
                 f"<td>{actions}</td>"
                 "</tr>"
             )
@@ -5159,7 +5175,7 @@ def super_admin_stats():
 def reportes():
     ensure_org()
     oid = session.get("org_id")
-    today = date.today()
+    today = today_rd()
 
     def parse_date(raw):
         raw = (raw or "").strip()
@@ -5585,7 +5601,7 @@ def prestamos_pagados():
 def gps_update():
     uid = session.get("user_id")
     store.gps_positions[uid] = {
-        "lat": request.form.get("lat"), "lng": request.form.get("lng"), "ts": datetime.utcnow(),
+        "lat": request.form.get("lat"), "lng": request.form.get("lng"), "ts": utc_now_for_db(),
     }
     return jsonify({"ok": True})
 
@@ -5600,10 +5616,7 @@ def collector_map():
     def fmt_ts(ts):
         if not ts:
             return "—"
-        try:
-            return ts.strftime("%d/%m/%Y %I:%M %p")
-        except Exception:
-            return str(ts)
+        return format_dt_rd(ts) if isinstance(ts, datetime) else str(ts)
 
     # La geolocalización se registra para el usuario logueado (cada cobrador debe abrir esta pantalla).
     me_pos = store.gps_positions.get(user.get("id"))
@@ -6323,8 +6336,8 @@ def bank_advance():
         if ts:
             return fmt_advance_datetime(ts)
         d = p.get("date")
-        if hasattr(d, "strftime"):
-            return d.strftime("%d/%m/%Y") + " 12:00 AM"
+        if isinstance(d, date) and not isinstance(d, datetime):
+            return format_dt_rd(combine_date_at_rd_midnight(d))
         return "—"
 
     advances = []
@@ -6753,7 +6766,7 @@ def add_route_expense():
         "amount": round(float(exp_amount), 2),
         "note": note or "—",
         "user_id": current_user()["id"],
-        "created_at": datetime.utcnow(),
+        "created_at": utc_now_for_db(),
         "organization_id": org_id,
         "cash_report_id": cash_id,
     }
@@ -7129,7 +7142,7 @@ def bank_delivery():
         reg_by = html.escape(store.users.get(cr.get("user_id"), {}).get("username") or "—")
         m = abs(float(cr.get("amount") or 0))
         fecha = cr.get("created_at")
-        fecha_s = fecha.strftime("%d/%m/%Y %I:%M %p") if fecha and hasattr(fecha, "strftime") else str(fecha or "—")
+        fecha_s = format_dt_rd(fecha) if isinstance(fecha, datetime) else str(fecha or "—")
         tr += (
             f"<tr><td>{html.escape(fecha_s)}</td><td>{col_nm}</td>"
             f"<td style='text-align:right;font-weight:800;color:#15803d'>{html.escape(fmt_money(m))}</td>"
@@ -7144,7 +7157,7 @@ def bank_delivery():
         reg_by = html.escape(store.users.get(cr.get("user_id"), {}).get("username") or "—")
         m = float(cr.get("amount") or 0)
         fecha = cr.get("created_at")
-        fecha_s = fecha.strftime("%d/%m/%Y %I:%M %p") if fecha and hasattr(fecha, "strftime") else str(fecha or "—")
+        fecha_s = format_dt_rd(fecha) if isinstance(fecha, datetime) else str(fecha or "—")
         tr_dev += (
             f"<tr><td>{html.escape(fecha_s)}</td><td>{col_nm}</td>"
             f"<td style='text-align:right;font-weight:800;color:#15803d'>{html.escape(fmt_money(m))}</td>"
@@ -7273,75 +7286,127 @@ def bank_acta():
             if L.get("discount_cash_report_id") is not None
         }
     # ============================================================
-    # Vista tipo "Acta global" (alineada al otro sistema)
-    # - Caja global: depósitos + banco inicial (sin incluir préstamos/pagos)
-    # - Descuento total: movimientos "descuento_inicial"
-    # - Gastos realizados: movimientos "gasto_ruta"
-    # - Disponible: saldo real del banco (starting_bank + todos los cash_reports)
+    # Acta global — fuente de verdad: tabla `banco` (admin_id = tenant).
+    # - Caja global: SUM(amount) de movimientos (sin saldo inicial; ver "Disponible")
+    # - Descuento total: SUM(amount) donde movement_type = descuento_inicial
+    # - Gastos realizados: SUM(ABS(amount)) donde movement_type en gasto / gasto_ruta
+    # - Disponible: starting_bank + SUM(amount) en banco (= get_bank_available)
     # ============================================================
-    caja_global = float(getattr(store, "starting_banks", {}).get(oid, 0.0) or 0.0) + sum(
-        float(cr.get("amount") or 0)
-        for cr in store.cash_reports.values()
-        if cr.get("organization_id") == oid
-        and cr.get("movement_type") == "deposito_banco"
-        and (not restrict or cr.get("user_id") == u.get("id"))
-    )
-    descuento_total = round(
-        sum(
+    GASTO_MOVEMENT_TYPES = ("gasto", "gasto_ruta")
+
+    if USE_DATABASE:
+        from credimapa_pg import (
+            get_session,
+            get_starting_bank,
+            get_banco_sum,
+            get_clientes_dict,
+            get_prestamos_dict,
+            get_user,
+            list_banco_descuentos_iniciales,
+            sum_banco_abs_amount,
+            sum_banco_amount,
+        )
+
+        sess = get_session()
+        if restrict:
+            caja_global = round(
+                float(get_starting_bank(sess, oid))
+                + sum_banco_amount(sess, oid, movement_type="deposito_banco", user_id=u.get("id")),
+                2,
+            )
+            descuento_total = round(
+                sum_banco_amount(
+                    sess,
+                    oid,
+                    movement_type="descuento_inicial",
+                    banco_ids=discount_cash_ids,
+                ),
+                2,
+            )
+            gastos_realizados = round(
+                sum_banco_abs_amount(sess, oid, GASTO_MOVEMENT_TYPES, user_id=u.get("id")),
+                2,
+            )
+        else:
+            caja_global = round(get_banco_sum(sess, oid), 2)
+            descuento_total = round(
+                sum_banco_amount(sess, oid, movement_type="descuento_inicial"),
+                2,
+            )
+            gastos_realizados = round(sum_banco_abs_amount(sess, oid, GASTO_MOVEMENT_TYPES), 2)
+        disponible = get_bank_available(oid)
+        discount_moves = list_banco_descuentos_iniciales(
+            sess,
+            oid,
+            banco_ids=discount_cash_ids if restrict else None,
+            limit=400,
+        )
+        loans_d = get_prestamos_dict(sess, [oid])
+        clients_d = get_clientes_dict(sess, [oid])
+    else:
+        caja_global = float(getattr(store, "starting_banks", {}).get(oid, 0.0) or 0.0) + sum(
             float(cr.get("amount") or 0)
             for cr in store.cash_reports.values()
             if cr.get("organization_id") == oid
-            and cr.get("movement_type") == "descuento_inicial"
-            and (not restrict or cr.get("id") in discount_cash_ids)
-        ),
-        2,
-    )
-    gastos_realizados = round(
-        sum(
-            abs(float(cr.get("amount") or 0))
-            for cr in store.cash_reports.values()
-            if cr.get("organization_id") == oid
-            and cr.get("movement_type") == "gasto_ruta"
+            and cr.get("movement_type") == "deposito_banco"
             and (not restrict or cr.get("user_id") == u.get("id"))
-        ),
-        2,
-    )
-    disponible = get_bank_available(oid)
+        )
+        descuento_total = round(
+            sum(
+                float(cr.get("amount") or 0)
+                for cr in store.cash_reports.values()
+                if cr.get("organization_id") == oid
+                and cr.get("movement_type") == "descuento_inicial"
+                and (not restrict or cr.get("id") in discount_cash_ids)
+            ),
+            2,
+        )
+        gastos_realizados = round(
+            sum(
+                abs(float(cr.get("amount") or 0))
+                for cr in store.cash_reports.values()
+                if cr.get("organization_id") == oid
+                and cr.get("movement_type") in GASTO_MOVEMENT_TYPES
+                and (not restrict or cr.get("user_id") == u.get("id"))
+            ),
+            2,
+        )
+        disponible = get_bank_available(oid)
+        discount_moves = sorted(
+            (
+                cr
+                for cr in store.cash_reports.values()
+                if cr.get("organization_id") == oid
+                and cr.get("movement_type") == "descuento_inicial"
+                and (not restrict or cr.get("id") in discount_cash_ids)
+            ),
+            key=lambda x: x.get("created_at") or datetime.min,
+            reverse=True,
+        )
+        loans_d = store.loans
+        clients_d = store.clients
 
     def fmt_dt(dt):
         if not dt:
             return ""
-        try:
-            return dt.strftime("%d/%m/%Y %I:%M %p")
-        except Exception:
-            return str(dt)
-
-    # Listar descuentos registrados como movimientos del libro.
-    discount_moves = sorted(
-        (
-            cr
-            for cr in store.cash_reports.values()
-            if cr.get("organization_id") == oid
-            and cr.get("movement_type") == "descuento_inicial"
-            and (not restrict or cr.get("id") in discount_cash_ids)
-        ),
-        key=lambda x: x.get("created_at") or datetime.min,
-        reverse=True,
-    )
+        return format_dt_rd(dt) if isinstance(dt, datetime) else str(dt)
 
     rows = ""
     for cr in discount_moves[:200]:
         discount_id = cr.get("id")
         loan = None
-        for L in store.loans.values():
+        for L in loans_d.values():
             if L.get("organization_id") == oid and L.get("discount_cash_report_id") == discount_id:
                 loan = L
                 break
         if restrict and loan and loan.get("created_by") != u.get("id"):
             continue
-        client = store.clients.get((loan or {}).get("client_id"), {}) if loan else {}
+        client = clients_d.get((loan or {}).get("client_id"), {}) if loan else {}
         user_id = cr.get("user_id")
-        cobrador = store.users.get(user_id, {}).get("username") or "—"
+        if USE_DATABASE:
+            cobrador = (get_user(user_id) or {}).get("username") or "—"
+        else:
+            cobrador = store.users.get(user_id, {}).get("username") or "—"
         ruta = client.get("route") or "—"
         monto = float(cr.get("amount") or 0)
         del_form = (
@@ -7756,7 +7821,7 @@ def bank_late():
     ensure_org()
     user = current_user()
     org_id = session.get("org_id")
-    today = date.today()
+    today = today_rd()
 
     rows_pack = []
     for L in loans_for_user(org_id, user):
@@ -7832,7 +7897,7 @@ def bank_ranking():
     ensure_org()
     user = current_user()
     org_id = session.get("org_id")
-    today = date.today()
+    today = today_rd()
     scored = []
     for L in loans_for_user(org_id, user):
         if str(L.get("status", "")).upper() != "ACTIVO":
@@ -8140,7 +8205,7 @@ def cierre_semanal():
     is_58mm = mode in ("58mm", "58", "t59", "recibo-58mm")
 
     # Rango semanal tipo lunes->domingo.
-    today = date.today()
+    today = today_rd()
     week_start = today - timedelta(days=today.weekday())
     week_end = week_start + timedelta(days=6)
 
@@ -8472,7 +8537,7 @@ def cierre_semanal():
             + f"<div style='display:flex;justify-content:space-between;margin-top:6px'><span style='opacity:.85;font-weight:900'>Interés cobrado</span><b>{fmt_money(interes_cobrado)}</b></div>"
             + f"<div style='display:flex;justify-content:space-between;margin-top:6px'><span style='opacity:.85;font-weight:900'>Ganancia real</span><b>{fmt_money(ganancias_reales)}</b></div>"
             + "</div>"
-            + f"<div style='margin-top:10px;opacity:.85;font-size:11px'>Fecha reporte: {date.today().isoformat()}</div>"
+            + f"<div style='margin-top:10px;opacity:.85;font-size:11px'>Fecha reporte: {today_rd().isoformat()}</div>"
             + "<script>window.print();</script>"
             + "</div>"
         )
@@ -8491,7 +8556,7 @@ def cierre_semanal():
             + "<div class='s'>Reporte financiero - Cierre semanal</div>"
             + "</div>"
             + "</div>"
-            + f"<div class='cierre-sub'>Semana: {week_start.isoformat()} → {week_end.isoformat()}<br/>Fecha reporte: {date.today().isoformat()}</div>"
+            + f"<div class='cierre-sub'>Semana: {week_start.isoformat()} → {week_end.isoformat()}<br/>Fecha reporte: {today_rd().isoformat()}</div>"
             + "</div>"
             + "<div class='cierre-grid'>"
             + "<div class='cierre-card'>"
@@ -8549,7 +8614,7 @@ def cierre_semanal():
         + "<span class='btn-ic' aria-hidden='true'><svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' width='18' height='18' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M7 10V3h10v7'/><path d='M7 21h10v-8H7v8z'/><path d='M9 13h6'/></svg></span>58mm</a>"
         + "</div>"
         + "</div>"
-        + f"<div class='cierre-sub'>Semana: {week_start.isoformat()} → {week_end.isoformat()}<br/>Fecha reporte: {date.today().isoformat()}</div>"
+        + f"<div class='cierre-sub'>Semana: {week_start.isoformat()} → {week_end.isoformat()}<br/>Fecha reporte: {today_rd().isoformat()}</div>"
         + "<div class='cierre-grid'>"
         + "<div class='cierre-card'>"
         + "<div class='cierre-title'>💰 Pagos (agrupados por cliente)</div>"
@@ -8600,7 +8665,7 @@ def cerrar_semana():
     rec = {
         "id": store.nid("cierre"),
         "organization_id": org_id,
-        "closed_at": datetime.utcnow(),
+        "closed_at": utc_now_for_db(),
         "user_id": user["id"],
         "notas": (request.form.get("notas") or "").strip(),
         "cobrado_hoy_snapshot": k["cobrado_hoy"],
@@ -8698,7 +8763,7 @@ def agregar_dinero_banco():
                 "user_id": u.get("id"),
                 "amount": amt,
                 "note": note,
-                "at": datetime.utcnow(),
+                "at": utc_now_for_db(),
             }
         )
         flash(f"Ingresado {fmt_money(amt)} al flujo de caja (memoria).", "success")
@@ -8763,12 +8828,7 @@ def historial_depositos():
     def fmt_dt(dt):
         if not dt:
             return "—"
-        try:
-            if hasattr(dt, "strftime"):
-                return dt.strftime("%d/%m/%Y %I:%M %p")
-        except Exception:
-            pass
-        return str(dt)
+        return format_dt_rd(dt) if isinstance(dt, datetime) else str(dt)
 
     style_block = """
 <style>

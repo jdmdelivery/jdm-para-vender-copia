@@ -9,6 +9,8 @@ from contextlib import contextmanager
 from datetime import datetime, date, timedelta
 from decimal import Decimal
 
+from rd_time import today_rd, utc_now_for_db
+
 from flask import session as flask_session
 from sqlalchemy import (
     Column, Integer, String, Text, Numeric, Boolean, Date, DateTime,
@@ -48,7 +50,7 @@ class Admin(Base):
     subscription_end = Column(DateTime, nullable=True)
     starting_bank = Column(Numeric(14, 2), default=0, nullable=False)
     is_default = Column(Boolean, default=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now_for_db)
 
     def to_dict(self):
         d = _to_dict(self)
@@ -75,7 +77,7 @@ class Usuario(Base):
     fecha_inicio = Column(Date, nullable=True)
     fecha_fin = Column(Date, nullable=True)
     subscription_end = Column(Date, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now_for_db)
     __table_args__ = (Index("ix_usuarios_admin_id", "admin_id"),)
 
     def to_dict(self):
@@ -99,7 +101,7 @@ class Cliente(Base):
     address = Column(Text, nullable=True)
     route = Column(String(120), nullable=True)
     created_by = Column(Integer, ForeignKey("usuarios.id"), nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now_for_db)
     __table_args__ = (Index("ix_clientes_admin_id", "admin_id"),)
 
     def to_dict(self):
@@ -133,7 +135,7 @@ class Prestamo(Base):
     signature_b64 = Column(Text, nullable=True)
     id_photo_b64 = Column(Text, nullable=True)
     id_photo_back_b64 = Column(Text, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now_for_db)
     __table_args__ = (Index("ix_prestamos_admin_id", "admin_id"), Index("ix_prestamos_client_id", "client_id"))
 
     def to_dict(self):
@@ -154,7 +156,7 @@ class Banco(Base):
     movement_type = Column(String(80), nullable=False)
     note = Column(Text, nullable=True)
     mov_date = Column(Date, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now_for_db)
     __table_args__ = (Index("ix_banco_admin_id", "admin_id"),)
 
     def to_dict(self):
@@ -177,7 +179,7 @@ class Pago(Base):
     status = Column(String(20), default="OK")
     weeks_advanced = Column(Integer, nullable=True)
     created_by = Column(Integer, ForeignKey("usuarios.id"), nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now_for_db)
     __table_args__ = (Index("ix_pagos_admin_id", "admin_id"), Index("ix_pagos_loan_id", "loan_id"))
 
     def to_dict(self):
@@ -198,7 +200,7 @@ class Gasto(Base):
     note = Column(Text, nullable=True)
     user_id = Column(Integer, ForeignKey("usuarios.id"), nullable=True)
     cash_report_id = Column(Integer, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now_for_db)
     __table_args__ = (Index("ix_gastos_admin_id", "admin_id"),)
 
     def to_dict(self):
@@ -213,7 +215,7 @@ class Atraso(Base):
     admin_id = Column(Integer, ForeignKey("admins.id", ondelete="CASCADE"), nullable=False)
     loan_id = Column(Integer, ForeignKey("prestamos.id", ondelete="CASCADE"), nullable=False)
     paid = Column(Boolean, default=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now_for_db)
     __table_args__ = (Index("ix_atrasos_admin_id", "admin_id"),)
 
     def to_dict(self):
@@ -229,7 +231,7 @@ class PagoAdmin(Base):
     amount = Column(Numeric(14, 2), nullable=False)
     payment_date = Column(Date, nullable=False)
     method = Column(String(80), nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now_for_db)
     __table_args__ = (Index("ix_pagos_admin_admin_id", "admin_id"),)
 
     def to_dict(self):
@@ -245,7 +247,7 @@ class Descuento(Base):
     loan_id = Column(Integer, ForeignKey("prestamos.id", ondelete="CASCADE"), nullable=False)
     amount = Column(Numeric(14, 2), nullable=False)
     banco_id = Column(Integer, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now_for_db)
     __table_args__ = (Index("ix_descuentos_admin_id", "admin_id"),)
 
     def to_dict(self):
@@ -259,7 +261,7 @@ class Cierre(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     admin_id = Column(Integer, ForeignKey("admins.id", ondelete="CASCADE"), nullable=False)
     user_id = Column(Integer, ForeignKey("usuarios.id"), nullable=True)
-    closed_at = Column(DateTime, default=datetime.utcnow)
+    closed_at = Column(DateTime, default=utc_now_for_db)
     notas = Column(Text, nullable=True)
     cobrado_hoy_snapshot = Column(Numeric(14, 2), default=0)
     total_por_cobrar_snapshot = Column(Numeric(14, 2), default=0)
@@ -285,7 +287,7 @@ class Auditoria(Base):
     detail = Column(Text, nullable=True)
     ip = Column(String(60), nullable=True)
     device = Column(String(280), nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now_for_db)
     __table_args__ = (Index("ix_auditoria_admin_id", "admin_id"), Index("ix_auditoria_user_id", "user_id"))
 
 
@@ -373,7 +375,7 @@ def _seed_defaults_if_empty() -> None:
             if n:
                 return
 
-            created = datetime.utcnow()
+            created = utc_now_for_db()
             sub_end = created + timedelta(days=tenant_days)
             sub_end_d = sub_end.date()
 
@@ -537,6 +539,69 @@ def get_banco_sum(sess, admin_id: int) -> float:
     return float(r or 0)
 
 
+def sum_banco_amount(
+    sess,
+    admin_id: int,
+    *,
+    movement_type: str | None = None,
+    movement_types: tuple[str, ...] | list[str] | None = None,
+    user_id: int | None = None,
+    banco_ids: set[int] | frozenset[int] | list[int] | None = None,
+) -> float:
+    """Suma de `amount` en `banco` para el tenant, con filtros opcionales."""
+    q = select(func.coalesce(func.sum(Banco.amount), 0)).where(Banco.admin_id == admin_id)
+    if movement_type is not None:
+        q = q.where(Banco.movement_type == movement_type)
+    elif movement_types is not None:
+        q = q.where(Banco.movement_type.in_(list(movement_types)))
+    if user_id is not None:
+        q = q.where(Banco.user_id == user_id)
+    if banco_ids is not None:
+        ids = list(banco_ids)
+        if not ids:
+            return 0.0
+        q = q.where(Banco.id.in_(ids))
+    r = sess.execute(q).scalar()
+    return float(r or 0)
+
+
+def sum_banco_abs_amount(
+    sess,
+    admin_id: int,
+    movement_types: tuple[str, ...] | list[str],
+    *,
+    user_id: int | None = None,
+) -> float:
+    """SUM(ABS(amount)) para gastos u otros tipos donde el signo no importa para el total mostrado."""
+    q = select(func.coalesce(func.sum(func.abs(Banco.amount)), 0)).where(Banco.admin_id == admin_id)
+    q = q.where(Banco.movement_type.in_(list(movement_types)))
+    if user_id is not None:
+        q = q.where(Banco.user_id == user_id)
+    r = sess.execute(q).scalar()
+    return float(r or 0)
+
+
+def list_banco_descuentos_iniciales(
+    sess,
+    admin_id: int,
+    *,
+    banco_ids: set[int] | frozenset[int] | None = None,
+    limit: int = 500,
+) -> list[dict]:
+    q = select(Banco).where(
+        Banco.admin_id == admin_id,
+        Banco.movement_type == "descuento_inicial",
+    )
+    if banco_ids is not None:
+        ids = list(banco_ids)
+        if not ids:
+            return []
+        q = q.where(Banco.id.in_(ids))
+    q = q.order_by(Banco.created_at.desc()).limit(limit)
+    rows = sess.execute(q).scalars().all()
+    return [r.to_dict() for r in rows]
+
+
 def _repo_add_banco(sess, data: dict) -> int:
     b = Banco(
         admin_id=data["admin_id"],
@@ -545,7 +610,7 @@ def _repo_add_banco(sess, data: dict) -> int:
         amount=data["amount"],
         movement_type=data["movement_type"],
         note=data.get("note"),
-        mov_date=data.get("date") or data.get("mov_date") or date.today(),
+        mov_date=data.get("date") or data.get("mov_date") or today_rd(),
     )
     sess.add(b)
     sess.flush()
@@ -944,7 +1009,7 @@ def add_banco_movement(movement_type, amount, note, user_id=None, org_id=None, c
         "amount": round(amt, 2),
         "movement_type": movement_type,
         "note": note or movement_type,
-        "date": date.today(),
+        "date": today_rd(),
     })
     get_session().flush()
     return rid

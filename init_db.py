@@ -12,7 +12,9 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from werkzeug.security import generate_password_hash
-from datetime import datetime, timedelta
+from datetime import timedelta
+
+from rd_time import utc_now_for_db
 
 from credimapa_pg import init_db, session_scope, Admin, Usuario
 
@@ -28,7 +30,7 @@ def seed_initial_data():
     with session_scope() as session:
         # Super admin (usuario id=1)
         if session.get(Usuario, 1) is None:
-            created = datetime.utcnow()
+            created = utc_now_for_db()
             sub_end = created + timedelta(days=DEFAULT_TENANT_SUBSCRIPTION_DAYS)
             super_admin = Usuario(
                 id=1,
@@ -49,7 +51,7 @@ def seed_initial_data():
 
         # Tenant por defecto (admin id=2) + usuario admin (id=2)
         if session.get(Admin, 2) is None:
-            created = datetime.utcnow()
+            created = utc_now_for_db()
             sub_end = created + timedelta(days=DEFAULT_TENANT_SUBSCRIPTION_DAYS)
             admin_tenant = Admin(
                 id=2,

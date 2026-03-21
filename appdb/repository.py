@@ -6,6 +6,8 @@ Retorna dicts para minimizar cambios en app.py.
 from datetime import datetime, date
 from decimal import Decimal
 
+from rd_time import today_rd
+
 from sqlalchemy import select, func, and_, or_
 from sqlalchemy.orm import Session
 
@@ -226,7 +228,7 @@ def add_banco_movement(session: Session, data: dict) -> int:
         amount=data["amount"],
         movement_type=data["movement_type"],
         note=data.get("note"),
-        mov_date=data.get("date") or data.get("mov_date") or date.today(),
+        mov_date=data.get("date") or data.get("mov_date") or today_rd(),
     )
     session.add(b)
     session.flush()
@@ -257,7 +259,7 @@ def save_pago(session: Session, data: dict) -> int:
         loan_id=data["loan_id"],
         amount=data["amount"],
         type=data.get("type", "cuota"),
-        pago_date=data.get("date") or data.get("pago_date") or date.today(),
+        pago_date=data.get("date") or data.get("pago_date") or today_rd(),
         capital=data.get("capital", 0),
         interest=data.get("interest", 0),
         status=data.get("status", "OK"),

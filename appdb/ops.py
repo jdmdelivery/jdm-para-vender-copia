@@ -2,9 +2,9 @@
 """
 Operaciones de datos para PostgreSQL. Solo DB; sin circular import con app.
 """
-from datetime import date
-
 from flask import session
+
+from rd_time import today_rd
 
 from .database import get_session
 from . import repository as repo
@@ -63,7 +63,7 @@ def add_banco_movement(movement_type, amount, note, user_id=None, org_id=None, c
         "amount": round(amt, 2),
         "movement_type": movement_type,
         "note": note or movement_type,
-        "date": date.today(),
+        "date": today_rd(),
     })
     _session().flush()
     return rid
