@@ -1273,7 +1273,7 @@ body.theme-dark .dash-h2 {{ color: #86efac; }}
 
 @app.route("/users")
 @login_required
-@role_required("admin", "supervisor")
+@role_required("admin", "supervisor", "super_admin")
 def users():
     ensure_org()
     oid = session.get("org_id")
@@ -1333,9 +1333,10 @@ def employees():
 
 @app.route("/users/new", methods=["GET", "POST"])
 @login_required
-@admin_required
+@role_required("admin", "super_admin")
 def new_user():
     ensure_org()
+    user = current_user()
     if request.method == "POST":
         if request.form.get("pin") != ADMIN_PIN:
             flash("PIN incorrecto.", "danger")
@@ -1346,6 +1347,9 @@ def new_user():
         phone = (request.form.get("phone") or "").strip()
         if not username or not password:
             flash("Datos incompletos.", "danger")
+            return redirect(url_for("new_user"))
+        if role == "admin" and user.get("role") != "super_admin":
+            flash("Solo el Super Admin puede crear administradores. Solicite permiso.", "danger")
             return redirect(url_for("new_user"))
         if any(u["username"] == username for u in store.users.values()):
             flash("Usuario ya existe.", "danger")
@@ -1391,17 +1395,29 @@ def new_user():
         }
         flash("Usuario creado.", "success")
         return redirect(url_for("users"))
+    role_opts = ""
+    if user.get("role") == "super_admin":
+        role_opts = (
+            f'<option value="admin">Admin</option>'
+            f'<option value="supervisor">Supervisor</option>'
+            f'<option value="cobrador">Cobrador (queda pendiente)</option>'
+            f'<option value="cajero">Cajero (queda pendiente)</option>'
+        )
+    else:
+        role_opts = (
+            f'<option value="supervisor">Supervisor</option>'
+            f'<option value="cobrador">Cobrador (queda pendiente)</option>'
+            f'<option value="cajero">Cajero (queda pendiente)</option>'
+        )
+    hint = "" if user.get("role") == "super_admin" else '<p style="opacity:.88;font-size:13px;margin-bottom:12px">Para crear un Admin, solicite permiso al Super Admin.</p>'
     body = (
-        f'<div class="card"><h2>Nuevo usuario</h2><form method="post">'
+        f'<div class="card"><h2>Nuevo usuario</h2>'
+        f'{hint}'
+        f'<form method="post">'
         f'<label>Usuario</label><input name="username" required>'
         f'<label>Contraseña</label><input type="password" name="password" required>'
         f'<label>Teléfono</label><input name="phone">'
-        f'<label>Rol</label><select name="role">'
-        f'<option value="admin">Admin</option>'
-        f'<option value="supervisor">Supervisor</option>'
-        f'<option value="cobrador">Cobrador (queda pendiente)</option>'
-        f'<option value="cajero">Cajero (queda pendiente)</option>'
-        f'</select>'
+        f'<label>Rol</label><select name="role">{role_opts}</select>'
         f'<label>Fecha inicio (cobradores/cajeros)</label><input name="fecha_inicio" type="date" value="{date.today().strftime("%Y-%m-%d")}">'
         f'<label>Fecha fin (cobradores/cajeros)</label><input name="fecha_fin" type="date" value="{(date.today()+timedelta(days=30)).strftime("%Y-%m-%d")}">'
         f'<label>PIN admin</label><input name="pin" required>'
@@ -3275,8 +3291,9 @@ def bank_home():
     bottom = (
         f'<a href="{url_for("collector_map")}" class="bank-tile bank-tile-full teal2">📍 Ver ubicación cobrador</a>'
     )
+    # Solo super_admin puede ver/usar "Borrar todo el sistema".
     destroy = ""
-    if user.get("role") == "admin":
+    if user.get("role") == "super_admin":
         destroy = (
             f'<form method="post" action="{url_for("admin_clear_all")}" style="margin:14px 0 0 0;" '
             f'onsubmit="return confirm(\'¿BORRAR TODO EL SISTEMA? Se eliminarán todos los datos en memoria y se cerrará la sesión. Esta acción no se puede deshacer.\');">'
@@ -3324,7 +3341,7 @@ def admin_force_create():
 
 @app.route("/admin/clear-all", methods=["GET", "POST"])
 @login_required
-@admin_required
+@super_admin_required
 def admin_clear_all():
     if request.method == "POST":
         store.reset_all()
