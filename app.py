@@ -3817,11 +3817,21 @@ def super_admin_panel():
                 return redirect(url_for("super_admin_panel"))
 
             # Extender fecha_fin + PAYMENT_EXTENSION_DAYS.
+            # datetime es subclase de date: hay que convertir a date antes de comparar con payment_date.
             base_date = admin_u.get("fecha_fin") or admin_u.get("subscription_end")
-            base_d = base_date
-            if hasattr(base_d, "date") and not isinstance(base_d, date):
-                base_d = base_d.date()
-            if isinstance(base_d, date) and base_d >= payment_date:
+            base_d = None
+            if base_date is not None:
+                if isinstance(base_date, datetime):
+                    base_d = base_date.date()
+                elif isinstance(base_date, date):
+                    base_d = base_date
+                elif hasattr(base_date, "date"):
+                    try:
+                        base_d = base_date.date()
+                    except Exception:
+                        base_d = None
+
+            if base_d is not None and base_d >= payment_date:
                 extend_from = base_d
             else:
                 extend_from = payment_date
@@ -3833,8 +3843,11 @@ def super_admin_panel():
             if not admin_u.get("fecha_inicio"):
                 admin_u["fecha_inicio"] = extend_from
             # Si fechas están invertidas por edición manual, reacomodar.
-            if admin_u.get("fecha_inicio") and isinstance(admin_u["fecha_inicio"], date) and admin_u["fecha_inicio"] > extend_from:
-                admin_u["fecha_inicio"] = extend_from
+            fi = admin_u.get("fecha_inicio")
+            if fi is not None:
+                fi_d = fi.date() if isinstance(fi, datetime) else fi if isinstance(fi, date) else None
+                if fi_d is not None and fi_d > extend_from:
+                    admin_u["fecha_inicio"] = extend_from
 
             admin_u["fecha_fin"] = new_fin
             admin_u["subscription_end"] = new_fin  # compatibilidad
@@ -3880,6 +3893,7 @@ def super_admin_panel():
             display_name = (request.form.get("display_name") or "").strip()
             new_username = (request.form.get("new_username") or "").strip()
             new_email = (request.form.get("email") or "").strip()
+            new_password = (request.form.get("new_password") or "").strip()
             if not display_name:
                 flash("El nombre no puede estar vacío.", "danger")
                 return redirect(url_for("super_admin_panel"))
@@ -3906,6 +3920,8 @@ def super_admin_panel():
                         flash("Ese usuario (login) ya está en uso.", "danger")
                         return redirect(url_for("super_admin_panel"))
                     admin_u["username"] = new_username
+            if new_password:
+                admin_u["password_hash"] = generate_password_hash(new_password)
             try:
                 log_action(current_user()["id"], "edit_admin", f"id={aid}")
             except Exception:
@@ -4161,6 +4177,8 @@ def super_admin_panel():
             f"<input name='new_username' type='text' value={json.dumps(un_raw)} placeholder='Opcional: nuevo usuario' maxlength='80' style='width:100%;padding:8px 10px;border-radius:12px;border:1px solid rgba(148,163,184,.35);background:rgba(255,255,255,.9);box-sizing:border-box'/>"
             f"<div style='font-size:11px;opacity:.8;font-weight:800;margin:10px 0 6px 0'>Correo (opcional)</div>"
             f"<input name='email' type='email' value={json.dumps(em_raw)} maxlength='120' style='width:100%;padding:8px 10px;border-radius:12px;border:1px solid rgba(148,163,184,.35);background:rgba(255,255,255,.9);box-sizing:border-box'/>"
+            f"<div style='font-size:11px;opacity:.8;font-weight:800;margin:10px 0 6px 0'>Nueva contraseña (opcional)</div>"
+            f"<input name='new_password' type='password' placeholder='Dejar vacío para no cambiar' autocomplete='new-password' style='width:100%;padding:8px 10px;border-radius:12px;border:1px solid rgba(148,163,184,.35);background:rgba(255,255,255,.9);box-sizing:border-box'/>"
             f"<button class='sa-btn sa-btn-primary' type='submit' style='margin-top:10px;width:100%'>Guardar cambios</button>"
             f"</form>"
             f"</details>"
