@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# JDM Cash Now — datos en memoria (sin base de datos persistente). Se pierden al reiniciar el servidor.
+# JDM Cash Now — PostgreSQL multi-tenant SaaS. Con fallback a memoria si no hay DATABASE_URL.
 from __future__ import annotations
 
 import os
@@ -405,10 +405,20 @@ store = Store()
 app = Flask(__name__)
 app.secret_key = os.getenv("SECRET_KEY", secrets.token_hex(16))
 
+USE_DATABASE = bool(os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL"))
+if USE_DATABASE:
+    from db import init_app
+    init_app(app)
+
 
 def current_user():
     uid = session.get("user_id")
-    return store.users.get(uid) if uid else None
+    if not uid:
+        return None
+    if USE_DATABASE:
+        from db.ops import get_user
+        return get_user(uid)
+    return store.users.get(uid)
 
 
 def login_required(fn):
@@ -444,44 +454,46 @@ def super_admin_required(fn):
 
 def log_action(user_id, action, detail="", module=""):
     """
-    Auditoría en memoria.
-    Campos: user_id, user_name, role (admin/prestamista), action, module, detail, created_at, ip, device.
+    Auditoría. En DB: tabla auditoria. En memoria: audit_log.
     """
     try:
-        u = store.users.get(user_id, {}) if user_id is not None else {}
+        if USE_DATABASE and user_id:
+            from db.ops import get_user
+            u = get_user(user_id) or {}
+        else:
+            u = store.users.get(user_id, {}) if user_id else {}
         user_name = u.get("name") or u.get("username") or "—"
         raw_role = (u.get("role") or "").strip().lower()
         role_group = "admin" if raw_role in ("admin", "supervisor", "super_admin") else "prestamista"
 
-        # IP y device (opcionales). Mantener simple para que no falle en locales/Render.
         ip = None
         device = None
         try:
-            # X-Forwarded-For ayuda en algunos proxys.
             ip = (request.headers.get("X-Forwarded-For") or request.remote_addr) if request else None
             ua = (request.headers.get("User-Agent") or "") if request else ""
             device = (ua[:220] if ua else None)
         except Exception:
-            ip = None
-            device = None
+            pass
 
-        store.audit_log.append(
-            {
-                "id": store.nid("audit"),
-                "user_id": user_id,
-                "user_name": user_name,
-                "role": role_group,
-                "raw_role": raw_role,
-                "action": action,
-                "module": module or "",
-                "detail": detail or "",
-                "created_at": datetime.utcnow(),
-                "ip": ip,
-                "device": device,
-            }
-        )
+        data = {
+            "user_id": user_id,
+            "user_name": user_name,
+            "role": role_group,
+            "raw_role": raw_role,
+            "action": action,
+            "module": module or "",
+            "detail": detail or "",
+            "ip": ip,
+            "device": device,
+        }
+        if USE_DATABASE:
+            from db.ops import save_audit
+            save_audit(data)
+        else:
+            data["id"] = store.nid("audit")
+            data["created_at"] = datetime.utcnow()
+            store.audit_log.append(data)
     except Exception:
-        # Nunca rompemos el flujo si la auditoría falla.
         return
 
 
@@ -545,14 +557,22 @@ def stub_page(title, extra=""):
 
 
 def loans_for_user(org_id, user):
-    rows = [L for L in store.loans.values() if L.get("organization_id") == org_id]
+    if USE_DATABASE:
+        from db.ops import get_loans
+        rows = list(get_loans([org_id]).values())
+    else:
+        rows = [L for L in store.loans.values() if L.get("organization_id") == org_id]
     if is_cajero_role(user) and not is_cartera_admin(user):
         rows = [L for L in rows if L.get("created_by") == user["id"]]
     return rows
 
 
 def clients_for_user(org_id, user):
-    rows = [c for c in store.clients.values() if c.get("organization_id") == org_id]
+    if USE_DATABASE:
+        from db.ops import get_clients
+        rows = list(get_clients([org_id]).values())
+    else:
+        rows = [c for c in store.clients.values() if c.get("organization_id") == org_id]
     if is_cajero_role(user) and not is_cartera_admin(user):
         rows = [c for c in rows if c.get("created_by") == user["id"]]
     return rows
@@ -622,11 +642,13 @@ def bank_org_id(org_id=None):
 
 def get_bank_available(org_id=None):
     oid = bank_org_id(org_id)
+    if USE_DATABASE:
+        from db.ops import get_bank_available as _db_bank
+        return _db_bank(oid)
     total = float(getattr(store, "starting_banks", {}).get(oid, 0.0) or 0.0)
     for cr in store.cash_reports.values():
         if cr.get("organization_id") == oid:
             total += float(cr.get("amount") or 0)
-    # Evitar valores tipo -0.00 por redondeos.
     if abs(total) < 1e-9:
         total = 0.0
     return round(total, 2)
@@ -634,31 +656,23 @@ def get_bank_available(org_id=None):
 
 def apply_cash_movement(movement_type, amount, note, user_id=None, org_id=None, collector_id=None):
     """
-    Aplica un movimiento al banco (memoria) y valida que nunca quede negativo.
-    movement_type: string informativo (deposito_banco, prestamo_entregado, descuento_inicial, pago_prestamo, gasto_ruta, etc.)
-    collector_id: opcional (p. ej. entrega de efectivo al cobrador antes de la ruta).
+    Aplica un movimiento al banco (ledger). Valida que nunca quede negativo.
     """
+    if USE_DATABASE:
+        from db.ops import add_banco_movement as _db_add
+        return _db_add(movement_type, amount, note, user_id, org_id, collector_id)
     oid = bank_org_id(org_id)
     amt = float(amount or 0)
     if abs(amt) < 1e-9:
         return None
-
     projected = get_bank_available(oid) + amt
     if projected < -1e-9:
         raise ValueError(f"Banco insuficiente. Disponible: {get_bank_available(oid)} | Requerido adicional: {abs(amt)}")
-    # Evitar -0.00
-    if abs(projected) < 1e-9:
-        projected = 0.0
-
     rid = store.nid("cash")
     rec = {
-        "id": rid,
-        "user_id": user_id,
-        "date": date.today(),
-        "amount": round(amt, 2),
-        "note": note or movement_type,
-        "created_at": datetime.utcnow(),
-        "organization_id": oid,
+        "id": rid, "user_id": user_id, "date": date.today(),
+        "amount": round(amt, 2), "note": note or movement_type,
+        "created_at": datetime.utcnow(), "organization_id": oid,
         "movement_type": movement_type,
     }
     if collector_id is not None:
@@ -673,21 +687,31 @@ def loan_ids_visible(org_id, user):
 
 def payments_in_scope(org_id, user):
     lids = loan_ids_visible(org_id, user)
+    if USE_DATABASE:
+        from db.ops import get_payments
+        pmts = get_payments([org_id])
+        return [p for p in (pmts or {}).values() if p.get("loan_id") in lids]
     return [p for p in store.payments.values() if p.get("loan_id") in lids]
 
 
 def _revert_loan_financials(loan_id, oid, user_id):
     """
     Revierte todos los movimientos financieros de un préstamo.
-    El banco queda como si el préstamo nunca existió.
-    - Revierte pagos (resta del banco lo cobrado)
-    - Elimina descuento inicial (se quitaba del banco el +descuento)
-    - Elimina entrega de capital (se devuelve al banco lo entregado)
     """
-    L = store.loans.get(loan_id)
+    if USE_DATABASE:
+        from db.database import get_session
+        from db import repository as _repo
+        L = _repo.get_prestamo(get_session(), loan_id)
+    else:
+        L = store.loans.get(loan_id)
     if not L:
         return
-    payments = [p for p in store.payments.values() if p.get("loan_id") == loan_id]
+    if USE_DATABASE:
+        from db.ops import get_payments
+        payments_src = list(get_payments([oid]).values())
+    else:
+        payments_src = list(store.payments.values())
+    payments = [p for p in payments_src if p and p.get("loan_id") == loan_id]
     for p in payments:
         amt = float(p.get("amount") or 0)
         if abs(amt) >= 1e-9:
@@ -701,13 +725,26 @@ def _revert_loan_financials(loan_id, oid, user_id):
                 )
             except ValueError:
                 pass
-        store.payments.pop(p.get("id"), None)
-    disc_id = L.get("discount_cash_report_id")
-    if disc_id is not None:
-        store.cash_reports.pop(disc_id, None)
-    disb_id = L.get("disbursement_cash_report_id")
-    if disb_id is not None:
-        store.cash_reports.pop(disb_id, None)
+        if USE_DATABASE:
+            from db import repository as _repo
+            from db.database import get_session as _gs
+            _repo.delete_pago(_gs(), p.get("id"))
+        else:
+            store.payments.pop(p.get("id"), None)
+    disc_id = L.get("discount_cash_report_id") or L.get("discount_banco_id")
+    disb_id = L.get("disbursement_cash_report_id") or L.get("disbursement_banco_id")
+    if disc_id:
+        if USE_DATABASE:
+            from db.ops import pop_banco_movement
+            pop_banco_movement(disc_id)
+        else:
+            store.cash_reports.pop(disc_id, None)
+    if disb_id:
+        if USE_DATABASE:
+            from db.ops import pop_banco_movement
+            pop_banco_movement(disb_id)
+        else:
+            store.cash_reports.pop(disb_id, None)
 
 
 def count_loan_cuota_payments(loan_id):
@@ -747,7 +784,12 @@ def compute_financial_kpis(org_id, user):
         if npd and npd < today:
             atrasados += 1
 
-    n_cobradores = sum(1 for u in store.users.values() if u.get("role") == "cobrador" and u.get("organization_id") == org_id)
+    if USE_DATABASE:
+        from db.ops import get_users
+        users_iter = get_users().values()
+    else:
+        users_iter = store.users.values()
+    n_cobradores = sum(1 for u in users_iter if u and u.get("role") == "cobrador" and u.get("organization_id") == org_id)
 
     return {
         "capital_prestado": capital_prestado,
@@ -785,7 +827,11 @@ def login():
     if request.method == "POST":
         username = (request.form.get("username") or "").strip()
         password = (request.form.get("password") or "").strip()
-        user = next((u for u in store.users.values() if u["username"] == username), None)
+        if USE_DATABASE:
+            from db.ops import get_user_by_username
+            user = get_user_by_username(username)
+        else:
+            user = next((u for u in store.users.values() if u.get("username") == username), None)
         if not user or not check_password_hash(user["password_hash"], password):
             flash("Usuario o contraseña incorrectos.", "danger")
             return render_template_string(
@@ -801,8 +847,12 @@ def login():
             session["role"] = "super_admin"
             session["org_id"] = None
         else:
-            tenant_id = user.get("organization_id") or ORG_ID
-            tenant_admin = store.users.get(tenant_id, {}) if tenant_id else user
+            tenant_id = user.get("organization_id") or user.get("admin_id") or ORG_ID
+            if USE_DATABASE:
+                from db.ops import get_users
+                tenant_admin = get_users().get(tenant_id, user)
+            else:
+                tenant_admin = store.users.get(tenant_id, user) if tenant_id else user
             now = datetime.utcnow()
 
             def to_date(x):
@@ -1026,23 +1076,45 @@ def api_notification_check():
     ensure_org()
     org_id = session.get("org_id")
     user = current_user()
-    morosos = sum(
-        1 for A in store.loan_arrears.values()
-        if not A.get("paid") and store.loans.get(A.get("loan_id"), {}).get("organization_id") == org_id
-    )
-    hoy = sum(
-        1 for L in store.loans.values()
-        if L.get("organization_id") == org_id and str(L.get("status", "")).upper() == "ACTIVO" and L.get("next_payment_date") == date.today()
-    )
-    if user_is_cobrador_limited(user):
+    if USE_DATABASE:
+        from db.ops import get_loans, get_loan_arrears
+        _loans = get_loans([org_id]) if org_id else {}
+        _arrears = get_loan_arrears(org_id) or {}
+        morosos = sum(
+            1 for A in _arrears.values()
+            if not A.get("paid") and _loans.get(A.get("loan_id"), {}).get("organization_id") == org_id
+        )
+        hoy = sum(
+            1 for L in _loans.values()
+            if L.get("organization_id") == org_id and str(L.get("status", "")).upper() == "ACTIVO" and L.get("next_payment_date") == date.today()
+        )
+        if user_is_cobrador_limited(user):
+            morosos = sum(
+                1 for A in _arrears.values()
+                if not A.get("paid") and _loans.get(A.get("loan_id"), {}).get("created_by") == user["id"]
+            )
+            hoy = sum(
+                1 for L in _loans.values()
+                if L.get("created_by") == user["id"] and str(L.get("status", "")).upper() == "ACTIVO" and L.get("next_payment_date") == date.today()
+            )
+    else:
         morosos = sum(
             1 for A in store.loan_arrears.values()
-            if not A.get("paid") and store.loans.get(A.get("loan_id"), {}).get("created_by") == user["id"]
+            if not A.get("paid") and store.loans.get(A.get("loan_id"), {}).get("organization_id") == org_id
         )
         hoy = sum(
             1 for L in store.loans.values()
-            if L.get("created_by") == user["id"] and str(L.get("status", "")).upper() == "ACTIVO" and L.get("next_payment_date") == date.today()
+            if L.get("organization_id") == org_id and str(L.get("status", "")).upper() == "ACTIVO" and L.get("next_payment_date") == date.today()
         )
+        if user_is_cobrador_limited(user):
+            morosos = sum(
+                1 for A in store.loan_arrears.values()
+                if not A.get("paid") and store.loans.get(A.get("loan_id"), {}).get("created_by") == user["id"]
+            )
+            hoy = sum(
+                1 for L in store.loans.values()
+                if L.get("created_by") == user["id"] and str(L.get("status", "")).upper() == "ACTIVO" and L.get("next_payment_date") == date.today()
+            )
     if morosos > 0:
         return jsonify({"show": True, "title": "Atrasos", "body": f"{morosos} registro(s)"})
     if hoy > 0:
