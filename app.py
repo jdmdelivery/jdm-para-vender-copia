@@ -675,6 +675,40 @@ def payments_in_scope(org_id, user):
     return [p for p in store.payments.values() if p.get("loan_id") in lids]
 
 
+def _revert_loan_financials(loan_id, oid, user_id):
+    """
+    Revierte todos los movimientos financieros de un préstamo.
+    El banco queda como si el préstamo nunca existió.
+    - Revierte pagos (resta del banco lo cobrado)
+    - Elimina descuento inicial (se quitaba del banco el +descuento)
+    - Elimina entrega de capital (se devuelve al banco lo entregado)
+    """
+    L = store.loans.get(loan_id)
+    if not L:
+        return
+    payments = [p for p in store.payments.values() if p.get("loan_id") == loan_id]
+    for p in payments:
+        amt = float(p.get("amount") or 0)
+        if abs(amt) >= 1e-9:
+            try:
+                apply_cash_movement(
+                    movement_type="reverso_pago_prestamo",
+                    amount=-amt,
+                    note=f"Reverso por eliminación préstamo #{loan_id} (pago #{p.get('id')})",
+                    user_id=user_id,
+                    org_id=oid,
+                )
+            except ValueError:
+                pass
+        store.payments.pop(p.get("id"), None)
+    disc_id = L.get("discount_cash_report_id")
+    if disc_id is not None:
+        store.cash_reports.pop(disc_id, None)
+    disb_id = L.get("disbursement_cash_report_id")
+    if disb_id is not None:
+        store.cash_reports.pop(disb_id, None)
+
+
 def count_loan_cuota_payments(loan_id):
     """Pagos tipo cuota válidos (para numerar la cuota vencida siguiente)."""
     return sum(
@@ -1613,6 +1647,7 @@ def edit_client(client_id):
 
 @app.route("/clients/<int:client_id>/delete", methods=["POST"])
 @login_required
+@admin_required
 def delete_client(client_id):
     ensure_org()
     oid = session.get("org_id")
@@ -1621,25 +1656,33 @@ def delete_client(client_id):
         flash("Cliente no encontrado.", "danger")
         return redirect(url_for("clients"))
     u = current_user()
-    if not can_admin_actions(u):
-        flash("Acción restringida: solo admin puede eliminar clientes.", "danger")
-        return redirect(url_for("clients"))
+
+    # Revertir movimientos financieros de todos los préstamos del cliente.
+    client_loans = [
+        (lid, L) for lid, L in list(store.loans.items())
+        if L.get("organization_id") == oid and L.get("client_id") == client_id
+    ]
+    try:
+        for lid, L in client_loans:
+            _revert_loan_financials(lid, oid, u.get("id"))
+    except ValueError as e:
+        flash(str(e), "danger")
+        return redirect(url_for("client_detail", client_id=client_id))
 
     store.clients.pop(client_id, None)
-    for lid, L in list(store.loans.items()):
-        if L.get("organization_id") == oid and L.get("client_id") == client_id:
-            store.loans.pop(lid, None)
+    for lid, _ in client_loans:
+        store.loans.pop(lid, None)
     try:
         full_nm = f"{c.get('first_name') or ''} {c.get('last_name') or ''}".strip()
         log_action(
             u.get("id"),
             "eliminar cliente",
             module="clientes",
-            detail=f"{full_nm} (ID: {client_id})",
+            detail=f"{full_nm} (ID: {client_id}) — banco ajustado",
         )
     except Exception:
         pass
-    flash("Cliente eliminado.", "success")
+    flash("Cliente eliminado. Banco ajustado correctamente.", "success")
     return redirect(url_for("clients"))
 
 
@@ -1754,7 +1797,7 @@ def client_detail(client_id):
 
         del_form = (
             f"<form method='post' action='{url_for('delete_loan', loan_id=L['id'])}' "
-            f"style='margin:0' onsubmit=\"return confirm('¿Eliminar préstamo #{L['id']}?');\">"
+            f"style='margin:0' onsubmit=\"return confirm('¿Eliminar préstamo #{L['id']}? Esto ajustará el banco automáticamente.');\">"
             f"<button class='btn btn-danger btn-action' type='submit'>"
             f"<span class='btn-ic' aria-hidden='true'>"
             f"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' width='18' height='18' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'>"
@@ -1952,7 +1995,7 @@ def client_detail(client_id):
                 <span class="btn-ic" aria-hidden="true">
                   <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z"/></svg>
                 </span>Editar</a>
-              <form method="post" action="{url_for("delete_client", client_id=client_id)}" style="margin:0" onsubmit="return confirm('¿Borrar cliente?');">
+              <form method="post" action="{url_for("delete_client", client_id=client_id)}" style="margin:0" onsubmit="return confirm('¿Eliminar cliente? Esto eliminará el cliente, sus préstamos y ajustará el banco automáticamente.');">
                 <button class="btn btn-danger btn-action" type="submit">
                   <span class="btn-ic" aria-hidden="true">
                     <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/></svg>
@@ -2435,38 +2478,16 @@ def delete_loan(loan_id):
     ensure_org()
     oid = session.get("org_id")
     user = current_user()
+    if user.get("role") != "admin" and not is_cartera_admin(user):
+        flash("Solo admin puede borrar préstamos.", "danger")
+        return redirect(url_for("loans"))
     L = store.loans.get(loan_id)
     if not L or L.get("organization_id") != oid:
         flash("Préstamo no encontrado.", "danger")
         return redirect(url_for("loans"))
-    if user.get("role") != "admin" and not is_cartera_admin(user):
-        flash("Solo admin puede borrar préstamos.", "danger")
-        return redirect(url_for("loans"))
 
     try:
-        # 1) Revertir pagos asociados (no podemos borrar cash_reports porque no guardamos sus IDs en el payment).
-        payments = [p for p in store.payments.values() if p.get("loan_id") == loan_id]
-        for p in payments:
-            amt = float(p.get("amount") or 0)
-            if abs(amt) < 1e-9:
-                continue
-            apply_cash_movement(
-                movement_type="reverso_pago_prestamo",
-                amount=-amt,
-                note=f"Reverso por eliminación préstamo #{loan_id} (pago #{p.get('id')})",
-                user_id=user["id"],
-                org_id=oid,
-            )
-            store.payments.pop(p.get("id"), None)
-
-        # 2) Revertir movimientos iniciales del préstamo (aquí sí tenemos los IDs en el loan).
-        disc_id = L.get("discount_cash_report_id")
-        if disc_id is not None:
-            store.cash_reports.pop(disc_id, None)
-        disb_id = L.get("disbursement_cash_report_id")
-        if disb_id is not None:
-            store.cash_reports.pop(disb_id, None)
-
+        _revert_loan_financials(loan_id, oid, user.get("id"))
         store.loans.pop(loan_id, None)
     except ValueError as e:
         flash(str(e), "danger")
@@ -2481,11 +2502,11 @@ def delete_loan(loan_id):
             user.get("id"),
             "eliminar préstamo",
             module="préstamos",
-            detail=f"#{loan_id} • {fmt_money(loan_amt)} para {client_nm}",
+            detail=f"#{loan_id} • {fmt_money(loan_amt)} para {client_nm} — banco ajustado",
         )
     except Exception:
         pass
-    flash("Préstamo eliminado y movimientos del banco revertidos.", "success")
+    flash("Préstamo eliminado. Banco ajustado correctamente.", "success")
     return redirect(url_for("loans"))
 
 
@@ -2622,6 +2643,14 @@ def loan_detail(loan_id):
     # Historial tabla
     hist_rows = ""
     for idx, p in enumerate(sorted(pays, key=lambda x: (x.get("date") or date.min)), start=1):
+        amt_p = p.get("amount") or 0
+        del_btn = ""
+        if can_admin:
+            del_btn = (
+                f" <form method='post' action='{url_for('delete_payment', payment_id=p.get('id'))}' "
+                f"style='display:inline' onsubmit=\"return confirm('¿Seguro que deseas eliminar este pago de {fmt_money(amt_p)}? Esto ajustará el banco automáticamente.');\">"
+                f"<button type='submit' class='btn btn-danger' style='padding:6px 10px'>Eliminar</button></form>"
+            )
         hist_rows += (
             f"<tr>"
             f"<td>{idx}</td>"
@@ -2629,7 +2658,7 @@ def loan_detail(loan_id):
             f"<td>{fmt_money(p.get('capital'))}</td>"
             f"<td>{fmt_money(p.get('interest'))}</td>"
             f"<td>{p.get('date')}</td>"
-            f"<td><a class='btn btn-secondary' style='padding:6px 10px' href='{url_for('print_payment', payment_id=p.get('id'))}' target='_blank' rel='noopener'>Imprimir recibo</a></td>"
+            f"<td><a class='btn btn-secondary' style='padding:6px 10px' href='{url_for('print_payment', payment_id=p.get('id'))}' target='_blank' rel='noopener'>Imprimir recibo</a>{del_btn}</td>"
             f"</tr>"
         )
 
@@ -3197,13 +3226,13 @@ def delete_payment(payment_id):
         loan_amt = float(L.get("amount") or 0) if L else 0
         log_action(
             user.get("id"),
-            "eliminar pago",
+            "eliminar recibo de pago",
             module="pagos",
-            detail=f"Pago #{payment_id} ({typ_l}) • {fmt_money(amt)} — Préstamo #{loan_id} • {client_nm}",
+            detail=f"Usuario eliminó recibo de {fmt_money(amt)} — Préstamo #{loan_id} • {client_nm}",
         )
     except Exception:
         pass
-    flash("Pago eliminado y banco revertido.", "success")
+    flash("Recibo eliminado. Banco ajustado correctamente.", "success")
     return redirect(url_for("loan_detail", loan_id=loan_id))
 
 
