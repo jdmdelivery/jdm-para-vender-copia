@@ -14,7 +14,7 @@ from rd_time import today_rd, utc_now_for_db
 from flask import session as flask_session
 from sqlalchemy import (
     Column, Integer, String, Text, Numeric, Boolean, Date, DateTime,
-    ForeignKey, Index, create_engine, select, func, and_, text, update,
+    ForeignKey, Index, create_engine, select, func, and_, or_, text, update,
 )
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import declarative_base, sessionmaker, scoped_session
@@ -579,6 +579,109 @@ def sum_banco_abs_amount(
         q = q.where(Banco.user_id == user_id)
     r = sess.execute(q).scalar()
     return float(r or 0)
+
+
+def sum_banco_abs_amount_in_range(
+    sess,
+    admin_id: int,
+    movement_types: tuple[str, ...] | list[str],
+    d0: date,
+    d1: date,
+    *,
+    user_id: int | None = None,
+) -> float:
+    q = select(func.coalesce(func.sum(func.abs(Banco.amount)), 0)).where(
+        Banco.admin_id == admin_id,
+        Banco.movement_type.in_(list(movement_types)),
+        Banco.mov_date >= d0,
+        Banco.mov_date <= d1,
+    )
+    if user_id is not None:
+        q = q.where(Banco.user_id == user_id)
+    return float(sess.execute(q).scalar() or 0)
+
+
+def sum_banco_amount_in_range(
+    sess,
+    admin_id: int,
+    movement_type: str,
+    d0: date,
+    d1: date,
+    *,
+    user_id: int | None = None,
+) -> float:
+    q = select(func.coalesce(func.sum(Banco.amount), 0)).where(
+        Banco.admin_id == admin_id,
+        Banco.movement_type == movement_type,
+        Banco.mov_date >= d0,
+        Banco.mov_date <= d1,
+    )
+    if user_id is not None:
+        q = q.where(Banco.user_id == user_id)
+    return float(sess.execute(q).scalar() or 0)
+
+
+def list_banco_cierre_by_type(
+    sess,
+    admin_id: int,
+    movement_type: str,
+    d0: date,
+    d1: date,
+    *,
+    user_id: int | None = None,
+) -> list[dict]:
+    q = select(Banco).where(
+        Banco.admin_id == admin_id,
+        Banco.movement_type == movement_type,
+        Banco.mov_date >= d0,
+        Banco.mov_date <= d1,
+    )
+    if user_id is not None:
+        q = q.where(Banco.user_id == user_id)
+    rows = sess.execute(q.order_by(Banco.created_at.desc(), Banco.id.desc())).scalars().all()
+    return [r.to_dict() for r in rows]
+
+
+def list_banco_cierre_gastos(
+    sess,
+    admin_id: int,
+    d0: date,
+    d1: date,
+    *,
+    user_id: int | None = None,
+    movement_types: tuple[str, ...] = ("gasto", "gasto_ruta"),
+) -> list[dict]:
+    q = select(Banco).where(
+        Banco.admin_id == admin_id,
+        Banco.movement_type.in_(list(movement_types)),
+        Banco.mov_date >= d0,
+        Banco.mov_date <= d1,
+    )
+    if user_id is not None:
+        q = q.where(Banco.user_id == user_id)
+    rows = sess.execute(q.order_by(Banco.created_at.desc(), Banco.id.desc())).scalars().all()
+    return [r.to_dict() for r in rows]
+
+
+def list_pagos_cierre_semanal(
+    sess,
+    admin_id: int,
+    d0: date,
+    d1: date,
+    *,
+    restrict: bool = False,
+    user_id: int | None = None,
+) -> list[dict]:
+    q = select(Pago).where(
+        Pago.admin_id == admin_id,
+        Pago.pago_date >= d0,
+        Pago.pago_date <= d1,
+        or_(Pago.status.is_(None), Pago.status != "ANULADO"),
+    )
+    if restrict and user_id is not None:
+        q = q.where(Pago.created_by == user_id)
+    rows = sess.execute(q.order_by(Pago.id.asc())).scalars().all()
+    return [r.to_dict() for r in rows]
 
 
 def list_banco_descuentos_iniciales(

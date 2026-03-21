@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# JDM Cash Now — PostgreSQL multi-tenant SaaS. Con fallback a memoria si no hay DATABASE_URL.
+# CREDIMAPA — PostgreSQL multi-tenant SaaS. Con fallback a memoria si no hay DATABASE_URL.
 from __future__ import annotations
 
 import os
@@ -6158,10 +6158,10 @@ def view_legal_document(loan_id):
   <div class="legal-compromiso">
     <h3 class="legal-h3">📄 Compromiso de Pago</h3>
     <p>
-      El cliente <b>{cliente_nombre_esc}</b> reconoce haber recibido el capital del préstamo y se compromete de manera expresa, voluntaria e irrevocable a pagar la totalidad de la deuda a <b>JDM CASH NOW</b>, incluyendo capital, intereses, cargos y penalidades aplicables, en los plazos establecidos.
+      El cliente <b>{cliente_nombre_esc}</b> reconoce haber recibido el capital del préstamo y se compromete de manera expresa, voluntaria e irrevocable a pagar la totalidad de la deuda a <b>CREDIMAPA</b>, incluyendo capital, intereses, cargos y penalidades aplicables, en los plazos establecidos.
     </p>
     <p>
-      El incumplimiento de este compromiso autoriza a <b>JDM CASH NOW</b> a iniciar las acciones legales correspondientes conforme a la ley vigente.
+      El incumplimiento de este compromiso autoriza a <b>CREDIMAPA</b> a iniciar las acciones legales correspondientes conforme a la ley vigente.
     </p>
   </div>
 
@@ -8209,34 +8209,115 @@ def cierre_semanal():
     week_start = today - timedelta(days=today.weekday())
     week_end = week_start + timedelta(days=6)
 
-    # Pagos de préstamos del tenant dentro del rango.
-    def loan_org_ok(loan_id):
-        L = store.loans.get(loan_id) if loan_id is not None else None
-        return bool(L and L.get("organization_id") == org_id)
+    GASTO_MOV_TYPES = ("gasto", "gasto_ruta")
+    _pg_get_user = None
+    if USE_DATABASE:
+        from credimapa_pg import (
+            get_session,
+            get_clientes_dict,
+            get_prestamos_dict,
+            get_user as _pg_get_user,
+            list_banco_cierre_by_type,
+            list_banco_cierre_gastos,
+            list_pagos_cierre_semanal,
+            sum_banco_abs_amount_in_range,
+            sum_banco_amount_in_range,
+        )
 
-    payments_week = [
-        p
-        for p in store.payments.values()
-        if p.get("date") is not None
-        and week_start <= p.get("date") <= week_end
-        and loan_org_ok(p.get("loan_id"))
-        and (p.get("status") or "OK") != "ANULADO"
-        and (not restrict or p.get("created_by") == user.get("id"))
-    ]
+        sess = get_session()
+        clients_map = get_clientes_dict(sess, [org_id])
+        loans_map = get_prestamos_dict(sess, [org_id])
+        uid_f = user.get("id") if restrict else None
+        payments_week = list_pagos_cierre_semanal(
+            sess, org_id, week_start, week_end, restrict=restrict, user_id=user.get("id")
+        )
+        prestamos_entregados = list_banco_cierre_by_type(
+            sess, org_id, "prestamo_entregado", week_start, week_end, user_id=uid_f
+        )
+        descuentos = list_banco_cierre_by_type(
+            sess, org_id, "descuento_inicial", week_start, week_end, user_id=uid_f
+        )
+        gastos = list_banco_cierre_gastos(
+            sess, org_id, week_start, week_end, user_id=uid_f, movement_types=GASTO_MOV_TYPES
+        )
+        descuentos_total = round(
+            sum_banco_amount_in_range(
+                sess, org_id, "descuento_inicial", week_start, week_end, user_id=uid_f
+            ),
+            2,
+        )
+        gastos_total = round(
+            sum_banco_abs_amount_in_range(
+                sess, org_id, list(GASTO_MOV_TYPES), week_start, week_end, user_id=uid_f
+            ),
+            2,
+        )
+    else:
+        clients_map = store.clients
+        loans_map = store.loans
+
+        def loan_org_ok(loan_id):
+            L = store.loans.get(loan_id) if loan_id is not None else None
+            return bool(L and L.get("organization_id") == org_id)
+
+        payments_week = [
+            p
+            for p in store.payments.values()
+            if p.get("date") is not None
+            and week_start <= p.get("date") <= week_end
+            and loan_org_ok(p.get("loan_id"))
+            and (p.get("status") or "OK") != "ANULADO"
+            and (not restrict or p.get("created_by") == user.get("id"))
+        ]
+        prestamos_entregados = [
+            cr
+            for cr in store.cash_reports.values()
+            if cr.get("organization_id") == org_id
+            and cr.get("movement_type") == "prestamo_entregado"
+            and cr.get("date") is not None
+            and week_start <= cr.get("date") <= week_end
+            and (not restrict or cr.get("user_id") == user.get("id"))
+        ]
+        descuentos = [
+            cr
+            for cr in store.cash_reports.values()
+            if cr.get("organization_id") == org_id
+            and cr.get("movement_type") == "descuento_inicial"
+            and cr.get("date") is not None
+            and week_start <= cr.get("date") <= week_end
+            and (not restrict or cr.get("user_id") == user.get("id"))
+        ]
+        gastos = [
+            e
+            for e in store.route_expenses.values()
+            if e.get("organization_id") == org_id
+            and e.get("created_at") is not None
+            and week_start <= e.get("created_at").date() <= week_end
+            and (not restrict or e.get("user_id") == user.get("id"))
+        ]
+        descuentos_total = round(sum(float(cr.get("amount") or 0) for cr in descuentos), 2)
+        gastos_total = round(sum(abs(float(e.get("amount") or 0)) for e in gastos), 2)
+
     payments_week.sort(key=lambda p: (p.get("created_by") or 0, p.get("id") or 0))
+    prestamos_entregados.sort(key=lambda cr: (cr.get("user_id") or 0, cr.get("id") or 0))
 
     total_amount_week = round(sum(float(p.get("amount") or 0) for p in payments_week), 2)
-    # Separar correctamente:
-    # - capital recuperado (payment.capital)
-    # - interés ganado (payment.interest)
     capital_cobrado = round(sum(float(p.get("capital") or 0) for p in payments_week), 2)
     interes_cobrado = round(sum(float(p.get("interest") or 0) for p in payments_week), 2)
 
-    # Fallback mínimo si la data antigua no trae capital/interest.
-    # (En esta app la lógica debería guardar ambos, pero protegemos para evitar valores inflados.)
-    if capital_cobrado == 0 and interes_cobrado == 0 and total_amount_week:
-        capital_cobrado = round(total_amount_week * 0.5, 2)
-        interes_cobrado = round(total_amount_week - capital_cobrado, 2)
+    if not USE_DATABASE:
+        if capital_cobrado == 0 and interes_cobrado == 0 and total_amount_week:
+            capital_cobrado = round(total_amount_week * 0.5, 2)
+            interes_cobrado = round(total_amount_week - capital_cobrado, 2)
+
+    def _cierre_user_label(uid):
+        if not uid:
+            return "—"
+        if _pg_get_user is not None:
+            rw = _pg_get_user(uid) or {}
+            return rw.get("name") or rw.get("username") or "—"
+        u = store.users.get(uid, {})
+        return (u.get("name") or u.get("username") or "—") if u else "—"
 
     # =========================
     # Pagos agrupados por cliente
@@ -8246,11 +8327,11 @@ def cierre_semanal():
     payments_by_client = {}  # cid -> {client_name, total, items[{loan_id, amount, date}]}
     for p in payments_week:
         loan_id = p.get("loan_id")
-        L = store.loans.get(loan_id) if loan_id is not None else None
+        L = loans_map.get(loan_id) if loan_id is not None else None
         if not L or L.get("organization_id") != org_id:
             continue
         cid = L.get("client_id")
-        cl = store.clients.get(cid, {}) if cid is not None else {}
+        cl = clients_map.get(cid, {}) if cid is not None else {}
         client_name = (
             f"{cl.get('first_name') or ''} {cl.get('last_name') or ''}".strip()
             or (f"Cliente #{cid}" if cid is not None else "—")
@@ -8323,18 +8404,6 @@ def cierre_semanal():
             )
         client_print_html = "".join(lines)
 
-    # Préstamos entregados (cash_movements prestamo_entregado) dentro del rango.
-    prestamos_entregados = [
-        cr
-        for cr in store.cash_reports.values()
-        if cr.get("organization_id") == org_id
-        and cr.get("movement_type") == "prestamo_entregado"
-        and cr.get("date") is not None
-        and week_start <= cr.get("date") <= week_end
-        and (not restrict or cr.get("user_id") == user.get("id"))
-    ]
-    prestamos_entregados.sort(key=lambda cr: (cr.get("user_id") or 0, cr.get("id") or 0))
-
     prestado_total = round(sum(float(cr.get("amount") or 0) for cr in prestamos_entregados), 2)
     prestamos_rows = ""
 
@@ -8361,7 +8430,7 @@ def cierre_semanal():
             cid = int(digits)
         except Exception:
             return None
-        cl = store.clients.get(cid)
+        cl = clients_map.get(cid)
         if not cl:
             return None
         full = f"{cl.get('first_name') or ''} {cl.get('last_name') or ''}".strip()
@@ -8369,8 +8438,7 @@ def cierre_semanal():
 
     for cr in prestamos_entregados:
         uid = cr.get("user_id")
-        u = store.users.get(uid, {})
-        fallback = (u.get("name") or u.get("username") or "—") if u else "—"
+        fallback = _cierre_user_label(uid)
         cliente_nm = client_name_from_cash_note(cr.get("note"))
         name = cliente_nm or fallback
         prestamos_rows += (
@@ -8382,61 +8450,36 @@ def cierre_semanal():
     if not prestamos_rows:
         prestamos_rows = "<tr><td colspan=2 style='opacity:.78'>Sin préstamos</td></tr>"
 
-    # Descuentos informativos.
-    descuentos = [
-        cr
-        for cr in store.cash_reports.values()
-        if cr.get("organization_id") == org_id
-        and cr.get("movement_type") == "descuento_inicial"
-        and cr.get("date") is not None
-        and week_start <= cr.get("date") <= week_end
-        and (not restrict or cr.get("user_id") == user.get("id"))
-    ]
-    descuentos_total = round(sum(float(cr.get("amount") or 0) for cr in descuentos), 2)
     descuentos_rows = ""
     for cr in descuentos:
-        uid = cr.get("user_id")
-        u = store.users.get(uid, {})
-        name = (u.get("name") or u.get("username") or "—") if u else "—"
+        name = _cierre_user_label(cr.get("user_id"))
+        raw_amt = float(cr.get("amount") or 0)
         descuentos_rows += (
             "<tr>"
             f"<td style='padding-right:12px'>{html.escape(str(name))}</td>"
-            f"<td style='text-align:right;font-weight:900'>-{fmt_money(cr.get('amount') or 0)}</td>"
+            f"<td style='text-align:right;font-weight:900'>-{fmt_money(abs(raw_amt))}</td>"
             "</tr>"
         )
     if not descuentos_rows:
         descuentos_rows = "<tr><td colspan=2 style='opacity:.78'>Sin descuentos</td></tr>"
 
-    # Gastos ruta.
-    gastos = [
-        e
-        for e in store.route_expenses.values()
-        if e.get("organization_id") == org_id
-        and e.get("created_at") is not None
-        and week_start <= e.get("created_at").date() <= week_end
-        and (not restrict or e.get("user_id") == user.get("id"))
-    ]
     gastos_rows = ""
-    gastos_total = round(sum(float(e.get("amount") or 0) for e in gastos), 2)
     for e in sorted(gastos, key=lambda x: x.get("created_at") or datetime.min):
-        uid = e.get("user_id")
-        u = store.users.get(uid, {})
-        name = (u.get("name") or u.get("username") or "—") if u else "—"
-        # Nota: mostramos como en el sistema: nombre + monto.
+        name = _cierre_user_label(e.get("user_id"))
+        amt_g = abs(float(e.get("amount") or 0))
         gastos_rows += (
             "<tr>"
             f"<td style='padding-right:12px'>{html.escape(str(name))}</td>"
-            f"<td style='text-align:right;font-weight:900'>{fmt_money(e.get('amount') or 0)}</td>"
+            f"<td style='text-align:right;font-weight:900'>{fmt_money(amt_g)}</td>"
             "</tr>"
         )
     if not gastos_rows:
         gastos_rows = "<tr><td colspan=2 style='opacity:.78'>Sin gastos</td></tr>"
 
-    # Ganancia real del negocio:
-    # Ganancia = Interés cobrado - Gastos
-    ganancias_reales = round(interes_cobrado - gastos_total, 2)
+    # Ganancia real: (interés cobrado + descuentos en libro) − gastos (descuentos suelen ser negativos).
+    ganancias_reales = round(interes_cobrado + descuentos_total - gastos_total, 2)
 
-    report_brand_name = "JDM Cash Now"
+    report_brand_name = APP_BRAND
     logo_svg = (
         "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64' width='34' height='34' "
         "fill='none' stroke='currentColor' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'>"
@@ -8535,6 +8578,8 @@ def cierre_semanal():
             + "<div style='margin-top:10px;border-top:1px solid rgba(148,163,184,.35);padding-top:10px'>"
             + f"<div style='display:flex;justify-content:space-between'><span style='opacity:.85;font-weight:900'>Capital cobrado</span><b>{fmt_money(capital_cobrado)}</b></div>"
             + f"<div style='display:flex;justify-content:space-between;margin-top:6px'><span style='opacity:.85;font-weight:900'>Interés cobrado</span><b>{fmt_money(interes_cobrado)}</b></div>"
+            + f"<div style='display:flex;justify-content:space-between;margin-top:6px'><span style='opacity:.85;font-weight:900'>Descuentos (Σ)</span><b>{fmt_money(descuentos_total)}</b></div>"
+            + f"<div style='display:flex;justify-content:space-between;margin-top:6px'><span style='opacity:.85;font-weight:900'>Gastos</span><b>{fmt_money(gastos_total)}</b></div>"
             + f"<div style='display:flex;justify-content:space-between;margin-top:6px'><span style='opacity:.85;font-weight:900'>Ganancia real</span><b>{fmt_money(ganancias_reales)}</b></div>"
             + "</div>"
             + f"<div style='margin-top:10px;opacity:.85;font-size:11px'>Fecha reporte: {today_rd().isoformat()}</div>"
@@ -8577,6 +8622,7 @@ def cierre_semanal():
             + f"<div style='padding:10px 12px;background:rgba(236,253,245,.55);border:1px solid rgba(148,163,184,.25);border-radius:14px'>"
             + f"<div style='display:flex;justify-content:space-between'><span style='opacity:.88'>Capital cobrado</span><b>{fmt_money(capital_cobrado)}</b></div>"
             + f"<div style='display:flex;justify-content:space-between;margin-top:6px'><span style='opacity:.88'>Interés cobrado</span><b>{fmt_money(interes_cobrado)}</b></div>"
+            + f"<div style='display:flex;justify-content:space-between;margin-top:6px'><span style='opacity:.88'>Descuentos (Σ libro)</span><b>{fmt_money(descuentos_total)}</b></div>"
             + f"<div style='display:flex;justify-content:space-between;margin-top:6px'><span style='opacity:.88'>Gastos</span><b>{fmt_money(gastos_total)}</b></div>"
             + f"<div style='display:flex;justify-content:space-between;margin-top:6px'><span style='opacity:.88'>Ganancia real</span><b>{fmt_money(ganancias_reales)}</b></div>"
             + "</div>"
@@ -8634,6 +8680,7 @@ def cierre_semanal():
         + f"<div style='padding:10px 12px;background:rgba(236,253,245,.55);border:1px solid rgba(148,163,184,.25);border-radius:14px'>"
             + f"<div style='display:flex;justify-content:space-between'><span style='opacity:.88'>Capital cobrado</span><b>{fmt_money(capital_cobrado)}</b></div>"
             + f"<div style='display:flex;justify-content:space-between;margin-top:6px'><span style='opacity:.88'>Interés cobrado</span><b>{fmt_money(interes_cobrado)}</b></div>"
+            + f"<div style='display:flex;justify-content:space-between;margin-top:6px'><span style='opacity:.88'>Descuentos (Σ libro)</span><b>{fmt_money(descuentos_total)}</b></div>"
             + f"<div style='display:flex;justify-content:space-between;margin-top:6px'><span style='opacity:.88'>Gastos</span><b>{fmt_money(gastos_total)}</b></div>"
             + f"<div style='display:flex;justify-content:space-between;margin-top:6px'><span style='opacity:.88'>Ganancia real</span><b>{fmt_money(ganancias_reales)}</b></div>"
         + "</div>"
