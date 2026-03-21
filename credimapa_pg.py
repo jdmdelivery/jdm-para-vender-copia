@@ -290,13 +290,20 @@ class Auditoria(Base):
 
 
 # ---------------------------------------------------------------------------
-# Engine / sesión
+# Engine / sesión  (solo PostgreSQL; sin SQLite ni URL local por defecto)
 # ---------------------------------------------------------------------------
-DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL") or "postgresql://localhost/jdm_cash"
-if str(DATABASE_URL).lower() in ("", "null", "none"):
-    DATABASE_URL = "postgresql://localhost/jdm_cash"
-if DATABASE_URL and str(DATABASE_URL).startswith("postgres://"):
+_raw_pg = (os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL") or "").strip()
+if not _raw_pg or str(_raw_pg).lower() in ("none", "null"):
+    raise RuntimeError(
+        "credimapa_pg: defina DATABASE_URL o POSTGRES_URL apuntando a PostgreSQL (p. ej. en Render)."
+    )
+DATABASE_URL = _raw_pg
+if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+# Driver explícito para Render / psycopg2-binary
+_pg_prefix = "postgresql://"
+if DATABASE_URL.startswith(_pg_prefix) and "psycopg2" not in DATABASE_URL.split("://", 1)[0]:
+    DATABASE_URL = "postgresql+psycopg2://" + DATABASE_URL[len(_pg_prefix) :]
 
 engine = create_engine(
     DATABASE_URL,
@@ -424,7 +431,25 @@ def _seed_defaults_if_empty() -> None:
         pass
 
 
+def mask_database_url(url: str) -> str:
+    if not url:
+        return "(vacío)"
+    if "@" not in url:
+        return url
+    try:
+        scheme, rest = url.split("://", 1)
+        if "@" in rest:
+            _creds, hostpart = rest.rsplit("@", 1)
+            return f"{scheme}://***:***@{hostpart}"
+    except Exception:
+        pass
+    return "***"
+
+
 def init_app(app):
+    with engine.connect() as conn:
+        conn.execute(text("SELECT 1"))
+    app.logger.info("PostgreSQL OK (SELECT 1). URI activa: %s", mask_database_url(DATABASE_URL))
     init_db()
     try:
         _seed_defaults_if_empty()
@@ -730,6 +755,156 @@ def delete_client_db(client_id: int, admin_id: int, loan_ids: list) -> bool:
         return False
     for lid in loan_ids:
         delete_prestamo_cascade(s, int(lid))
+    s.delete(row)
+    s.commit()
+    return True
+
+
+def get_loan(loan_id: int):
+    return get_prestamo(get_session(), loan_id)
+
+
+def create_prestamo(
+    admin_id: int,
+    client_id: int,
+    created_by: int,
+    amount: float,
+    rate: float,
+    frequency: str,
+    start_date,
+    next_payment_date,
+    term_count: int,
+    remaining: float,
+    total_interest: float,
+    total_to_pay: float,
+    upfront_percent: float,
+    installment_amount: float,
+    discount_banco_id=None,
+    disbursement_banco_id=None,
+) -> int:
+    """Inserta préstamo y hace commit (persistente en PostgreSQL)."""
+    s = get_session()
+    row = Prestamo(
+        admin_id=admin_id,
+        client_id=client_id,
+        amount=amount,
+        rate=rate,
+        frequency=frequency or "semanal",
+        start_date=start_date,
+        next_payment_date=next_payment_date,
+        term_count=term_count,
+        remaining=remaining,
+        remaining_capital=remaining,
+        total_interest=total_interest,
+        total_to_pay=total_to_pay,
+        upfront_percent=upfront_percent,
+        installment_amount=installment_amount,
+        total_interest_paid=0,
+        status="ACTIVO",
+        created_by=created_by,
+        discount_banco_id=discount_banco_id,
+        disbursement_banco_id=disbursement_banco_id,
+    )
+    s.add(row)
+    s.flush()
+    lid = row.id
+    s.commit()
+    return lid
+
+
+def update_prestamo_simple(loan_id: int, admin_id: int, rate=None, remaining=None) -> bool:
+    s = get_session()
+    row = s.get(Prestamo, loan_id)
+    if not row or row.admin_id != admin_id:
+        return False
+    if rate is not None:
+        row.rate = rate
+    if remaining is not None:
+        row.remaining = remaining
+        row.remaining_capital = remaining
+    s.commit()
+    return True
+
+
+def delete_loan_row(loan_id: int, admin_id: int) -> bool:
+    s = get_session()
+    row = s.get(Prestamo, loan_id)
+    if not row or row.admin_id != admin_id:
+        return False
+    delete_prestamo_cascade(s, loan_id)
+    s.commit()
+    return True
+
+
+def save_prestamo_from_loan_dict(d: dict) -> bool:
+    """Persiste campos mutables del préstamo desde un dict (como en memoria)."""
+    s = get_session()
+    row = s.get(Prestamo, d.get("id"))
+    oid = d.get("organization_id")
+    if not row or row.admin_id != oid:
+        return False
+    row.remaining = float(d.get("remaining") or 0)
+    rc = d.get("remaining_capital")
+    if rc is not None:
+        row.remaining_capital = float(rc)
+    row.next_payment_date = d.get("next_payment_date")
+    st = d.get("status")
+    if st is not None:
+        row.status = str(st)
+    s.commit()
+    return True
+
+
+def insert_pago_and_sync_loan(
+    admin_id: int,
+    loan_id: int,
+    payment: dict,
+    loan_snapshot: dict,
+) -> int:
+    """Equiv. a db.session.add(Pago); actualizar Prestamo; commit."""
+    s = get_session()
+    pay_date = payment.get("date")
+    if hasattr(pay_date, "date"):
+        pay_date = pay_date.date()
+    rowp = Pago(
+        admin_id=admin_id,
+        loan_id=loan_id,
+        amount=float(payment.get("amount") or 0),
+        type=(payment.get("type") or "cuota"),
+        pago_date=pay_date,
+        capital=float(payment.get("capital") or 0),
+        interest=float(payment.get("interest") or 0),
+        status=payment.get("status") or "OK",
+        weeks_advanced=payment.get("weeks_advanced"),
+        created_by=payment.get("created_by"),
+    )
+    s.add(rowp)
+    rowl = s.get(Prestamo, loan_id)
+    if rowl and rowl.admin_id == admin_id:
+        rowl.remaining = float(loan_snapshot.get("remaining") or 0)
+        rc = loan_snapshot.get("remaining_capital")
+        if rc is not None:
+            rowl.remaining_capital = float(rc)
+        rowl.next_payment_date = loan_snapshot.get("next_payment_date")
+        st = loan_snapshot.get("status")
+        if st is not None:
+            rowl.status = str(st)
+    s.flush()
+    pid = rowp.id
+    s.commit()
+    return pid
+
+
+def get_payment_row(payment_id: int):
+    row = get_session().get(Pago, payment_id)
+    return row.to_dict() if row else None
+
+
+def delete_pago_by_id(payment_id: int, admin_id: int) -> bool:
+    s = get_session()
+    row = s.get(Pago, payment_id)
+    if not row or row.admin_id != admin_id:
+        return False
     s.delete(row)
     s.commit()
     return True

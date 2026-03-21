@@ -65,15 +65,24 @@ def receipt_cuotas_label(p, L):
     """Etiqueta tipo 3/10 para el recibo (solo cuenta pagos tipo cuota)."""
     loan_id = L.get("id") or p.get("loan_id")
     term_count = int(L.get("term_count") or 1)
+    oid = L.get("organization_id")
     if str(p.get("type") or "").strip().lower() != "cuota":
         return f"—/{term_count}"
-    cuotas = [
-        x
-        for x in store.payments.values()
-        if x.get("loan_id") == loan_id
-        and (x.get("status") or "OK") != "ANULADO"
-        and str(x.get("type") or "").strip().lower() == "cuota"
-    ]
+    if USE_DATABASE:
+        cuotas = [
+            x
+            for x in payments_for_loan(loan_id, oid)
+            if (x.get("status") or "OK") != "ANULADO"
+            and str(x.get("type") or "").strip().lower() == "cuota"
+        ]
+    else:
+        cuotas = [
+            x
+            for x in store.payments.values()
+            if x.get("loan_id") == loan_id
+            and (x.get("status") or "OK") != "ANULADO"
+            and str(x.get("type") or "").strip().lower() == "cuota"
+        ]
     cuotas.sort(key=lambda x: (x.get("date") or date.min, x.get("id") or 0))
     for i, x in enumerate(cuotas, start=1):
         if x.get("id") == p.get("id"):
@@ -416,9 +425,12 @@ SQLALCHEMY_DATABASE_URI = (
 
 USE_DATABASE = bool(os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL"))
 if USE_DATABASE:
-    from credimapa_pg import init_app
+    import credimapa_pg
 
-    init_app(app)
+    # Compatibilidad con convención Flask-SQLAlchemy (no usamos extensión; el motor es credimapa_pg).
+    app.config["SQLALCHEMY_DATABASE_URI"] = credimapa_pg.DATABASE_URL
+    app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+    credimapa_pg.init_app(app)
 
 
 def current_user():
@@ -626,6 +638,33 @@ def client_dict_by_id(client_id, org_id=None):
     return c
 
 
+def loan_dict_by_id(loan_id, org_id=None):
+    """Préstamo como dict (memoria o PostgreSQL)."""
+    oid = org_id if org_id is not None else session.get("org_id")
+    if USE_DATABASE:
+        from credimapa_pg import get_loan as _db_get_loan
+
+        L = _db_get_loan(loan_id)
+        if not L or L.get("organization_id") != oid:
+            return None
+        return L
+    L = store.loans.get(loan_id)
+    if not L:
+        return None
+    if oid is not None and L.get("organization_id") != oid:
+        return None
+    return L
+
+
+def payments_for_loan(loan_id, org_id=None):
+    oid = org_id if org_id is not None else session.get("org_id")
+    if USE_DATABASE:
+        from credimapa_pg import get_payments
+
+        return [p for p in get_payments([oid]).values() if p.get("loan_id") == loan_id]
+    return [p for p in store.payments.values() if p.get("loan_id") == loan_id]
+
+
 def user_is_cobrador_limited(user):
     """
     Un cobrador (collector) no debe ver datos de otros usuarios.
@@ -795,6 +834,21 @@ def _revert_loan_financials(loan_id, oid, user_id):
 
 def count_loan_cuota_payments(loan_id):
     """Pagos tipo cuota válidos (para numerar la cuota vencida siguiente)."""
+    if USE_DATABASE:
+        from credimapa_pg import get_loan, get_payments
+
+        L = get_loan(loan_id)
+        if not L:
+            return 0
+        oid = L.get("organization_id")
+        pm = get_payments([oid]) if oid is not None else {}
+        return sum(
+            1
+            for p in pm.values()
+            if p.get("loan_id") == loan_id
+            and (p.get("status") or "OK") != "ANULADO"
+            and str(p.get("type") or "").strip().lower() == "cuota"
+        )
     return sum(
         1
         for p in store.payments.values()
@@ -2626,8 +2680,8 @@ def new_loan():
             return redirect(url_for("new_loan"))
         if is_cajero_role(user):
             # Validación backend: el cajero solo puede crear préstamos para sus clientes.
-            c = store.clients.get(client_id)
-            if not c or c.get("organization_id") != org_id or c.get("created_by") != user.get("id"):
+            c = client_dict_by_id(client_id, org_id)
+            if not c or c.get("created_by") != user.get("id"):
                 flash("Sin acceso al cliente seleccionado.", "danger")
                 return redirect(url_for("new_loan"))
         if amount <= 0:
@@ -2677,7 +2731,7 @@ def new_loan():
                     org_id=org_id,
                 )
                 try:
-                    cl = store.clients.get(client_id, {})
+                    cl = client_dict_by_id(client_id, org_id) or {}
                     client_nm = f"{cl.get('first_name') or ''} {cl.get('last_name') or ''}".strip() or f"Cliente #{client_id}"
                     log_action(
                         user["id"],
@@ -2691,35 +2745,57 @@ def new_loan():
             flash(str(e), "danger")
             return redirect(url_for("new_loan"))
 
-        lid = store.nid("loans")
-        store.loans[lid] = {
-            "id": lid,
-            "client_id": client_id,
-            "amount": amount,  # capital aprobado
-            "rate": rate,
-            "frequency": freq,
-            "start_date": start_date,
-            "next_payment_date": next_payment_date,
-            "created_by": user["id"],
-            "remaining": amount,  # capital pendiente = capital aprobado (el descuento no lo reduce)
-            "remaining_capital": amount,
-            # IDs del libro de movimientos para poder corregir descuento.
-            "discount_cash_report_id": discount_cash_id,
-            "disbursement_cash_report_id": disbursement_cash_id,
-            "total_interest_paid": 0,
-            "status": "ACTIVO",
-            "term_count": term_count,
-            "organization_id": org_id,
-            "total_interest": total_interest,
-            "total_to_pay": total_to_pay,
-            "upfront_percent": upfront_percent,
-            "installment_amount": installment_amount,
-            "signature_b64": None,
-            "id_photo_b64": None,
-            "id_photo_back_b64": None,
-        }
+        if USE_DATABASE:
+            from credimapa_pg import create_prestamo as _db_create_prestamo
+
+            lid = _db_create_prestamo(
+                admin_id=org_id,
+                client_id=client_id,
+                created_by=user["id"],
+                amount=float(amount),
+                rate=float(rate),
+                frequency=freq,
+                start_date=start_date,
+                next_payment_date=next_payment_date,
+                term_count=term_count,
+                remaining=float(amount),
+                total_interest=float(total_interest),
+                total_to_pay=float(total_to_pay),
+                upfront_percent=float(upfront_percent),
+                installment_amount=float(installment_amount),
+                discount_banco_id=discount_cash_id,
+                disbursement_banco_id=disbursement_cash_id,
+            )
+        else:
+            lid = store.nid("loans")
+            store.loans[lid] = {
+                "id": lid,
+                "client_id": client_id,
+                "amount": amount,  # capital aprobado
+                "rate": rate,
+                "frequency": freq,
+                "start_date": start_date,
+                "next_payment_date": next_payment_date,
+                "created_by": user["id"],
+                "remaining": amount,  # capital pendiente = capital aprobado (el descuento no lo reduce)
+                "remaining_capital": amount,
+                # IDs del libro de movimientos para poder corregir descuento.
+                "discount_cash_report_id": discount_cash_id,
+                "disbursement_cash_report_id": disbursement_cash_id,
+                "total_interest_paid": 0,
+                "status": "ACTIVO",
+                "term_count": term_count,
+                "organization_id": org_id,
+                "total_interest": total_interest,
+                "total_to_pay": total_to_pay,
+                "upfront_percent": upfront_percent,
+                "installment_amount": installment_amount,
+                "signature_b64": None,
+                "id_photo_b64": None,
+                "id_photo_back_b64": None,
+            }
         try:
-            cl = store.clients.get(client_id, {})
+            cl = client_dict_by_id(client_id, org_id) or {}
             client_nm = f"{cl.get('first_name') or ''} {cl.get('last_name') or ''}".strip() or f"Cliente #{client_id}"
             log_action(
                 user["id"],
@@ -2757,21 +2833,28 @@ def delete_loan(loan_id):
     if user.get("role") != "admin" and not is_cartera_admin(user):
         flash("Solo admin puede borrar préstamos.", "danger")
         return redirect(url_for("loans"))
-    L = store.loans.get(loan_id)
-    if not L or L.get("organization_id") != oid:
+    L = loan_dict_by_id(loan_id, oid)
+    if not L:
         flash("Préstamo no encontrado.", "danger")
         return redirect(url_for("loans"))
 
     try:
         _revert_loan_financials(loan_id, oid, user.get("id"))
-        store.loans.pop(loan_id, None)
+        if USE_DATABASE:
+            from credimapa_pg import delete_loan_row
+
+            if not delete_loan_row(loan_id, oid):
+                flash("No se pudo eliminar el préstamo en la base de datos.", "danger")
+                return redirect(url_for("loan_detail", loan_id=loan_id))
+        else:
+            store.loans.pop(loan_id, None)
     except ValueError as e:
         flash(str(e), "danger")
         return redirect(url_for("loan_detail", loan_id=loan_id))
 
     try:
         user = current_user()
-        cl = store.clients.get(L.get("client_id"), {}) if L else {}
+        cl = client_dict_by_id(L.get("client_id"), oid) if L else {}
         client_nm = f"{cl.get('first_name') or ''} {cl.get('last_name') or ''}".strip() or f"Cliente #{L.get('client_id') if L else '—'}"
         loan_amt = float(L.get("amount") or 0) if L else 0
         log_action(
@@ -2789,7 +2872,9 @@ def delete_loan(loan_id):
 @app.route("/loans/<int:loan_id>/edit", methods=["GET", "POST"])
 @login_required
 def edit_loan(loan_id):
-    L = store.loans.get(loan_id)
+    ensure_org()
+    oid = session.get("org_id")
+    L = loan_dict_by_id(loan_id, oid)
     if not L:
         flash("No encontrado.", "danger")
         return redirect(url_for("loans"))
@@ -2798,11 +2883,26 @@ def edit_loan(loan_id):
         flash("Solo admin puede editar préstamos.", "danger")
         return redirect(url_for("loan_detail", loan_id=loan_id))
     if request.method == "POST":
-        L["rate"] = request.form.get("rate", type=float) or L.get("rate")
-        L["remaining"] = request.form.get("remaining", type=float)
+        new_rate = request.form.get("rate", type=float)
+        new_rem = request.form.get("remaining", type=float)
+        if USE_DATABASE:
+            from credimapa_pg import update_prestamo_simple
+
+            if not update_prestamo_simple(
+                loan_id,
+                oid,
+                rate=new_rate if new_rate is not None else float(L.get("rate") or 0),
+                remaining=new_rem if new_rem is not None else float(L.get("remaining") or 0),
+            ):
+                flash("No se pudo guardar.", "danger")
+                return redirect(url_for("edit_loan", loan_id=loan_id))
+            L = loan_dict_by_id(loan_id, oid) or L
+        else:
+            L["rate"] = new_rate or L.get("rate")
+            L["remaining"] = new_rem
         try:
             user = current_user()
-            cl = store.clients.get(L.get("client_id"), {}) if L else {}
+            cl = client_dict_by_id(L.get("client_id"), oid) if L else {}
             client_nm = f"{cl.get('first_name') or ''} {cl.get('last_name') or ''}".strip() or f"Cliente #{L.get('client_id') if L else '—'}"
             log_action(
                 user.get("id"),
@@ -2828,19 +2928,18 @@ def edit_loan(loan_id):
 def loan_detail(loan_id):
     ensure_org()
     oid = session.get("org_id")
-    L = store.loans.get(loan_id)
+    L = loan_dict_by_id(loan_id, oid)
     if not L:
         flash("No encontrado.", "danger")
-        return redirect(url_for("loans"))
-    if L.get("organization_id") != oid:
-        flash("Sin acceso.", "danger")
         return redirect(url_for("loans"))
     u = current_user()
     if not scope_owns_loan(u, L):
         flash("Sin acceso.", "danger")
         return redirect(url_for("loans"))
     try:
-        client_nm = f"{store.clients.get(L.get('client_id'), {}).get('first_name') or ''} {store.clients.get(L.get('client_id'), {}).get('last_name') or ''}".strip() or "Cliente"
+        _cid = L.get("client_id")
+        _c = client_dict_by_id(_cid, oid) or {}
+        client_nm = f"{_c.get('first_name') or ''} {_c.get('last_name') or ''}".strip() or "Cliente"
         log_action(
             u.get("id"),
             "ver préstamo",
@@ -2850,8 +2949,8 @@ def loan_detail(loan_id):
     except Exception:
         pass
     client_id = L.get("client_id")
-    client = store.clients.get(client_id, {})
-    pays = [p for p in store.payments.values() if p.get("loan_id") == loan_id]
+    client = client_dict_by_id(client_id, oid) or {}
+    pays = payments_for_loan(loan_id, oid)
     can_admin = u.get("role") == "admin" or is_cartera_admin(u)
     edit_btn = (
         f'<a class="btn btn-secondary" href="{url_for("edit_loan", loan_id=loan_id)}">✏️ Editar</a>'
@@ -3158,12 +3257,9 @@ def loan_detail(loan_id):
 def new_payment(loan_id):
     ensure_org()
     oid = session.get("org_id")
-    L = store.loans.get(loan_id)
+    L = loan_dict_by_id(loan_id, oid)
     if not L:
         flash("Préstamo no encontrado.", "danger")
-        return redirect(url_for("loans"))
-    if L.get("organization_id") != oid:
-        flash("Sin acceso.", "danger")
         return redirect(url_for("loans"))
     u = current_user()
     if not scope_owns_loan(u, L):
@@ -3237,10 +3333,12 @@ def new_payment(loan_id):
             capital_part = round(amt * 0.5, 2)
             interest_part = round(amt - capital_part, 2)
 
-        pid = store.nid("payments")
-        store.payments[pid] = {
-            "id": pid,
-            "loan_id": loan_id,
+        if USE_DATABASE:
+            L_state = dict(L)
+        else:
+            L_state = store.loans[loan_id]
+
+        pay_payload = {
             "amount": amt,
             "type": typ,
             "date": date.today(),
@@ -3249,11 +3347,10 @@ def new_payment(loan_id):
             "interest": interest_part,
             "status": "OK",
             "weeks_advanced": weeks_adv,
-            "created_at": datetime.utcnow(),
         }
 
         try:
-            cl = store.clients.get(L.get("client_id"), {})
+            cl = client_dict_by_id(L.get("client_id"), oid) or {}
             client_nm = f"{cl.get('first_name') or ''} {cl.get('last_name') or ''}".strip() or f"Cliente #{L.get('client_id')}"
             user_id = current_user()["id"]
             if typ_l == "adelanto":
@@ -3273,32 +3370,42 @@ def new_payment(loan_id):
         except Exception:
             pass
 
-        rem = float(L.get("remaining") or 0) - capital_part
-        L["remaining"] = max(0, rem)
-        if "remaining_capital" in L:
-            L["remaining_capital"] = max(0, float(L.get("remaining_capital") or 0) - capital_part)
+        rem = float(L_state.get("remaining") or 0) - capital_part
+        L_state["remaining"] = max(0, rem)
+        if "remaining_capital" in L_state:
+            L_state["remaining_capital"] = max(0, float(L_state.get("remaining_capital") or 0) - capital_part)
         # Si se registra una cuota, avanzamos la próxima fecha automáticamente.
         if typ_l == "cuota":
-            interval_days = freq_interval_days(L.get("frequency"))
-            current_due = L.get("next_payment_date") or date.today()
+            interval_days = freq_interval_days(L_state.get("frequency"))
+            current_due = L_state.get("next_payment_date") or date.today()
             if hasattr(current_due, "strftime"):
-                L["next_payment_date"] = current_due + timedelta(days=interval_days)
+                L_state["next_payment_date"] = current_due + timedelta(days=interval_days)
         elif typ_l == "adelanto" and weeks_adv:
-            interval_days = freq_interval_days(L.get("frequency"))
-            current_due = L.get("next_payment_date") or date.today()
+            interval_days = freq_interval_days(L_state.get("frequency"))
+            current_due = L_state.get("next_payment_date") or date.today()
             if hasattr(current_due, "strftime"):
-                L["next_payment_date"] = current_due + timedelta(days=interval_days * weeks_adv)
+                L_state["next_payment_date"] = current_due + timedelta(days=interval_days * weeks_adv)
 
-        # Regla: al alcanzar el número de cuotas, cerrar el préstamo y bloquear nuevos pagos.
+        # Regla: al alcanzar el número de cuotas, cerrar el préstamo (incluye el pago que acabamos de registrar).
         if typ_l == "cuota":
-            cuota_count_after = count_loan_cuota_payments(loan_id)
+            cuota_count_after = count_loan_cuota_payments(loan_id) + 1
             if cuota_count_after >= term_count:
-                L["status"] = "cerrado"
-                L["next_payment_date"] = None
+                L_state["status"] = "cerrado"
+                L_state["next_payment_date"] = None
             else:
-                # Mientras no complete `term_count`, el préstamo sigue activo aunque
-                # el capital pendiente llegue a 0 antes (por interés en las últimas cuotas).
-                L["status"] = "ACTIVO"
+                L_state["status"] = "ACTIVO"
+
+        if USE_DATABASE:
+            from credimapa_pg import insert_pago_and_sync_loan
+
+            insert_pago_and_sync_loan(oid, loan_id, pay_payload, L_state)
+        else:
+            pid = store.nid("payments")
+            pay_payload["id"] = pid
+            pay_payload["loan_id"] = loan_id
+            pay_payload["created_at"] = datetime.utcnow()
+            store.payments[pid] = pay_payload
+
         flash("Pago registrado.", "success")
         return redirect(url_for("loan_detail", loan_id=loan_id))
     body = (
@@ -3323,27 +3430,35 @@ def print_payment(payment_id):
     ensure_org()
     user = current_user()
     oid = session.get("org_id")
-    p = store.payments.get(payment_id)
+    if USE_DATABASE:
+        from credimapa_pg import get_payment_row
+
+        p = get_payment_row(payment_id)
+    else:
+        p = store.payments.get(payment_id)
     if not p:
         return "Pago no encontrado", 404
     loan_id = p.get("loan_id")
-    L = store.loans.get(loan_id) if loan_id is not None else None
+    L = loan_dict_by_id(loan_id, oid) if loan_id is not None else None
     if not L:
         return "Préstamo no encontrado", 404
-    if L.get("organization_id") != oid:
-        return "Sin acceso.", 403
     if user_is_cobrador_limited(user) and L.get("created_by") != user.get("id"):
         return "Sin acceso.", 403
 
     cid = L.get("client_id")
-    client = store.clients.get(cid, {})
+    client = client_dict_by_id(cid, oid) or {}
     cli_name = html.escape(
         f"{client.get('first_name', '')} {client.get('last_name') or ''}".strip() or f"Cliente #{cid}"
     )
     cli_phone = html.escape(str(client.get("phone") or "—"))
 
     cob_uid = L.get("created_by")
-    cob = store.users.get(cob_uid, {}) if cob_uid else {}
+    if USE_DATABASE and cob_uid:
+        from credimapa_pg import get_user as _db_gu
+
+        cob = _db_gu(cob_uid) or {}
+    else:
+        cob = store.users.get(cob_uid, {}) if cob_uid else {}
     cob_name = html.escape(str(cob.get("name") or cob.get("username") or "—"))
     cob_phone = html.escape(str(cob.get("phone") or RECEIPT_COMPANY_TEL or "—"))
 
@@ -3433,13 +3548,18 @@ def delete_payment(payment_id):
     ensure_org()
     oid = session.get("org_id")
     user = current_user()
-    p = store.payments.get(payment_id)
+    if USE_DATABASE:
+        from credimapa_pg import get_payment_row
+
+        p = get_payment_row(payment_id)
+    else:
+        p = store.payments.get(payment_id)
     if not p:
         flash("Pago no encontrado.", "danger")
         return redirect(url_for("loans"))
     loan_id = p.get("loan_id")
-    L = store.loans.get(loan_id) if loan_id is not None else None
-    if not L or L.get("organization_id") != oid:
+    L = loan_dict_by_id(loan_id, oid) if loan_id is not None else None
+    if not L:
         flash("Préstamo no encontrado.", "danger")
         return redirect(url_for("loans"))
     if user.get("role") != "admin" and not is_cartera_admin(user):
@@ -3467,39 +3587,65 @@ def delete_payment(payment_id):
         flash(str(e), "danger")
         return redirect(url_for("loan_detail", loan_id=loan_id))
 
-    # Ajustar préstamo (saldo y fechas) para que no quede inconsistente.
-    L["remaining"] = float(L.get("remaining") or 0) + capital_back
-    if "remaining_capital" in L:
-        L["remaining_capital"] = float(L.get("remaining_capital") or 0) + capital_back
-    term_count = int(L.get("term_count") or 1)
-    # Recuento de cuotas después de eliminar este pago (excluimos el payment actual).
-    cuota_count_after = len(
-        [
-            p
-            for p in store.payments.values()
-            if p.get("loan_id") == loan_id
-            and (p.get("type") or "").lower() == "cuota"
-            and int(p.get("id") or -1) != int(payment_id)
-        ]
-    )
-    if cuota_count_after >= term_count:
-        L["status"] = "cerrado"
+    if USE_DATABASE:
+        L_adj = dict(L)
     else:
-        L["status"] = "ACTIVO"
+        L_adj = store.loans[loan_id]
 
-    interval_days = freq_interval_days(L.get("frequency"))
-    current_due = L.get("next_payment_date")
+    # Ajustar préstamo (saldo y fechas) para que no quede inconsistente.
+    L_adj["remaining"] = float(L_adj.get("remaining") or 0) + capital_back
+    if "remaining_capital" in L_adj:
+        L_adj["remaining_capital"] = float(L_adj.get("remaining_capital") or 0) + capital_back
+    term_count = int(L_adj.get("term_count") or 1)
+    if USE_DATABASE:
+        from credimapa_pg import get_payments
+
+        pm = list(get_payments([oid]).values())
+        cuota_count_after = len(
+            [
+                x
+                for x in pm
+                if x.get("loan_id") == loan_id
+                and (x.get("type") or "").lower() == "cuota"
+                and int(x.get("id") or -1) != int(payment_id)
+            ]
+        )
+    else:
+        cuota_count_after = len(
+            [
+                x
+                for x in store.payments.values()
+                if x.get("loan_id") == loan_id
+                and (x.get("type") or "").lower() == "cuota"
+                and int(x.get("id") or -1) != int(payment_id)
+            ]
+        )
+    if cuota_count_after >= term_count:
+        L_adj["status"] = "cerrado"
+    else:
+        L_adj["status"] = "ACTIVO"
+
+    interval_days = freq_interval_days(L_adj.get("frequency"))
+    current_due = L_adj.get("next_payment_date")
     if hasattr(current_due, "strftime"):
         if typ_l == "cuota":
-            L["next_payment_date"] = current_due - timedelta(days=interval_days)
+            L_adj["next_payment_date"] = current_due - timedelta(days=interval_days)
         elif typ_l == "adelanto" and weeks > 0:
-            L["next_payment_date"] = current_due - timedelta(days=interval_days * weeks)
+            L_adj["next_payment_date"] = current_due - timedelta(days=interval_days * weeks)
 
-    store.payments.pop(payment_id, None)
+    if USE_DATABASE:
+        from credimapa_pg import delete_pago_by_id, save_prestamo_from_loan_dict
+
+        if not delete_pago_by_id(payment_id, oid):
+            flash("No se pudo eliminar el pago en la base de datos.", "danger")
+            return redirect(url_for("loan_detail", loan_id=loan_id))
+        save_prestamo_from_loan_dict(L_adj)
+    else:
+        store.payments.pop(payment_id, None)
     try:
-        cl = store.clients.get(L.get("client_id"), {}) if L else {}
-        client_nm = f"{cl.get('first_name') or ''} {cl.get('last_name') or ''}".strip() or f"Cliente #{L.get('client_id') if L else '—'}"
-        loan_amt = float(L.get("amount") or 0) if L else 0
+        cl = client_dict_by_id(L_adj.get("client_id"), oid) if L_adj else {}
+        client_nm = f"{cl.get('first_name') or ''} {cl.get('last_name') or ''}".strip() or f"Cliente #{L_adj.get('client_id') if L_adj else '—'}"
+        loan_amt = float(L_adj.get("amount") or 0) if L_adj else 0
         log_action(
             user.get("id"),
             "eliminar recibo de pago",
