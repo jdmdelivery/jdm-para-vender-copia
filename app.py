@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import json
+import math
 import base64
 import html
 import secrets
@@ -3703,6 +3704,10 @@ def compute_super_admin_stats(date_from=None, date_to=None):
         reverse=True,
     )[:150]
 
+    def _admin_display_name(uid):
+        u = store.users.get(uid, {})
+        return u.get("name") or u.get("username") or "—"
+
     return {
         "range_from": date_from.isoformat(),
         "range_to": date_to.isoformat(),
@@ -3727,7 +3732,7 @@ def compute_super_admin_stats(date_from=None, date_to=None):
             {
                 "id": p.get("id"),
                 "admin_id": p.get("admin_id"),
-                "admin_username": store.users.get(p.get("admin_id"), {}).get("username"),
+                "admin_username": _admin_display_name(p.get("admin_id")),
                 "amount": round(float(p.get("amount") or 0), 2),
                 "payment_date": _to_date(p.get("payment_date")).isoformat() if _to_date(p.get("payment_date")) else None,
                 "method": p.get("method") or "",
@@ -3777,72 +3782,24 @@ def super_admin_panel():
         target_id = request.form.get("target_id", type=int)
         tenant_id = request.form.get("tenant_id", type=int)
 
-        u = store.users.get(target_id) if target_id else None
-        if not u:
-            flash("Usuario no encontrado.", "danger")
-            return redirect(url_for("super_admin_panel"))
-
-        if act == "approve_admin":
-            if u.get("role") != "admin":
-                flash("Solo se aprueban admins.", "danger")
-                return redirect(url_for("super_admin_panel"))
-            u["account_status"] = ACCOUNT_ACTIVE
-            flash("Admin aprobado y activado.", "success")
-            return redirect(url_for("super_admin_panel"))
-
-        if act == "toggle_admin":
-            if u.get("role") != "admin":
-                flash("Solo se pueden activar/desactivar admins.", "danger")
-                return redirect(url_for("super_admin_panel"))
-            new_status = request.form.get("new_status", type=str)
-            if new_status not in (ACCOUNT_ACTIVE, ACCOUNT_SUSPENDED):
-                flash("Estado inválido.", "danger")
-                return redirect(url_for("super_admin_panel"))
-            u["account_status"] = new_status
-            flash("Estado de admin actualizado.", "success")
-            return redirect(url_for("super_admin_panel"))
-
-        if act == "approve_cobrador":
-            if u.get("role") != "cobrador":
-                flash("Solo se aprueban cobradores.", "danger")
-                return redirect(url_for("super_admin_panel"))
-            # Si el cobrador no pertenece a un tenant/admin, no se aprueba.
-            tid = u.get("organization_id")
-            if tid is None:
-                flash("Cobrador sin tenant asociado.", "danger")
-                return redirect(url_for("super_admin_panel"))
-            u["account_status"] = ACCOUNT_ACTIVE
-            flash("Cobrador aprobado.", "success")
-            return redirect(url_for("super_admin_panel"))
-
-        if act == "toggle_cobrador":
-            if u.get("role") != "cobrador":
-                flash("Solo se puede controlar cobradores.", "danger")
-                return redirect(url_for("super_admin_panel"))
-            new_status = request.form.get("new_status", type=str)
-            if new_status not in (ACCOUNT_ACTIVE, ACCOUNT_SUSPENDED):
-                flash("Estado inválido.", "danger")
-                return redirect(url_for("super_admin_panel"))
-            # No permitir pasar de "pendiente" a "activo" sin aprobación.
-            if u.get("account_status") == ACCOUNT_PENDING and new_status == ACCOUNT_ACTIVE:
-                flash("Primero apruebe el cobrador.", "warning")
-                return redirect(url_for("super_admin_panel"))
-            u["account_status"] = new_status
-            flash("Estado del cobrador actualizado.", "success")
-            return redirect(url_for("super_admin_panel"))
+        # No exigir target_id global: register_admin_payment usa admin_id; fechas usan su propio lookup.
 
         if act == "register_admin_payment":
             # Registrar pago de suscripción y extender fecha_fin.
             admin_id = request.form.get("admin_id", type=int)
-            amount = request.form.get("amount", type=float)
+            amount_raw = (request.form.get("amount") or "").strip()
+            try:
+                amount = float(amount_raw.replace(",", ".")) if amount_raw else None
+            except ValueError:
+                amount = None
             payment_date_raw = (request.form.get("payment_date") or "").strip()
             method = (request.form.get("method") or "").strip()
 
             if not admin_id:
                 flash("Admin inválido.", "danger")
                 return redirect(url_for("super_admin_panel"))
-            if amount is None or amount < 0:
-                flash("Monto inválido.", "danger")
+            if amount is None or amount < 0 or not math.isfinite(amount):
+                flash("Indique un monto válido (mayor que 0).", "danger")
                 return redirect(url_for("super_admin_panel"))
             if amount == 0:
                 flash("El monto debe ser mayor que 0.", "danger")
@@ -3899,8 +3856,70 @@ def super_admin_panel():
             except Exception:
                 pass
 
-            flash("Pago registrado. Suscripción extendida.", "success")
-            return redirect(url_for("super_admin_panel"))
+            amt_txt = fmt_money(round(float(amount), 2))
+            flash(
+                f"Pago #{pid} guardado por {amt_txt}. Suscripción extendida hasta {new_fin.strftime('%d/%m/%Y')}.",
+                "success",
+            )
+            fd = (request.form.get("desde") or raw_desde or "").strip()
+            fh = (request.form.get("hasta") or raw_hasta or "").strip()
+            qp = []
+            if fd:
+                qp.append(f"desde={fd}")
+            if fh:
+                qp.append(f"hasta={fh}")
+            q = ("?" + "&".join(qp)) if qp else ""
+            return redirect(url_for("super_admin_panel") + q)
+
+        if act == "edit_admin":
+            aid = request.form.get("admin_id", type=int)
+            admin_u = store.users.get(aid) if aid else None
+            if not admin_u or admin_u.get("role") != "admin":
+                flash("Admin no encontrado.", "danger")
+                return redirect(url_for("super_admin_panel"))
+            display_name = (request.form.get("display_name") or "").strip()
+            new_username = (request.form.get("new_username") or "").strip()
+            new_email = (request.form.get("email") or "").strip()
+            if not display_name:
+                flash("El nombre no puede estar vacío.", "danger")
+                return redirect(url_for("super_admin_panel"))
+            # Nombre visible duplicado entre admins (misma etiqueta)
+            dn_lower = display_name.lower()
+            for u in store.users.values():
+                if u.get("role") != "admin" or u.get("id") == aid:
+                    continue
+                other = (u.get("name") or u.get("username") or "").strip().lower()
+                if other == dn_lower:
+                    flash("Ya existe otro admin con ese nombre.", "danger")
+                    return redirect(url_for("super_admin_panel"))
+            admin_u["name"] = display_name
+            if new_email:
+                admin_u["email"] = new_email
+            else:
+                admin_u.pop("email", None)
+            if new_username:
+                if new_username != admin_u.get("username"):
+                    if any(
+                        x.get("username") == new_username and x.get("id") != aid
+                        for x in store.users.values()
+                    ):
+                        flash("Ese usuario (login) ya está en uso.", "danger")
+                        return redirect(url_for("super_admin_panel"))
+                    admin_u["username"] = new_username
+            try:
+                log_action(current_user()["id"], "edit_admin", f"id={aid}")
+            except Exception:
+                pass
+            flash("Datos del admin actualizados.", "success")
+            fd = (request.form.get("desde") or raw_desde or "").strip()
+            fh = (request.form.get("hasta") or raw_hasta or "").strip()
+            qp = []
+            if fd:
+                qp.append(f"desde={fd}")
+            if fh:
+                qp.append(f"hasta={fh}")
+            q = ("?" + "&".join(qp)) if qp else ""
+            return redirect(url_for("super_admin_panel") + q)
 
         if act == "set_admin_subscription_dates":
             admin_id = request.form.get("target_id", type=int) or request.form.get("admin_id", type=int)
@@ -3949,6 +3968,58 @@ def super_admin_panel():
             cob_u["subscription_end"] = fecha_fin  # compatibilidad
             cob_u["subscription_start"] = fecha_inicio
             flash("Fechas del cobrador actualizadas.", "success")
+            return redirect(url_for("super_admin_panel"))
+
+        u = store.users.get(target_id) if target_id else None
+        if not u:
+            flash("Usuario no encontrado.", "danger")
+            return redirect(url_for("super_admin_panel"))
+
+        if act == "approve_admin":
+            if u.get("role") != "admin":
+                flash("Solo se aprueban admins.", "danger")
+                return redirect(url_for("super_admin_panel"))
+            u["account_status"] = ACCOUNT_ACTIVE
+            flash("Admin aprobado y activado.", "success")
+            return redirect(url_for("super_admin_panel"))
+
+        if act == "toggle_admin":
+            if u.get("role") != "admin":
+                flash("Solo se pueden activar/desactivar admins.", "danger")
+                return redirect(url_for("super_admin_panel"))
+            new_status = request.form.get("new_status", type=str)
+            if new_status not in (ACCOUNT_ACTIVE, ACCOUNT_SUSPENDED):
+                flash("Estado inválido.", "danger")
+                return redirect(url_for("super_admin_panel"))
+            u["account_status"] = new_status
+            flash("Estado de admin actualizado.", "success")
+            return redirect(url_for("super_admin_panel"))
+
+        if act == "approve_cobrador":
+            if u.get("role") != "cobrador":
+                flash("Solo se aprueban cobradores.", "danger")
+                return redirect(url_for("super_admin_panel"))
+            tid = u.get("organization_id")
+            if tid is None:
+                flash("Cobrador sin tenant asociado.", "danger")
+                return redirect(url_for("super_admin_panel"))
+            u["account_status"] = ACCOUNT_ACTIVE
+            flash("Cobrador aprobado.", "success")
+            return redirect(url_for("super_admin_panel"))
+
+        if act == "toggle_cobrador":
+            if u.get("role") != "cobrador":
+                flash("Solo se puede controlar cobradores.", "danger")
+                return redirect(url_for("super_admin_panel"))
+            new_status = request.form.get("new_status", type=str)
+            if new_status not in (ACCOUNT_ACTIVE, ACCOUNT_SUSPENDED):
+                flash("Estado inválido.", "danger")
+                return redirect(url_for("super_admin_panel"))
+            if u.get("account_status") == ACCOUNT_PENDING and new_status == ACCOUNT_ACTIVE:
+                flash("Primero apruebe el cobrador.", "warning")
+                return redirect(url_for("super_admin_panel"))
+            u["account_status"] = new_status
+            flash("Estado del cobrador actualizado.", "success")
             return redirect(url_for("super_admin_panel"))
 
         flash("Acción inválida.", "danger")
@@ -4073,11 +4144,32 @@ def super_admin_panel():
             f"</form>"
             f"</details>"
         )
-        actions = f"{actions}{admin_dates_editor}"
+        dn_raw = a.get("name") or a.get("username") or ""
+        un_raw = a.get("username") or ""
+        em_raw = (a.get("email") or "").strip()
+        admin_edit_form = (
+            f"<details style='display:inline-block;margin-left:8px;vertical-align:top'>"
+            f"<summary style='cursor:pointer;font-weight:900;opacity:.85'>Editar admin</summary>"
+            f"<form method='post' action='{url_for('super_admin_panel')}' style='margin-top:8px;min-width:240px'>"
+            f"<input type='hidden' name='action' value='edit_admin'>"
+            f"<input type='hidden' name='admin_id' value='{aid}'>"
+            f"<input type='hidden' name='desde' value='{df.isoformat()}'>"
+            f"<input type='hidden' name='hasta' value='{dt.isoformat()}'>"
+            f"<div style='font-size:11px;opacity:.8;font-weight:800;margin-bottom:6px'>Nombre visible</div>"
+            f"<input name='display_name' type='text' value={json.dumps(dn_raw)} required maxlength='120' style='width:100%;padding:8px 10px;border-radius:12px;border:1px solid rgba(148,163,184,.35);background:rgba(255,255,255,.9);box-sizing:border-box'/>"
+            f"<div style='font-size:11px;opacity:.8;font-weight:800;margin:10px 0 6px 0'>Usuario (login)</div>"
+            f"<input name='new_username' type='text' value={json.dumps(un_raw)} placeholder='Opcional: nuevo usuario' maxlength='80' style='width:100%;padding:8px 10px;border-radius:12px;border:1px solid rgba(148,163,184,.35);background:rgba(255,255,255,.9);box-sizing:border-box'/>"
+            f"<div style='font-size:11px;opacity:.8;font-weight:800;margin:10px 0 6px 0'>Correo (opcional)</div>"
+            f"<input name='email' type='email' value={json.dumps(em_raw)} maxlength='120' style='width:100%;padding:8px 10px;border-radius:12px;border:1px solid rgba(148,163,184,.35);background:rgba(255,255,255,.9);box-sizing:border-box'/>"
+            f"<button class='sa-btn sa-btn-primary' type='submit' style='margin-top:10px;width:100%'>Guardar cambios</button>"
+            f"</form>"
+            f"</details>"
+        )
+        actions = f"{actions}{admin_dates_editor}{admin_edit_form}"
 
         admin_rows += (
             "<tr>"
-            f"<td>{esc(a.get('username'))}</td>"
+            f"<td>{esc(a.get('name') or a.get('username'))}</td>"
             f"<td>{subscription_state_badge(status, sub_end)}</td>"
             f"<td>{fmt_sub_end(sub_end)}</td>"
             f"<td style='text-align:right'>{users_total}</td>"
@@ -4094,7 +4186,11 @@ def super_admin_panel():
     users_rows = ""
     for u in all_users[:280]:
         tid = u.get("organization_id")
-        tname = store.users.get(tid, {}).get("username") or f"Admin #{tid}"
+        tname = (
+            store.users.get(tid, {}).get("name")
+            or store.users.get(tid, {}).get("username")
+            or f"Admin #{tid}"
+        )
         users_rows += (
             "<tr>"
             f"<td>{esc(tname)}</td>"
@@ -4110,7 +4206,7 @@ def super_admin_panel():
     collectors_by_admin_html = ""
     for a in admins:
         aid = a.get("id")
-        a_name = a.get("username") or f"Admin #{aid}"
+        a_name = a.get("name") or a.get("username") or f"Admin #{aid}"
         collectors = [
             u
             for u in store.users.values()
@@ -4195,14 +4291,23 @@ def super_admin_panel():
     soon_list = ", ".join(esc(a.get("username")) for a in soon_admins) if soon_admins else "Nadie próximo a vencer"
 
     payment_admin_opts = "".join(
-        f"<option value='{a.get('id')}'>{esc(a.get('username'))}</option>"
+        f"<option value='{a.get('id')}'>{esc(a.get('name') or a.get('username'))}</option>"
         for a in admins
     )
+
+    def fmt_ph_date_cell(iso_s):
+        if not iso_s:
+            return "—"
+        try:
+            return datetime.strptime(str(iso_s)[:10], "%Y-%m-%d").date().strftime("%d/%m/%Y")
+        except ValueError:
+            return str(iso_s)
+
     payments_rows = "".join(
         "<tr>"
         f"<td>{esc(p.get('admin_username') or '—')}</td>"
         f"<td style='text-align:right'>{fmt_money(p.get('amount') or 0)}</td>"
-        f"<td>{esc(p.get('payment_date') or '—')}</td>"
+        f"<td>{esc(fmt_ph_date_cell(p.get('payment_date')))}</td>"
         f"<td>{esc(p.get('method') or '—')}</td>"
         "</tr>"
         for p in (stats.get("payment_history") or [])
@@ -4226,6 +4331,34 @@ let prestadoChart = null;
 function money(v){
   const n = Number(v || 0);
   return 'RD$ ' + n.toLocaleString('es-DO', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+function escText(s){
+  return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function formatPayDateIso(iso){
+  if(!iso) return '—';
+  const p = String(iso).slice(0,10).split('-');
+  if(p.length !== 3) return escText(iso);
+  return escText(`${p[2]}/${p[1]}/${p[0]}`);
+}
+
+function renderPaymentHistoryBody(rows){
+  const tb = document.getElementById('saPaymentHistoryBody');
+  if(!tb) return;
+  const list = Array.isArray(rows) ? rows : [];
+  if(!list.length){
+    tb.innerHTML = "<tr><td colspan='4' style='text-align:center;opacity:.85'>Sin pagos en el rango</td></tr>";
+    return;
+  }
+  tb.innerHTML = list.map(p => {
+    const who = escText(p.admin_username || '—');
+    const amt = money(p.amount || 0);
+    const when = formatPayDateIso(p.payment_date);
+    const how = escText(p.method || '—');
+    return `<tr><td>${who}</td><td style="text-align:right">${amt}</td><td>${when}</td><td>${how}</td></tr>`;
+  }).join('');
 }
 
 function buildCharts(){
@@ -4297,6 +4430,8 @@ function updateFrom(data){
   document.getElementById('alertExpiredCount').textContent = alerts.expired_admins_count || 0;
   document.getElementById('alertSoonCount').textContent = alerts.soon_admins_count || 0;
   document.getElementById('alertPendingCollectorsCount').textContent = alerts.pending_collectors_count || 0;
+
+  renderPaymentHistoryBody(data.payment_history);
 }
 
 async function refreshStats(){
@@ -4497,12 +4632,14 @@ window.addEventListener('load', () => {
       </div>
       <form method="post" style="margin-top:8px">
         <input type="hidden" name="action" value="register_admin_payment">
+        <input type="hidden" name="desde" value="{df.isoformat()}">
+        <input type="hidden" name="hasta" value="{dt.isoformat()}">
         <label style="display:block;font-size:12px;opacity:.8;font-weight:800;margin-top:6px">Admin</label>
         <select name="admin_id" required style="width:100%;padding:10px;border-radius:12px;border:1px solid rgba(148,163,184,.35);background:rgba(255,255,255,.9);">
           {payment_admin_opts}
         </select>
         <label style="display:block;font-size:12px;opacity:.8;font-weight:800;margin-top:10px">Monto pagado</label>
-        <input name="amount" type="number" step="0.01" min="0" required style="width:100%;padding:10px;border-radius:12px;border:1px solid rgba(148,163,184,.35);background:rgba(255,255,255,.9);">
+        <input name="amount" type="number" step="0.01" min="0.01" required style="width:100%;padding:10px;border-radius:12px;border:1px solid rgba(148,163,184,.35);background:rgba(255,255,255,.9);">
         <label style="display:block;font-size:12px;opacity:.8;font-weight:800;margin-top:10px">Fecha de pago</label>
         <input name="payment_date" type="date" value="{dt.isoformat()}" required style="width:100%;padding:10px;border-radius:12px;border:1px solid rgba(148,163,184,.35);background:rgba(255,255,255,.9);">
         <label style="display:block;font-size:12px;opacity:.8;font-weight:800;margin-top:10px">Método (opcional)</label>
@@ -4520,8 +4657,10 @@ window.addEventListener('load', () => {
       </div>
       <div class="table-scroll" style="margin-top:8px">
         <table>
-          <tr><th>Admin</th><th style="text-align:right">Monto</th><th>Fecha</th><th>Método</th></tr>
+          <thead><tr><th>Admin</th><th style="text-align:right">Monto</th><th>Fecha</th><th>Método</th></tr></thead>
+          <tbody id="saPaymentHistoryBody">
           {payments_rows or "<tr><td colspan='4' style='text-align:center;opacity:.85'>Sin pagos en el rango</td></tr>"}
+          </tbody>
         </table>
       </div>
     </div>
