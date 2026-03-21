@@ -290,6 +290,13 @@ class Cierre(Base):
     cobrado_hoy_snapshot = Column(Numeric(14, 2), default=0)
     total_por_cobrar_snapshot = Column(Numeric(14, 2), default=0)
     n_activos = Column(Integer, default=0)
+    fecha_inicio = Column(Date, nullable=True)
+    fecha_fin = Column(Date, nullable=True)
+    capital_cobrado = Column(Numeric(14, 2), nullable=True)
+    interes_cobrado = Column(Numeric(14, 2), nullable=True)
+    gastos_cuadre = Column(Numeric(14, 2), nullable=True)
+    descuentos_cuadre = Column(Numeric(14, 2), nullable=True)
+    ganancia_cuadre = Column(Numeric(14, 2), nullable=True)
 
     __table_args__ = (Index("ix_cierres_admin_id", "admin_id"),)
 
@@ -297,6 +304,14 @@ class Cierre(Base):
         d = _to_dict(self)
         d["organization_id"] = d["admin_id"]
         d["notas"] = d.get("notas")
+        for alias, col in (
+            ("gastos", "gastos_cuadre"),
+            ("descuentos", "descuentos_cuadre"),
+            ("ganancia", "ganancia_cuadre"),
+        ):
+            v = d.get(col)
+            if v is not None:
+                d[alias] = float(v)
         return d
 
 

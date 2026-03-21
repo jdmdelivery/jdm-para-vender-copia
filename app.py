@@ -8,6 +8,7 @@ import math
 import base64
 import html
 import secrets
+from urllib.parse import urlencode
 from datetime import datetime, date, timedelta
 from functools import wraps
 
@@ -8204,54 +8205,56 @@ def cierre_semanal():
     is_print = mode in ("print", "pdf", "imprimir")
     is_58mm = mode in ("58mm", "58", "t59", "recibo-58mm")
 
-    # Rango semanal tipo lunes->domingo.
+    def _parse_cierre_date(arg, default: date) -> date:
+        if arg is None or not str(arg).strip():
+            return default
+        try:
+            return datetime.strptime(str(arg).strip()[:10], "%Y-%m-%d").date()
+        except ValueError:
+            return default
+
     today = today_rd()
-    week_start = today - timedelta(days=today.weekday())
-    week_end = week_start + timedelta(days=6)
+    default_ws = today - timedelta(days=today.weekday())
+    default_we = default_ws + timedelta(days=6)
+    week_start = _parse_cierre_date(request.args.get("fecha_inicio"), default_ws)
+    week_end = _parse_cierre_date(request.args.get("fecha_fin"), default_we)
+    if week_start > week_end:
+        week_start, week_end = week_end, week_start
 
     GASTO_MOV_TYPES = ("gasto", "gasto_ruta")
     _pg_get_user = None
     if USE_DATABASE:
         from credimapa_pg import (
+            compute_cierre_period_data,
+            ensure_cierres_schema,
             get_session,
             get_clientes_dict,
             get_prestamos_dict,
             get_user as _pg_get_user,
-            list_banco_cierre_by_type,
-            list_banco_cierre_gastos,
-            list_pagos_cierre_semanal,
-            sum_banco_abs_amount_in_range,
-            sum_banco_amount_in_range,
         )
 
+        ensure_cierres_schema()
         sess = get_session()
+        cd = compute_cierre_period_data(
+            sess,
+            org_id,
+            week_start,
+            week_end,
+            restrict=restrict,
+            user_id=user.get("id"),
+        )
         clients_map = get_clientes_dict(sess, [org_id])
         loans_map = get_prestamos_dict(sess, [org_id])
-        uid_f = user.get("id") if restrict else None
-        payments_week = list_pagos_cierre_semanal(
-            sess, org_id, week_start, week_end, restrict=restrict, user_id=user.get("id")
-        )
-        prestamos_entregados = list_banco_cierre_by_type(
-            sess, org_id, "prestamo_entregado", week_start, week_end, user_id=uid_f
-        )
-        descuentos = list_banco_cierre_by_type(
-            sess, org_id, "descuento_inicial", week_start, week_end, user_id=uid_f
-        )
-        gastos = list_banco_cierre_gastos(
-            sess, org_id, week_start, week_end, user_id=uid_f, movement_types=GASTO_MOV_TYPES
-        )
-        descuentos_total = round(
-            sum_banco_amount_in_range(
-                sess, org_id, "descuento_inicial", week_start, week_end, user_id=uid_f
-            ),
-            2,
-        )
-        gastos_total = round(
-            sum_banco_abs_amount_in_range(
-                sess, org_id, list(GASTO_MOV_TYPES), week_start, week_end, user_id=uid_f
-            ),
-            2,
-        )
+        payments_week = cd["payments_week"]
+        prestamos_periodo = cd["prestamos_periodo"]
+        descuentos = cd["descuentos"]
+        gastos = cd["gastos"]
+        capital_cobrado = cd["capital_cobrado"]
+        interes_cobrado = cd["interes_cobrado"]
+        descuentos_total = cd["descuentos_total"]
+        gastos_total = cd["gastos_total"]
+        ganancias_reales = cd["ganancia"]
+        prestado_total = cd["prestado_total"]
     else:
         clients_map = store.clients
         loans_map = store.loans
@@ -8269,14 +8272,13 @@ def cierre_semanal():
             and (p.get("status") or "OK") != "ANULADO"
             and (not restrict or p.get("created_by") == user.get("id"))
         ]
-        prestamos_entregados = [
-            cr
-            for cr in store.cash_reports.values()
-            if cr.get("organization_id") == org_id
-            and cr.get("movement_type") == "prestamo_entregado"
-            and cr.get("date") is not None
-            and week_start <= cr.get("date") <= week_end
-            and (not restrict or cr.get("user_id") == user.get("id"))
+        prestamos_periodo = [
+            L
+            for L in store.loans.values()
+            if L.get("organization_id") == org_id
+            and L.get("start_date") is not None
+            and week_start <= L.get("start_date") <= week_end
+            and (not restrict or L.get("created_by") == user.get("id"))
         ]
         descuentos = [
             cr
@@ -8295,20 +8297,17 @@ def cierre_semanal():
             and week_start <= e.get("created_at").date() <= week_end
             and (not restrict or e.get("user_id") == user.get("id"))
         ]
+        capital_cobrado = round(sum(float(p.get("amount") or 0) for p in payments_week), 2)
+        interes_cobrado = round(sum(float(p.get("interest") or 0) for p in payments_week), 2)
         descuentos_total = round(sum(float(cr.get("amount") or 0) for cr in descuentos), 2)
         gastos_total = round(sum(abs(float(e.get("amount") or 0)) for e in gastos), 2)
+        ganancias_reales = round(interes_cobrado + descuentos_total - gastos_total, 2)
+        prestado_total = round(sum(float(L.get("amount") or 0) for L in prestamos_periodo), 2)
 
     payments_week.sort(key=lambda p: (p.get("created_by") or 0, p.get("id") or 0))
-    prestamos_entregados.sort(key=lambda cr: (cr.get("user_id") or 0, cr.get("id") or 0))
 
     total_amount_week = round(sum(float(p.get("amount") or 0) for p in payments_week), 2)
-    capital_cobrado = round(sum(float(p.get("capital") or 0) for p in payments_week), 2)
-    interes_cobrado = round(sum(float(p.get("interest") or 0) for p in payments_week), 2)
-
-    if not USE_DATABASE:
-        if capital_cobrado == 0 and interes_cobrado == 0 and total_amount_week:
-            capital_cobrado = round(total_amount_week * 0.5, 2)
-            interes_cobrado = round(total_amount_week - capital_cobrado, 2)
+    period_qs = urlencode({"fecha_inicio": week_start.isoformat(), "fecha_fin": week_end.isoformat()})
 
     def _cierre_user_label(uid):
         if not uid:
@@ -8404,47 +8403,21 @@ def cierre_semanal():
             )
         client_print_html = "".join(lines)
 
-    prestado_total = round(sum(float(cr.get("amount") or 0) for cr in prestamos_entregados), 2)
     prestamos_rows = ""
-
-    def client_name_from_cash_note(note):
-        # Nota:
-        # "Préstamo entregado cliente #{client_id}"
-        # También puede venir con sufijos por ediciones.
-        if not note:
-            return None
-        n = str(note)
-        low = n.lower()
-        marker = "cliente #"
-        idx = low.find(marker)
-        if idx == -1:
-            return None
-        i = idx + len(marker)
-        digits = ""
-        while i < len(n) and n[i].isdigit():
-            digits += n[i]
-            i += 1
-        if not digits:
-            return None
-        try:
-            cid = int(digits)
-        except Exception:
-            return None
-        cl = clients_map.get(cid)
-        if not cl:
-            return None
-        full = f"{cl.get('first_name') or ''} {cl.get('last_name') or ''}".strip()
-        return full or (cl.get("first_name") or cl.get("last_name") or None)
-
-    for cr in prestamos_entregados:
-        uid = cr.get("user_id")
-        fallback = _cierre_user_label(uid)
-        cliente_nm = client_name_from_cash_note(cr.get("note"))
-        name = cliente_nm or fallback
+    for L in sorted(
+        prestamos_periodo,
+        key=lambda x: (x.get("created_by") or 0, x.get("id") or 0),
+    ):
+        cid = L.get("client_id")
+        cl = clients_map.get(cid, {}) if cid is not None else {}
+        name = (
+            f"{cl.get('first_name') or ''} {cl.get('last_name') or ''}".strip()
+            or (f"Cliente #{cid}" if cid is not None else "—")
+        )
         prestamos_rows += (
             "<tr>"
             f"<td style='padding-right:12px'>{html.escape(str(name))}</td>"
-            f"<td style='text-align:right;font-weight:900'>{fmt_money(cr.get('amount') or 0)}</td>"
+            f"<td style='text-align:right;font-weight:900'>{fmt_money(L.get('amount') or 0)}</td>"
             "</tr>"
         )
     if not prestamos_rows:
@@ -8639,12 +8612,54 @@ def cierre_semanal():
     # -------------------------
     # Vista normal (con gráficos + acciones)
     # -------------------------
-    print_href = url_for("cierre_semanal") + "?mode=print"
-    print58_href = url_for("cierre_semanal") + "?mode=58mm"
+    print_href = url_for("cierre_semanal") + "?" + period_qs + "&mode=print"
+    print58_href = url_for("cierre_semanal") + "?" + period_qs + "&mode=58mm"
+
+    period_form = (
+        f'<form method="get" action="{url_for("cierre_semanal")}" class="no-print" '
+        f'style="margin:0 0 12px 0;padding:12px;background:rgba(248,250,252,.9);border:1px solid rgba(148,163,184,.25);border-radius:14px;display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end">'
+        f'<div><div style="font-size:11px;font-weight:900;opacity:.8;margin-bottom:4px">Desde (RD)</div>'
+        f'<input type="date" name="fecha_inicio" value="{week_start.isoformat()}" required style="padding:8px 10px;border-radius:10px;border:1px solid rgba(148,163,184,.35)"/></div>'
+        f'<div><div style="font-size:11px;font-weight:900;opacity:.8;margin-bottom:4px">Hasta (RD)</div>'
+        f'<input type="date" name="fecha_fin" value="{week_end.isoformat()}" required style="padding:8px 10px;border-radius:10px;border:1px solid rgba(148,163,184,.35)"/></div>'
+        f'<button type="submit" class="btn btn-secondary" style="margin-top:18px">Actualizar periodo</button>'
+        f"</form>"
+    )
+
+    cerrar_block = ""
+    if USE_DATABASE and can_admin_actions(user):
+        cerrar_block = (
+            f'<form method="post" action="{url_for("cerrar_semana")}" style="margin-top:14px" class="no-print">'
+            f'<input type="hidden" name="fecha_inicio" value="{week_start.isoformat()}"/>'
+            f'<input type="hidden" name="fecha_fin" value="{week_end.isoformat()}"/>'
+            f'<p style="margin:0 0 8px 0;font-size:13px;opacity:.88">Cierra el cuadre del periodo mostrado: guarda totales en historial y vacía préstamos, pagos y clientes. El libro <b>banco</b> no se modifica.</p>'
+            f'<button class="btn btn-primary" type="submit" style="width:100%;font-size:16px;padding:12px 10px" '
+            f'onclick="return confirm(\'¿Cerrar cuadre? Esta acción borra préstamos, pagos y clientes del tenant.\');">'
+            f"✅ CERRAR CUADRE</button>"
+            f"</form>"
+        )
+    elif USE_DATABASE:
+        cerrar_block = (
+            '<p class="no-print" style="margin-top:14px;font-size:13px;opacity:.85">Solo administración puede cerrar cuadre.</p>'
+        )
+    else:
+        if can_admin_actions(user):
+            cerrar_block = (
+                '<p class="no-print" style="margin-top:14px;font-size:13px;opacity:.85">'
+                "Sin PostgreSQL: puedes registrar un snapshot en memoria (no borra datos).</p>"
+                f'<form method="post" action="{url_for("cerrar_semana")}" class="no-print" style="margin-top:8px">'
+                f'<input type="hidden" name="fecha_inicio" value="{week_start.isoformat()}"/>'
+                f'<input type="hidden" name="fecha_fin" value="{week_end.isoformat()}"/>'
+                f'<button class="btn btn-secondary" type="submit">Registrar cierre (memoria)</button>'
+                f"</form>"
+            )
+        else:
+            cerrar_block = ""
 
     body = (
         report_css
         + "<div class='cierre-wrap'>"
+        + period_form
         + "<div class='cierre-head'>"
         + "<div class='cierre-brand'>"
         + "<div style='color:#16a34a'>" + logo_svg + "</div>"
@@ -8690,9 +8705,7 @@ def cierre_semanal():
         + "<div style='height:260px'><canvas id='cierreChart'></canvas></div>"
         + "</div>"
         + charts_js
-        + "<form method='post' action=\"" + url_for("cerrar_semana") + "\" style='margin-top:14px' class='no-print'>"
-        + "<button class='btn btn-primary' type='submit' style='width:100%;font-size:16px;padding:12px 10px'>✅ CERRAR CUADRE</button>"
-        + "</form>"
+        + cerrar_block
         + "</div>"
         + "</div>"
         + nav_subfooter()
@@ -8708,13 +8721,53 @@ def cerrar_semana():
     ensure_org()
     org_id = session.get("org_id")
     user = current_user()
+    if not can_admin_actions(user):
+        flash("Solo administración puede cerrar cuadre.", "danger")
+        return redirect(url_for("cierre_semanal"))
+
+    def _fd(name):
+        raw = (request.form.get(name) or "").strip()[:10]
+        if not raw:
+            return None
+        try:
+            return datetime.strptime(raw, "%Y-%m-%d").date()
+        except ValueError:
+            return None
+
+    d0 = _fd("fecha_inicio")
+    d1 = _fd("fecha_fin")
+    if d0 is None or d1 is None:
+        flash("Indica fecha inicio y fin del periodo.", "danger")
+        return redirect(url_for("cierre_semanal"))
+    if d0 > d1:
+        d0, d1 = d1, d0
+    notas = (request.form.get("notas") or "").strip()
+
+    if USE_DATABASE:
+        try:
+            from credimapa_pg import execute_cerrar_cuadre
+
+            execute_cerrar_cuadre(org_id, user["id"], d0, d1, notas)
+            try:
+                log_action(user["id"], "cerrar_cuadre_pg", module="banco", detail=f"{d0}..{d1}")
+            except Exception:
+                pass
+            flash("Cuadre cerrado correctamente", "success")
+            return redirect(url_for("dashboard"))
+        except Exception as e:
+            flash(f"No se pudo cerrar el cuadre: {e}", "danger")
+            qs = urlencode({"fecha_inicio": d0.isoformat(), "fecha_fin": d1.isoformat()})
+            return redirect(url_for("cierre_semanal") + "?" + qs)
+
     k = compute_financial_kpis(org_id, user)
     rec = {
         "id": store.nid("cierre"),
         "organization_id": org_id,
         "closed_at": utc_now_for_db(),
         "user_id": user["id"],
-        "notas": (request.form.get("notas") or "").strip(),
+        "notas": notas,
+        "fecha_inicio": d0,
+        "fecha_fin": d1,
         "cobrado_hoy_snapshot": k["cobrado_hoy"],
         "total_por_cobrar_snapshot": k["total_por_cobrar"],
         "n_activos": k["n_activos"],
@@ -8724,7 +8777,7 @@ def cerrar_semana():
         log_action(user["id"], "cierre_semana", str(rec["id"]))
     except Exception:
         pass
-    flash("Cierre de semana registrado.", "success")
+    flash("Cierre registrado en memoria (sin PostgreSQL).", "success")
     return redirect(url_for("historial_cierres"))
 
 
@@ -8734,21 +8787,61 @@ def historial_cierres():
     ensure_org()
     oid = session.get("org_id")
     rows = ""
-    for rec in reversed([r for r in store.closure_history if r.get("organization_id") == oid][-50:]):
-        cid = rec.get("id")
-        del_form = (
-            f'<form method="post" action="{url_for("borrar_cierre", cierre_id=cid)}" style="display:inline" '
-            f'onsubmit="return confirm(\'¿Eliminar este registro?\');"><button type="submit" class="btn btn-secondary">Borrar</button></form>'
+    if USE_DATABASE:
+        from credimapa_pg import ensure_cierres_schema, list_cierres_admin
+
+        ensure_cierres_schema()
+        recs = list_cierres_admin(oid, limit=50)
+        for rec in recs:
+            cid = rec.get("id")
+            del_form = ""
+            if can_admin_actions(current_user()):
+                del_form = (
+                    f'<form method="post" action="{url_for("borrar_cierre", cierre_id=cid)}" style="display:inline" '
+                    f'onsubmit="return confirm(\'¿Eliminar este registro?\');"><button type="submit" class="btn btn-secondary">Borrar</button></form>'
+                )
+            fi = rec.get("fecha_inicio")
+            ff = rec.get("fecha_fin")
+            periodo = f"{fi or '—'} → {ff or '—'}"
+            cap = rec.get("capital_cobrado")
+            intr = rec.get("interes_cobrado")
+            gas = rec.get("gastos_cuadre") if rec.get("gastos_cuadre") is not None else rec.get("gastos")
+            des = rec.get("descuentos_cuadre") if rec.get("descuentos_cuadre") is not None else rec.get("descuentos")
+            gan = rec.get("ganancia_cuadre") if rec.get("ganancia_cuadre") is not None else rec.get("ganancia")
+            rows += (
+                f"<tr><td>{html.escape(str(rec.get('closed_at') or '—'))}</td>"
+                f"<td>{html.escape(periodo)}</td>"
+                f"<td>{fmt_money(cap)}</td><td>{fmt_money(intr)}</td>"
+                f"<td>{fmt_money(des)}</td><td>{fmt_money(gas)}</td><td>{fmt_money(gan)}</td>"
+                f"<td>{html.escape(str(rec.get('notas') or '—'))}</td><td>{del_form}</td></tr>"
+            )
+        head = (
+            "<tr><th>Cerrado</th><th>Periodo</th><th>Capital cobrado</th><th>Interés</th>"
+            "<th>Descuentos</th><th>Gastos</th><th>Ganancia</th><th>Notas</th><th></th></tr>"
         )
-        rows += (
-            f"<tr><td>{rec.get('closed_at')}</td><td>{fmt_money(rec.get('cobrado_hoy_snapshot'))}</td>"
-            f"<td>{fmt_money(rec.get('total_por_cobrar_snapshot'))}</td>"
-            f"<td>{rec.get('n_activos')}</td><td>{rec.get('notas') or '—'}</td><td>{del_form}</td></tr>"
+        sub = "<p>Registros guardados en PostgreSQL al cerrar cuadre.</p>"
+        colspan = 9
+    else:
+        head = (
+            "<tr><th>Fecha</th><th>Cobrado hoy (snap)</th><th>Total por cobrar</th><th>Activos</th><th>Notas</th><th></th></tr>"
         )
+        sub = "<p>Últimos cierres en memoria (modo sin base de datos).</p>"
+        colspan = 6
+        for rec in reversed([r for r in store.closure_history if r.get("organization_id") == oid][-50:]):
+            cid = rec.get("id")
+            del_form = (
+                f'<form method="post" action="{url_for("borrar_cierre", cierre_id=cid)}" style="display:inline" '
+                f'onsubmit="return confirm(\'¿Eliminar este registro?\');"><button type="submit" class="btn btn-secondary">Borrar</button></form>'
+            )
+            rows += (
+                f"<tr><td>{rec.get('closed_at')}</td><td>{fmt_money(rec.get('cobrado_hoy_snapshot'))}</td>"
+                f"<td>{fmt_money(rec.get('total_por_cobrar_snapshot'))}</td>"
+                f"<td>{rec.get('n_activos')}</td><td>{rec.get('notas') or '—'}</td><td>{del_form}</td></tr>"
+            )
     body = (
-        f'<div class="card"><h2>✔️ Cuadres cerrados</h2><p>Últimos cierres semanales guardados en memoria.</p>'
-        f'<div class="table-scroll"><table><tr><th>Fecha</th><th>Cobrado hoy (snap)</th><th>Total por cobrar</th><th>Activos</th><th>Notas</th><th></th></tr>'
-        f"{rows or '<tr><td colspan=6>Sin cierres aún</td></tr>'}</table></div>{nav_subfooter()}</div>"
+        f'<div class="card"><h2>✔️ Cuadres cerrados</h2>{sub}'
+        f'<div class="table-scroll"><table>{head}'
+        f"{rows or f'<tr><td colspan={colspan}>Sin cierres aún</td></tr>'}</table></div>{nav_subfooter()}</div>"
     )
     return page(body)
 
@@ -8765,6 +8858,21 @@ def pagar_prestamo(loan_id):
 def borrar_cierre(cierre_id):
     ensure_org()
     oid = session.get("org_id")
+    u = current_user()
+    if not can_admin_actions(u):
+        flash("Solo administración puede borrar cierres.", "danger")
+        return redirect(url_for("historial_cierres"))
+    if USE_DATABASE:
+        try:
+            from credimapa_pg import delete_cierre_admin
+
+            if delete_cierre_admin(cierre_id, oid):
+                flash("Cierre eliminado.", "success")
+            else:
+                flash("Cierre no encontrado.", "warning")
+        except Exception as e:
+            flash(f"No se pudo eliminar: {e}", "danger")
+        return redirect(url_for("historial_cierres"))
     store.closure_history = [
         c
         for c in store.closure_history

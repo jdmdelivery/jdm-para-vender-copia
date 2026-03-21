@@ -266,11 +266,28 @@ class Cierre(Base):
     cobrado_hoy_snapshot = Column(Numeric(14, 2), default=0)
     total_por_cobrar_snapshot = Column(Numeric(14, 2), default=0)
     n_activos = Column(Integer, default=0)
+    # Cuadre semanal (fechas = calendario negocio RD)
+    fecha_inicio = Column(Date, nullable=True)
+    fecha_fin = Column(Date, nullable=True)
+    capital_cobrado = Column(Numeric(14, 2), nullable=True)
+    interes_cobrado = Column(Numeric(14, 2), nullable=True)
+    gastos_cuadre = Column(Numeric(14, 2), nullable=True)
+    descuentos_cuadre = Column(Numeric(14, 2), nullable=True)
+    ganancia_cuadre = Column(Numeric(14, 2), nullable=True)
+
     __table_args__ = (Index("ix_cierres_admin_id", "admin_id"),)
 
     def to_dict(self):
         d = _to_dict(self)
         d["organization_id"] = d["admin_id"]
+        for alias, col in (
+            ("gastos", "gastos_cuadre"),
+            ("descuentos", "descuentos_cuadre"),
+            ("ganancia", "ganancia_cuadre"),
+        ):
+            v = d.get(col)
+            if v is not None:
+                d[alias] = float(v)
         return d
 
 
@@ -333,6 +350,27 @@ def session_scope():
         raise
     finally:
         s.close()
+
+
+def ensure_cierres_schema() -> None:
+    """Columnas de cuadre en `cierres` (ADD IF NOT EXISTS) para BD existentes."""
+    ddl = [
+        "ALTER TABLE cierres ADD COLUMN IF NOT EXISTS fecha_inicio DATE",
+        "ALTER TABLE cierres ADD COLUMN IF NOT EXISTS fecha_fin DATE",
+        "ALTER TABLE cierres ADD COLUMN IF NOT EXISTS capital_cobrado NUMERIC(14,2)",
+        "ALTER TABLE cierres ADD COLUMN IF NOT EXISTS interes_cobrado NUMERIC(14,2)",
+        "ALTER TABLE cierres ADD COLUMN IF NOT EXISTS gastos_cuadre NUMERIC(14,2)",
+        "ALTER TABLE cierres ADD COLUMN IF NOT EXISTS descuentos_cuadre NUMERIC(14,2)",
+        "ALTER TABLE cierres ADD COLUMN IF NOT EXISTS ganancia_cuadre NUMERIC(14,2)",
+    ]
+    s = get_session()
+    try:
+        for stmt in ddl:
+            s.execute(text(stmt))
+        s.commit()
+    except Exception:
+        s.rollback()
+        raise
 
 
 def init_db(drop_all=False):
@@ -682,6 +720,205 @@ def list_pagos_cierre_semanal(
         q = q.where(Pago.created_by == user_id)
     rows = sess.execute(q.order_by(Pago.id.asc())).scalars().all()
     return [r.to_dict() for r in rows]
+
+
+def sums_pagos_amount_interest_in_range(
+    sess,
+    admin_id: int,
+    d0: date,
+    d1: date,
+    *,
+    restrict: bool = False,
+    user_id: int | None = None,
+) -> tuple[float, float]:
+    """(SUM(amount), SUM(interest)) en pagos; pago_date en [d0,d1], tenant admin_id."""
+    q = select(
+        func.coalesce(func.sum(Pago.amount), 0),
+        func.coalesce(func.sum(Pago.interest), 0),
+    ).where(
+        Pago.admin_id == admin_id,
+        Pago.pago_date >= d0,
+        Pago.pago_date <= d1,
+        or_(Pago.status.is_(None), Pago.status != "ANULADO"),
+    )
+    if restrict and user_id is not None:
+        q = q.where(Pago.created_by == user_id)
+    a, b = sess.execute(q).one()
+    return float(a or 0), float(b or 0)
+
+
+def list_prestamos_start_date_in_range(
+    sess,
+    admin_id: int,
+    d0: date,
+    d1: date,
+    *,
+    restrict: bool = False,
+    user_id: int | None = None,
+) -> list[dict]:
+    q = select(Prestamo).where(
+        Prestamo.admin_id == admin_id,
+        Prestamo.start_date >= d0,
+        Prestamo.start_date <= d1,
+    )
+    if restrict and user_id is not None:
+        q = q.where(Prestamo.created_by == user_id)
+    rows = sess.execute(q.order_by(Prestamo.id.asc())).scalars().all()
+    return [r.to_dict() for r in rows]
+
+
+def sum_prestamos_amount_start_date_in_range(
+    sess,
+    admin_id: int,
+    d0: date,
+    d1: date,
+    *,
+    restrict: bool = False,
+    user_id: int | None = None,
+) -> float:
+    q = select(func.coalesce(func.sum(Prestamo.amount), 0)).where(
+        Prestamo.admin_id == admin_id,
+        Prestamo.start_date >= d0,
+        Prestamo.start_date <= d1,
+    )
+    if restrict and user_id is not None:
+        q = q.where(Prestamo.created_by == user_id)
+    return float(sess.execute(q).scalar() or 0)
+
+
+def compute_cierre_period_data(
+    sess,
+    admin_id: int,
+    d0: date,
+    d1: date,
+    *,
+    restrict: bool = False,
+    user_id: int | None = None,
+) -> dict:
+    """
+    Métricas y listas para /bank/cierre-semanal y cierre de cuadre.
+    - Capital (spec): SUM(pagos.amount); interés: SUM(pagos.interest)
+    - Préstamos: tabla prestamos por start_date en rango
+    - Descuentos / gastos: banco por mov_date (fechas negocio RD)
+    - Gastos: SUM(ABS(amount)); tipos 'gasto' y 'gasto_ruta' (producción)
+    """
+    uid_f = user_id if restrict else None
+    capital_cobrado, interes_cobrado = sums_pagos_amount_interest_in_range(
+        sess, admin_id, d0, d1, restrict=restrict, user_id=user_id
+    )
+    capital_cobrado = round(capital_cobrado, 2)
+    interes_cobrado = round(interes_cobrado, 2)
+
+    payments_week = list_pagos_cierre_semanal(sess, admin_id, d0, d1, restrict=restrict, user_id=user_id)
+    prestamos_periodo = list_prestamos_start_date_in_range(
+        sess, admin_id, d0, d1, restrict=restrict, user_id=user_id
+    )
+    prestado_total = round(sum_prestamos_amount_start_date_in_range(
+        sess, admin_id, d0, d1, restrict=restrict, user_id=user_id
+    ), 2)
+
+    descuentos_total = round(
+        sum_banco_amount_in_range(sess, admin_id, "descuento_inicial", d0, d1, user_id=uid_f),
+        2,
+    )
+    gastos_types = ("gasto", "gasto_ruta")
+    gastos_total = round(
+        sum_banco_abs_amount_in_range(sess, admin_id, list(gastos_types), d0, d1, user_id=uid_f),
+        2,
+    )
+    ganancia = round(interes_cobrado + descuentos_total - gastos_total, 2)
+
+    descuentos = list_banco_cierre_by_type(
+        sess, admin_id, "descuento_inicial", d0, d1, user_id=uid_f
+    )
+    gastos = list_banco_cierre_gastos(
+        sess, admin_id, d0, d1, user_id=uid_f, movement_types=gastos_types
+    )
+
+    return {
+        "payments_week": payments_week,
+        "prestamos_periodo": prestamos_periodo,
+        "prestado_total": prestado_total,
+        "descuentos": descuentos,
+        "gastos": gastos,
+        "capital_cobrado": capital_cobrado,
+        "interes_cobrado": interes_cobrado,
+        "descuentos_total": descuentos_total,
+        "gastos_total": gastos_total,
+        "ganancia": ganancia,
+    }
+
+
+def execute_cerrar_cuadre(
+    admin_id: int,
+    user_id: int,
+    d0: date,
+    d1: date,
+    notas: str = "",
+) -> None:
+    """
+    Transacción: guarda fila en cierres y vacía operación (pagos, préstamos, clientes, …).
+    NO modifica banco. Incluye tablas hijas (atrasos, descuentos) por integridad FK.
+    """
+    ensure_cierres_schema()
+    s = get_session()
+    try:
+        data = compute_cierre_period_data(s, admin_id, d0, d1, restrict=False, user_id=None)
+        c = Cierre(
+            admin_id=admin_id,
+            user_id=user_id,
+            notas=(notas or "").strip() or None,
+            closed_at=utc_now_for_db(),
+            fecha_inicio=d0,
+            fecha_fin=d1,
+            capital_cobrado=data["capital_cobrado"],
+            interes_cobrado=data["interes_cobrado"],
+            gastos_cuadre=data["gastos_total"],
+            descuentos_cuadre=data["descuentos_total"],
+            ganancia_cuadre=data["ganancia"],
+            cobrado_hoy_snapshot=Decimal("0"),
+            total_por_cobrar_snapshot=Decimal("0"),
+            n_activos=0,
+        )
+        s.add(c)
+        s.flush()
+        s.execute(
+            text(
+                "TRUNCATE TABLE pagos, descuentos, atrasos, prestamos, clientes "
+                "RESTART IDENTITY CASCADE"
+            )
+        )
+        s.commit()
+    except Exception:
+        s.rollback()
+        raise
+
+
+def list_cierres_admin(admin_id: int, limit: int = 50) -> list[dict]:
+    ensure_cierres_schema()
+    s = get_session()
+    rows = (
+        s.execute(
+            select(Cierre)
+            .where(Cierre.admin_id == admin_id)
+            .order_by(Cierre.closed_at.desc())
+            .limit(limit)
+        )
+        .scalars()
+        .all()
+    )
+    return [r.to_dict() for r in rows]
+
+
+def delete_cierre_admin(cierre_id: int, admin_id: int) -> bool:
+    ensure_cierres_schema()
+    s = get_session()
+    row = s.get(Cierre, cierre_id)
+    if row is None or row.admin_id != admin_id:
+        return False
+    s.delete(row)
+    s.commit()
+    return True
 
 
 def list_banco_descuentos_iniciales(
