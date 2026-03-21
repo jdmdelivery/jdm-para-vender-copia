@@ -1,0 +1,12 @@
+# Archivos locales / entorno
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Bases SQLite locales (no confundir con el paquete appdb)
+*.db
+*.sqlite3
+
+# El código de PostgreSQL vive en appdb/ — no usar carpeta llamada "db" sola

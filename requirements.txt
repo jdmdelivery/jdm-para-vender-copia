@@ -1,10 +1,6 @@
-flask
-gunicorn
-requests
-pandas
-beautifulsoup4
-apscheduler
-lxml
-numpy
-python-dateutil
-pytz
+# Solo lo que usa app.py en producción (Render free tier: evita pandas/numpy salvo que los necesites).
+flask>=3.0,<4
+werkzeug>=3.0,<4
+gunicorn>=22,<26
+sqlalchemy>=2.0,<3
+psycopg2-binary>=2.9

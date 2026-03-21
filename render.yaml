@@ -1,18 +1,20 @@
-# Render Blueprint - Banca la que nunca falla
-# https://render.com/docs/blueprint-spec
-
 services:
   - type: web
-    name: banca-la-que-nunca-falla
+    name: jdm-cash
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: >
-      gunicorn app:app
-      --bind 0.0.0.0:${PORT:-10000}
-      --workers 1
-      --timeout 120
-      --capture-output
-      --log-level info
-      --access-logfile -
-      --error-logfile -
-    healthCheckPath: /health
+    startCommand: gunicorn app:app
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: jdm-db
+          property: connectionString
+      - key: SECRET_KEY
+        generateValue: true
+      - key: PYTHON_VERSION
+        value: "3.11.0"
+
+databases:
+  - name: jdm-db
+    databaseName: jdm_cash
+    user: jdm_user
