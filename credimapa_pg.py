@@ -6,14 +6,15 @@ from __future__ import annotations
 
 import os
 from contextlib import contextmanager
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from decimal import Decimal
 
 from flask import session as flask_session
 from sqlalchemy import (
     Column, Integer, String, Text, Numeric, Boolean, Date, DateTime,
-    ForeignKey, Index, create_engine, select, func, and_,
+    ForeignKey, Index, create_engine, select, func, and_, text,
 )
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import declarative_base, sessionmaker, scoped_session
 
 # ---------------------------------------------------------------------------
@@ -331,7 +332,105 @@ def init_db(drop_all=False):
     Base.metadata.create_all(bind=engine)
 
 
+def _sync_pg_id_sequences(connection) -> None:
+    """Tras INSERT con id fijo, alinea serial de PostgreSQL para próximos autoincrement."""
+    connection.execute(
+        text(
+            "SELECT setval(pg_get_serial_sequence('usuarios', 'id'), "
+            "COALESCE((SELECT MAX(id) FROM usuarios), 1))"
+        )
+    )
+    connection.execute(
+        text(
+            "SELECT setval(pg_get_serial_sequence('admins', 'id'), "
+            "COALESCE((SELECT MAX(id) FROM admins), 1))"
+        )
+    )
+
+
+def _seed_defaults_if_empty() -> None:
+    """
+    Si la BD está vacía (p. ej. Postgres nuevo en Render), crea super_admin y tenant admin.
+    Misma lógica que init_db.py — no hace falta ejecutar el script a mano.
+    """
+    from werkzeug.security import generate_password_hash
+
+    super_user = os.getenv("SUPER_ADMIN_USERNAME", "super_admin")
+    super_pass = os.getenv("SUPER_ADMIN_PASSWORD", "super_admin")
+    tenant_days = int(os.getenv("DEFAULT_TENANT_SUBSCRIPTION_DAYS", "30"))
+    starting_bank = float(os.getenv("STARTING_BANK", "0") or 0)
+
+    try:
+        with session_scope() as session:
+            n = session.scalar(select(func.count()).select_from(Usuario))
+            if n:
+                return
+
+            created = datetime.utcnow()
+            sub_end = created + timedelta(days=tenant_days)
+            sub_end_d = sub_end.date()
+
+            session.add(
+                Usuario(
+                    id=1,
+                    admin_id=None,
+                    username=super_user,
+                    password_hash=generate_password_hash(super_pass),
+                    role="super_admin",
+                    phone="",
+                    account_status="activo",
+                    fecha_inicio=created.date(),
+                    fecha_fin=sub_end_d,
+                    subscription_end=sub_end_d,
+                    created_at=created,
+                )
+            )
+            session.flush()
+
+            session.add(
+                Admin(
+                    id=2,
+                    account_status="activo",
+                    fecha_inicio=created,
+                    fecha_fin=sub_end,
+                    subscription_end=sub_end,
+                    starting_bank=starting_bank,
+                    is_default=True,
+                    created_at=created,
+                )
+            )
+            session.flush()
+
+            session.add(
+                Usuario(
+                    id=2,
+                    admin_id=2,
+                    username="admin",
+                    password_hash=generate_password_hash("admin"),
+                    role="admin",
+                    phone="",
+                    account_status="activo",
+                    fecha_inicio=created.date(),
+                    fecha_fin=sub_end_d,
+                    subscription_end=sub_end_d,
+                    created_at=created,
+                )
+            )
+            session.flush()
+
+            _sync_pg_id_sequences(session.connection())
+    except IntegrityError:
+        # Otro worker de Gunicorn sembró al mismo tiempo
+        pass
+
+
 def init_app(app):
+    init_db()
+    try:
+        _seed_defaults_if_empty()
+    except Exception as e:
+        app.logger.warning("PostgreSQL bootstrap: %s", e)
+
     @app.teardown_appcontext
     def shutdown_session(exception=None):
         try:
