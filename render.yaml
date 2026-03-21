@@ -3,7 +3,8 @@ services:
     name: jdm-cash
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app
+    # Render inyecta PORT; hay que enlazar 0.0.0.0 o el healthcheck falla y mata el proceso.
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --timeout 120 --graceful-timeout 60 --access-logfile - --error-logfile -
     envVars:
       - key: DATABASE_URL
         fromDatabase:
