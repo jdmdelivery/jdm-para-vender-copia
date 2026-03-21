@@ -25,7 +25,7 @@ from flask import (
     Response,
 )
 
-APP_BRAND = "DEMO"
+APP_BRAND = "CREDIMAPA"
 # Service worker mínimo si no hay archivo en static/ (p. ej. deploy sin carpeta static).
 SW_JS_MINIMAL = """/* Minimal service worker */
 self.addEventListener('install', (e) => self.skipWaiting());
@@ -35,9 +35,9 @@ ADMIN_PIN = os.getenv("ADMIN_PIN", "5555")
 CURRENCY = "RD$"
 ADMIN_WHATSAPP = os.getenv("ADMIN_WHATSAPP", "3128565688")
 # Recibo térmico (impresión); sobreescribibles en producción.
-RECEIPT_BUSINESS_NAME = os.getenv("RECEIPT_BUSINESS_NAME", "JDMCASHNOW")
-RECEIPT_SUBTITLE = os.getenv("RECEIPT_SUBTITLE", "LA FACTORIA DEL POZO")
-RECEIPT_COMPANY_TEL = os.getenv("RECEIPT_COMPANY_TEL", "8495788819")
+RECEIPT_BUSINESS_NAME = os.getenv("RECEIPT_BUSINESS_NAME", "CREDIMAPA")
+RECEIPT_SUBTITLE = os.getenv("RECEIPT_SUBTITLE", "Calle central 31, los jardines, 10116")
+RECEIPT_COMPANY_TEL = os.getenv("RECEIPT_COMPANY_TEL", "(829) 924-8121")
 CARTERA_ADMIN_USER_ID = 60
 ORG_ID = 1
 SUPER_ADMIN_USERNAME = os.getenv("SUPER_ADMIN_USERNAME", "super_admin")
@@ -376,7 +376,7 @@ class Store:
             "subscription_end": sub_end,  # compatibilidad
         }
 
-        # ADMÍN TENANT inicial (su propio sistema).
+        # ADMÍN TENANT inicial (de fábrica). Se puede eliminar si existe otro admin activo.
         tenant_admin_id = 2
         self.users[tenant_admin_id] = {
             "id": tenant_admin_id,
@@ -391,6 +391,7 @@ class Store:
             "fecha_inicio": created,
             "fecha_fin": sub_end,
             "subscription_end": sub_end,  # compatibilidad
+            "is_default": True,
         }
         self.starting_banks[tenant_admin_id] = self.starting_bank_default
         self._seq["users"] = tenant_admin_id
@@ -899,6 +900,7 @@ def register_admin():
             "fecha_inicio": created,
             "fecha_fin": sub_end,
             "subscription_end": sub_end,  # compatibilidad
+            "is_default": False,
         }
         store.starting_banks[uid] = store.starting_bank_default
         flash("Registro recibido. Queda pendiente de aprobación por el sistema.", "success")
@@ -955,7 +957,7 @@ def toggle_theme():
 @app.route("/manifest.json")
 def manifest():
     return jsonify({
-        "name": APP_BRAND, "short_name": "DEMO",
+        "name": APP_BRAND, "short_name": "CREDIMAPA",
         "description": "Gestión de préstamos y cobros.",
         "start_url": "/dashboard", "scope": "/", "display": "standalone",
         "theme_color": "#16a34a", "background_color": "#ecfdf3",
@@ -1241,15 +1243,37 @@ body.theme-dark .dash-h2 {{ color: #86efac; }}
 def users():
     ensure_org()
     oid = session.get("org_id")
-    rows = "".join(
-        f"<tr><td>{u['username']}</td><td>{u['role']}</td><td>{u.get('phone') or ''}</td>"
-        f"""<td><form method="post" action="{url_for('delete_user', user_id=u['id'])}" style="display:inline" """
-        f"""onsubmit="return confirm('¿Eliminar usuario?');"><button class="btn btn-secondary" type="submit">Borrar</button></form></td></tr>"""
-        for u in store.users.values()
-        if u.get("organization_id") == oid and u.get("role") != "super_admin"
-    )
+    current_uid = session.get("user_id")
+    current_u = current_user()
+    can_manage = current_u and current_u.get("role") == "admin"
+    n_admins = _count_active_admins_in_org(oid)
+    rows = []
+    for u in store.users.values():
+        if u.get("organization_id") != oid or u.get("role") == "super_admin":
+            continue
+        is_self = u.get("id") == current_uid
+        is_last_admin = u.get("role") == "admin" and n_admins <= 1
+        can_delete = can_manage and not is_self and not is_last_admin
+        badge = " (fábrica)" if u.get("is_default") else ""
+        del_btn = ""
+        if can_delete:
+            del_btn = (
+                f'<form method="post" action="{url_for("delete_user", user_id=u["id"])}" style="display:inline" '
+                f'onsubmit="return confirm(\'¿Eliminar usuario {html.escape(u["username"])}?\');">'
+                f'<button class="btn btn-secondary" type="submit">Borrar</button></form>'
+            )
+        else:
+            if is_last_admin:
+                del_btn = '<span style="opacity:.7;font-size:12px">Requiere otro admin</span>'
+        rows.append(
+            f"<tr><td>{html.escape(u['username'])}{badge}</td><td>{html.escape(u['role'])}</td>"
+            f"<td>{html.escape(u.get('phone') or '')}</td><td>{del_btn}</td></tr>"
+        )
+    rows_html = "".join(rows)
     body = (
-        f'<div class="card"><h2>Usuarios</h2><div class="table-scroll"><table><tr><th>Usuario</th><th>Rol</th><th>Tel</th><th></th></tr>{rows}</table></div>'
+        f'<div class="card"><h2>Usuarios</h2>'
+        f'<p style="opacity:.9;font-size:13px">Puede crear admins y eliminar el de fábrica una vez exista otro admin activo.</p>'
+        f'<div class="table-scroll"><table><tr><th>Usuario</th><th>Rol</th><th>Tel</th><th></th></tr>{rows_html or "<tr><td colspan=4 style=\"text-align:center;opacity:.85\">Sin usuarios</td></tr>"}</table></div>'
         f'<a class="btn btn-primary" href="{url_for("new_user")}">Nuevo usuario</a></div>'
     )
     return page(body)
@@ -1289,17 +1313,16 @@ def new_user():
         if not username or not password:
             flash("Datos incompletos.", "danger")
             return redirect(url_for("new_user"))
-        if role == "admin":
-            flash("No puede crear usuarios con rol 'admin'.", "danger")
-            return redirect(url_for("new_user"))
         if any(u["username"] == username for u in store.users.values()):
             flash("Usuario ya existe.", "danger")
             return redirect(url_for("new_user"))
         org_id = session.get("org_id")
         uid = store.nid("users")
-        status = ACCOUNT_PENDING if role in ("cobrador", "cajero") else ACCOUNT_ACTIVE
+        status = ACCOUNT_ACTIVE if role in ("admin", "supervisor") else (
+            ACCOUNT_PENDING if role in ("cobrador", "cajero") else ACCOUNT_ACTIVE
+        )
 
-        # Fechas de acceso (solo cobradores/cajeros). Se guardan incluso si queda pendiente.
+        # Fechas de acceso (solo cobradores/cajeros). Admins/supervisores no las requieren.
         fecha_inicio = None
         fecha_fin = None
         if role in ("cobrador", "cajero"):
@@ -1330,6 +1353,7 @@ def new_user():
             "account_status": status,
             "fecha_inicio": fecha_inicio,
             "fecha_fin": fecha_fin,
+            "is_default": False,
         }
         flash("Usuario creado.", "success")
         return redirect(url_for("users"))
@@ -1338,7 +1362,12 @@ def new_user():
         f'<label>Usuario</label><input name="username" required>'
         f'<label>Contraseña</label><input type="password" name="password" required>'
         f'<label>Teléfono</label><input name="phone">'
-        f'<label>Rol</label><select name="role"><option value="cobrador">Cobrador (queda pendiente)</option><option value="cajero">Cajero (queda pendiente)</option><option value="supervisor">Supervisor</option></select>'
+        f'<label>Rol</label><select name="role">'
+        f'<option value="admin">Admin</option>'
+        f'<option value="supervisor">Supervisor</option>'
+        f'<option value="cobrador">Cobrador (queda pendiente)</option>'
+        f'<option value="cajero">Cajero (queda pendiente)</option>'
+        f'</select>'
         f'<label>Fecha inicio (cobradores/cajeros)</label><input name="fecha_inicio" type="date" value="{date.today().strftime("%Y-%m-%d")}">'
         f'<label>Fecha fin (cobradores/cajeros)</label><input name="fecha_fin" type="date" value="{(date.today()+timedelta(days=30)).strftime("%Y-%m-%d")}">'
         f'<label>PIN admin</label><input name="pin" required>'
@@ -1347,19 +1376,48 @@ def new_user():
     return page(body)
 
 
+def _count_active_admins_in_org(oid):
+    """Cuenta admins activos en la org (rol admin). Siempre debe haber al menos 1."""
+    return sum(
+        1 for u in store.users.values()
+        if u.get("organization_id") == oid
+        and u.get("role") == "admin"
+        and u.get("account_status", ACCOUNT_ACTIVE) == ACCOUNT_ACTIVE
+    )
+
+
 @app.route("/users/<int:user_id>/delete", methods=["POST"])
 @login_required
 @admin_required
 def delete_user(user_id):
-    if user_id == session.get("user_id"):
-        flash("No puede borrarse a sí mismo.", "danger")
-        return redirect(url_for("users"))
     ensure_org()
     oid = session.get("org_id")
     u = store.users.get(user_id)
     if not u or u.get("organization_id") != oid:
         flash("Sin acceso para eliminar ese usuario.", "danger")
         return redirect(url_for("users"))
+    if u.get("role") == "super_admin":
+        flash("No se puede eliminar al super administrador.", "danger")
+        return redirect(url_for("users"))
+    if user_id == session.get("user_id"):
+        flash("No puede borrarse a sí mismo.", "danger")
+        return redirect(url_for("users"))
+    # Solo admin puede eliminar admin; validar que no quede el sistema sin admin.
+    if u.get("role") == "admin":
+        n_admins = _count_active_admins_in_org(oid)
+        if n_admins <= 1:
+            flash("No se puede eliminar el único admin. Cree otro admin primero.", "danger")
+            return redirect(url_for("users"))
+    try:
+        current_u = current_user()
+        log_action(
+            current_u.get("id"),
+            "eliminar usuario",
+            module="usuarios",
+            detail=f"{u.get('username')} (rol: {u.get('role')})",
+        )
+    except Exception:
+        pass
     store.users.pop(user_id, None)
     flash("Usuario eliminado.", "success")
     return redirect(url_for("users"))
@@ -2273,7 +2331,8 @@ def new_loan():
             monto_entregado = 0.0
 
         total_interest = round((amount * rate / 100) * term_count, 2)
-        total_to_pay = round(monto_entregado + total_interest, 2)
+        # Total a pagar = capital aprobado + interés (el descuento NO reduce lo que debe el cliente)
+        total_to_pay = round(amount + total_interest, 2)
         installment_amount = round(total_to_pay / max(term_count, 1), 2)
 
         discount_cash_id = None
@@ -2323,8 +2382,8 @@ def new_loan():
             "start_date": start_date,
             "next_payment_date": next_payment_date,
             "created_by": user["id"],
-            "remaining": monto_entregado,  # capital pendiente (neto entregado)
-            "remaining_capital": monto_entregado,
+            "remaining": amount,  # capital pendiente = capital aprobado (el descuento no lo reduce)
+            "remaining_capital": amount,
             # IDs del libro de movimientos para poder corregir descuento.
             "discount_cash_report_id": discount_cash_id,
             "disbursement_cash_report_id": disbursement_cash_id,
@@ -2512,7 +2571,8 @@ def loan_detail(loan_id):
     monto_entregado = round(capital_aprobado - descuento_inicial, 2)
     rate = float(L.get("rate") or 0)
     interes_total = round(float(L.get("total_interest") or 0), 2)
-    total_a_pagar = round(float(L.get("total_to_pay") or (capital_aprobado + interes_total)), 2)
+    # Siempre: total = capital aprobado + interés (el descuento no reduce lo que debe)
+    total_a_pagar = round(capital_aprobado + interes_total, 2)
 
     # Cuotas estimadas
     term_count = int(L.get("term_count") or 1)
@@ -2814,7 +2874,10 @@ def new_payment(loan_id):
         flash("Préstamo cerrado. No se permite registrar más pagos.", "warning")
         return redirect(url_for("loan_detail", loan_id=loan_id))
 
-    total_to_pay = float(L.get("total_to_pay") or 0)
+    # Total = capital + interés (descuento no lo reduce)
+    capital_prest = float(L.get("amount") or 0)
+    interes_loan = float(L.get("total_interest") or 0)
+    total_to_pay = float(L.get("total_to_pay") or (capital_prest + interes_loan))
     scheduled_payment = float(L.get("installment_amount") or 0)
     if scheduled_payment <= 0 and term_count:
         scheduled_payment = total_to_pay / float(term_count)
@@ -2981,7 +3044,8 @@ def print_payment(payment_id):
 
     capital_prest = float(L.get("amount") or 0)
     interes_total = float(L.get("total_interest") or 0)
-    total_prest = float(L.get("total_to_pay") or (capital_prest + interes_total))
+    # Total = capital + interés (descuento no reduce lo que debe el cliente)
+    total_prest = round(capital_prest + interes_total, 2)
     term_count = int(L.get("term_count") or 1)
     cuota_prog = float(L.get("installment_amount") or 0)
     if cuota_prog <= 0 and total_prest and term_count:
@@ -6154,7 +6218,8 @@ def delete_discount(discount_id):
 
     total_interest = round(float(target.get("total_interest") or 0), 2)
     term_count = int(target.get("term_count") or 1)
-    target["total_to_pay"] = round(new_net_initial + total_interest, 2)
+    # Total a pagar = capital aprobado + interés (el descuento no lo reduce)
+    target["total_to_pay"] = round(amount_total + total_interest, 2)
     target["installment_amount"] = round(target["total_to_pay"] / max(term_count, 1), 2)
 
     target["discount_cash_report_id"] = None
@@ -6250,14 +6315,18 @@ def edit_discount(discount_id):
         store.cash_reports.pop(old_disbursement_id, None)
 
     # Actualizar campos del préstamo.
+    # Capital que debe = amount_total. Solo corregimos remaining cuando delta > 0 (quitando descuento).
     delta = new_net_initial - old_net_initial
     target["upfront_percent"] = new_upfront_percent
-    target["remaining_capital"] = new_net_initial
-    target["remaining"] = max(0.0, float(target.get("remaining") or 0) + delta)
+    if delta > 0:
+        target["remaining"] = max(0.0, float(target.get("remaining") or 0) + delta)
+        if "remaining_capital" in target:
+            target["remaining_capital"] = max(0.0, float(target.get("remaining_capital") or 0) + delta)
 
     total_interest = round(float(target.get("total_interest") or 0), 2)
     term_count = int(target.get("term_count") or 1)
-    target["total_to_pay"] = round(new_net_initial + total_interest, 2)
+    # Total a pagar = capital aprobado + interés (el descuento no lo reduce)
+    target["total_to_pay"] = round(amount_total + total_interest, 2)
     target["installment_amount"] = round(target["total_to_pay"] / max(term_count, 1), 2)
 
     target["discount_cash_report_id"] = None
@@ -8275,5 +8344,5 @@ def historial_depositos():
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
-    print(f"[DEMO — memoria] http://0.0.0.0:{port}")
+    print(f"[CREDIMAPA — memoria] http://0.0.0.0:{port}")
     app.run(host="0.0.0.0", port=port, debug=os.getenv("FLASK_DEBUG", "false").lower() == "true")
