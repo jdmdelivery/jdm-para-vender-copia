@@ -405,9 +405,19 @@ store = Store()
 app = Flask(__name__)
 app.secret_key = os.getenv("SECRET_KEY", secrets.token_hex(16))
 
+# --- Base de datos (Render / producción) ---
+# Misma URL que usaría Flask-SQLAlchemy; el motor real está en credimapa_pg (SQLAlchemy 2).
+# En Render debe existir DATABASE_URL (PostgreSQL). SQLite en el filesystem del contenedor
+# NO persiste entre redeploys/reinicios: no lo uses para datos reales en Render.
+_raw_db_url = os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL") or ""
+SQLALCHEMY_DATABASE_URI = (
+    _raw_db_url.replace("postgres://", "postgresql://", 1) if _raw_db_url else ""
+)
+
 USE_DATABASE = bool(os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL"))
 if USE_DATABASE:
     from credimapa_pg import init_app
+
     init_app(app)
 
 
@@ -509,15 +519,34 @@ def ensure_org():
 
 
 def calc_client_score(client_id, org_id):
-    prestamos_pagados = sum(
-        1 for L in store.loans.values()
-        if L.get("client_id") == client_id and L.get("organization_id") == org_id
-        and str(L.get("status", "")).upper() in ("CERRADO", "PAGADO", "FINALIZADO")
-    )
-    atrasos = sum(
-        1 for A in store.loan_arrears.values()
-        if not A.get("paid") and store.loans.get(A.get("loan_id"), {}).get("client_id") == client_id
-    )
+    if USE_DATABASE:
+        from credimapa_pg import get_loans, get_loan_arrears
+
+        loans = list(get_loans([org_id]).values())
+        prestamos_pagados = sum(
+            1
+            for L in loans
+            if L.get("client_id") == client_id
+            and str(L.get("status", "")).upper() in ("CERRADO", "PAGADO", "FINALIZADO")
+        )
+        arr = get_loan_arrears(org_id) or {}
+        by_loan = {L["id"]: L for L in loans}
+        atrasos = sum(
+            1
+            for A in arr.values()
+            if not A.get("paid")
+            and by_loan.get(A.get("loan_id"), {}).get("client_id") == client_id
+        )
+    else:
+        prestamos_pagados = sum(
+            1 for L in store.loans.values()
+            if L.get("client_id") == client_id and L.get("organization_id") == org_id
+            and str(L.get("status", "")).upper() in ("CERRADO", "PAGADO", "FINALIZADO")
+        )
+        atrasos = sum(
+            1 for A in store.loan_arrears.values()
+            if not A.get("paid") and store.loans.get(A.get("loan_id"), {}).get("client_id") == client_id
+        )
     base = 55
     score = base + min(prestamos_pagados, 8) * 8 - min(atrasos, 10) * 12
     score = max(0, min(100, int(score)))
@@ -570,12 +599,31 @@ def loans_for_user(org_id, user):
 def clients_for_user(org_id, user):
     if USE_DATABASE:
         from credimapa_pg import get_clients
+        # Equivalente a Cliente.query.filter_by(admin_id=org_id).all() → dicts para las plantillas HTML.
         rows = list(get_clients([org_id]).values())
     else:
         rows = [c for c in store.clients.values() if c.get("organization_id") == org_id]
     if is_cajero_role(user) and not is_cartera_admin(user):
         rows = [c for c in rows if c.get("created_by") == user["id"]]
     return rows
+
+
+def client_dict_by_id(client_id, org_id=None):
+    """Cliente como dict (store en memoria o fila PostgreSQL)."""
+    oid = org_id if org_id is not None else session.get("org_id")
+    if USE_DATABASE:
+        from credimapa_pg import get_client as _db_get_client
+
+        c = _db_get_client(client_id)
+        if not c or c.get("organization_id") != oid:
+            return None
+        return c
+    c = store.clients.get(client_id)
+    if not c:
+        return None
+    if oid is not None and c.get("organization_id") != oid:
+        return None
+    return c
 
 
 def user_is_cobrador_limited(user):
@@ -1353,13 +1401,11 @@ def users():
     can_manage = current_u and current_u.get("role") == "admin"
     n_admins = _count_active_admins_in_org(oid)
     rows = []
-    for u in store.users.values():
-        if u.get("organization_id") != oid or u.get("role") == "super_admin":
-            continue
+    for u in _org_users_list(oid):
         is_self = u.get("id") == current_uid
         is_last_admin = u.get("role") == "admin" and n_admins <= 1
         can_delete = can_manage and not is_self and not is_last_admin
-        badge = " (fábrica)" if u.get("is_default") else ""
+        badge = " (fábrica)" if _is_factory_admin_user(u) else ""
         del_btn = ""
         if can_delete:
             del_btn = (
@@ -1419,14 +1465,20 @@ def new_user():
         if not username or not password:
             flash("Datos incompletos.", "danger")
             return redirect(url_for("new_user"))
-        if role == "admin" and user.get("role") != "super_admin":
-            flash("Solo el Super Admin puede crear administradores. Solicite permiso.", "danger")
-            return redirect(url_for("new_user"))
-        if any(u["username"] == username for u in store.users.values()):
-            flash("Usuario ya existe.", "danger")
+        # Crear otro admin: autorizado con PIN admin (ya validado arriba), no hace falta ser super_admin.
+        if role == "admin" and user.get("role") not in ("admin", "super_admin"):
+            flash("Solo un administrador de la empresa puede crear otro admin.", "danger")
             return redirect(url_for("new_user"))
         org_id = session.get("org_id")
-        uid = store.nid("users")
+        if USE_DATABASE:
+            from credimapa_pg import username_exists, create_tenant_usuario
+
+            if username_exists(username):
+                flash("Usuario ya existe.", "danger")
+                return redirect(url_for("new_user"))
+        elif any(u["username"] == username for u in store.users.values()):
+            flash("Usuario ya existe.", "danger")
+            return redirect(url_for("new_user"))
         status = ACCOUNT_ACTIVE if role in ("admin", "supervisor") else (
             ACCOUNT_PENDING if role in ("cobrador", "cajero") else ACCOUNT_ACTIVE
         )
@@ -1452,18 +1504,33 @@ def new_user():
                 flash("La fecha fin no puede ser menor que la fecha inicio.", "danger")
                 return redirect(url_for("new_user"))
 
-        store.users[uid] = {
-            "id": uid, "username": username, "password_hash": generate_password_hash(password),
-            "role": role,
-            "phone": phone,
-            "organization_id": org_id,
-            "created_at": datetime.utcnow(),
-            "name": None,
-            "account_status": status,
-            "fecha_inicio": fecha_inicio,
-            "fecha_fin": fecha_fin,
-            "is_default": False,
-        }
+        if USE_DATABASE:
+            uid = create_tenant_usuario(
+                admin_id=org_id,
+                username=username,
+                password_hash=generate_password_hash(password),
+                role=role,
+                phone=phone,
+                account_status=status,
+                fecha_inicio=fecha_inicio,
+                fecha_fin=fecha_fin,
+            )
+        else:
+            uid = store.nid("users")
+            store.users[uid] = {
+                "id": uid,
+                "username": username,
+                "password_hash": generate_password_hash(password),
+                "role": role,
+                "phone": phone,
+                "organization_id": org_id,
+                "created_at": datetime.utcnow(),
+                "name": None,
+                "account_status": status,
+                "fecha_inicio": fecha_inicio,
+                "fecha_fin": fecha_fin,
+                "is_default": False,
+            }
         flash("Usuario creado.", "success")
         return redirect(url_for("users"))
     role_opts = ""
@@ -1476,11 +1543,19 @@ def new_user():
         )
     else:
         role_opts = (
+            f'<option value="admin">Admin (requiere PIN admin)</option>'
             f'<option value="supervisor">Supervisor</option>'
             f'<option value="cobrador">Cobrador (queda pendiente)</option>'
             f'<option value="cajero">Cajero (queda pendiente)</option>'
         )
-    hint = "" if user.get("role") == "super_admin" else '<p style="opacity:.88;font-size:13px;margin-bottom:12px">Para crear un Admin, solicite permiso al Super Admin.</p>'
+    hint = ""
+    if user.get("role") != "super_admin":
+        hint = (
+            '<p style="opacity:.88;font-size:13px;margin-bottom:12px">'
+            "Para crear un <b>Admin</b> adicional, elija ese rol e ingrese el <b>PIN admin</b> correcto. "
+            "Cuando haya más de un admin activo, podrá borrar el de fábrica (<code>admin</code>) desde la lista."
+            "</p>"
+        )
     body = (
         f'<div class="card"><h2>Nuevo usuario</h2>'
         f'{hint}'
@@ -1497,14 +1572,34 @@ def new_user():
     return page(body)
 
 
+def _org_users_list(oid):
+    """Usuarios del tenant (PostgreSQL o memoria), sin super_admin."""
+    if USE_DATABASE:
+        from credimapa_pg import list_tenant_usuarios
+
+        return list_tenant_usuarios(oid)
+    return [
+        u
+        for u in store.users.values()
+        if u.get("organization_id") == oid and u.get("role") != "super_admin"
+    ]
+
+
 def _count_active_admins_in_org(oid):
     """Cuenta admins activos en la org (rol admin). Siempre debe haber al menos 1."""
     return sum(
-        1 for u in store.users.values()
-        if u.get("organization_id") == oid
-        and u.get("role") == "admin"
+        1
+        for u in _org_users_list(oid)
+        if u.get("role") == "admin"
         and u.get("account_status", ACCOUNT_ACTIVE) == ACCOUNT_ACTIVE
     )
+
+
+def _is_factory_admin_user(u):
+    """Admin sembrado por defecto (badge «fábrica»)."""
+    if u.get("is_default"):
+        return True
+    return u.get("id") == 2 and (u.get("username") or "").strip().lower() == "admin"
 
 
 @app.route("/users/<int:user_id>/delete", methods=["POST"])
@@ -1513,10 +1608,18 @@ def _count_active_admins_in_org(oid):
 def delete_user(user_id):
     ensure_org()
     oid = session.get("org_id")
-    u = store.users.get(user_id)
-    if not u or u.get("organization_id") != oid:
-        flash("Sin acceso para eliminar ese usuario.", "danger")
-        return redirect(url_for("users"))
+    if USE_DATABASE:
+        from credimapa_pg import get_user as _db_gu
+
+        u = _db_gu(user_id)
+        if not u or u.get("organization_id") != oid:
+            flash("Sin acceso para eliminar ese usuario.", "danger")
+            return redirect(url_for("users"))
+    else:
+        u = store.users.get(user_id)
+        if not u or u.get("organization_id") != oid:
+            flash("Sin acceso para eliminar ese usuario.", "danger")
+            return redirect(url_for("users"))
     if u.get("role") == "super_admin":
         flash("No se puede eliminar al super administrador.", "danger")
         return redirect(url_for("users"))
@@ -1539,7 +1642,14 @@ def delete_user(user_id):
         )
     except Exception:
         pass
-    store.users.pop(user_id, None)
+    if USE_DATABASE:
+        from credimapa_pg import delete_tenant_usuario
+
+        if not delete_tenant_usuario(user_id, oid):
+            flash("No se pudo eliminar el usuario en la base de datos.", "danger")
+            return redirect(url_for("users"))
+    else:
+        store.users.pop(user_id, None)
     flash("Usuario eliminado.", "success")
     return redirect(url_for("users"))
 
@@ -1615,6 +1725,13 @@ def clients():
     user = current_user()
     org_id = session.get("org_id")
     rows = clients_for_user(org_id, user)
+    if os.getenv("DEBUG_CLIENTS"):
+        app.logger.info(
+            "clients() org_id=%s count=%s ids=%s",
+            org_id,
+            len(rows),
+            [c.get("id") for c in rows],
+        )
     t = "".join(
         f"<tr><td>{c['first_name']} {c.get('last_name') or ''}</td><td>{c.get('phone') or ''}</td>"
         f"<td><a class='btn btn-secondary' href='{url_for('client_detail', client_id=c['id'])}'>Ver</a></td></tr>"
@@ -1644,22 +1761,58 @@ def new_client():
         if not first:
             flash("Nombre obligatorio.", "danger")
             return redirect(url_for("new_client"))
-        cid = store.nid("clients")
         route = (request.form.get("route") or "").strip()
-        store.clients[cid] = {
-            "id": cid,
-            "first_name": first,
-            "last_name": (request.form.get("last_name") or "").strip(),
-            "document_id": (request.form.get("document_id") or "").strip(),
-            "phone": (request.form.get("phone") or "").strip(),
-            "address": (request.form.get("address") or "").strip(),
-            "route": (request.form.get("route") or "").strip(),
-            "created_by": user["id"],
-            "organization_id": session.get("org_id"),
-            "created_at": datetime.utcnow(),
-        }
+        oid = session.get("org_id")
+        last = (request.form.get("last_name") or "").strip()
+        if USE_DATABASE:
+            from credimapa_pg import create_client as _db_create_client, get_clients
+
+            try:
+                new_id = _db_create_client(
+                    admin_id=oid,
+                    created_by=user["id"],
+                    first_name=first,
+                    last_name=last,
+                    document_id=(request.form.get("document_id") or "").strip(),
+                    phone=(request.form.get("phone") or "").strip(),
+                    address=(request.form.get("address") or "").strip(),
+                    route=route,
+                )
+                if os.getenv("DEBUG_CLIENTS"):
+                    snap = list(get_clients([oid]).values())
+                    app.logger.info(
+                        "new_client DB committed id=%s org=%s total_in_org=%s snapshot=%s",
+                        new_id,
+                        oid,
+                        len(snap),
+                        [(x.get("id"), x.get("first_name")) for x in snap],
+                    )
+            except Exception:
+                app.logger.exception("new_client PostgreSQL")
+                flash("Error al guardar el cliente en la base de datos.", "danger")
+                return redirect(url_for("new_client"))
+        else:
+            cid = store.nid("clients")
+            store.clients[cid] = {
+                "id": cid,
+                "first_name": first,
+                "last_name": last,
+                "document_id": (request.form.get("document_id") or "").strip(),
+                "phone": (request.form.get("phone") or "").strip(),
+                "address": (request.form.get("address") or "").strip(),
+                "route": route,
+                "created_by": user["id"],
+                "organization_id": oid,
+                "created_at": datetime.utcnow(),
+            }
+            if os.getenv("DEBUG_CLIENTS"):
+                app.logger.info(
+                    "new_client memory id=%s store_clients=%s",
+                    cid,
+                    list(store.clients.keys()),
+                )
         try:
-            full_nm = f"{first} {store.clients[cid].get('last_name') or ''}".strip()
+            full_nm = f"{first} {last}".strip()
             log_action(
                 user["id"],
                 "crear cliente",
@@ -1686,28 +1839,45 @@ def new_client():
 @app.route("/clients/<int:client_id>/edit", methods=["GET", "POST"])
 @login_required
 def edit_client(client_id):
-    c = store.clients.get(client_id)
-    if not c:
-        flash("No encontrado.", "danger")
-        return redirect(url_for("clients"))
     user = current_user()
     ensure_org()
     oid = session.get("org_id")
-    if c.get("organization_id") != oid:
-        flash("Sin acceso.", "danger")
+    c = client_dict_by_id(client_id, oid)
+    if not c:
+        flash("No encontrado.", "danger")
         return redirect(url_for("clients"))
     if not can_admin_actions(user):
         flash("Acción restringida: solo admin puede editar clientes.", "danger")
         return redirect(url_for("clients"))
     if request.method == "POST":
-        c["first_name"] = (request.form.get("first_name") or "").strip()
-        c["last_name"] = (request.form.get("last_name") or "").strip()
-        c["phone"] = (request.form.get("phone") or "").strip()
-        c["address"] = (request.form.get("address") or "").strip()
-        c["document_id"] = (request.form.get("document_id") or "").strip()
-        c["route"] = (request.form.get("route") or "").strip()
+        fn = (request.form.get("first_name") or "").strip()
+        if not fn:
+            flash("Nombre obligatorio.", "danger")
+            return redirect(url_for("edit_client", client_id=client_id))
+        if USE_DATABASE:
+            from credimapa_pg import update_client as _db_update_client
+
+            if not _db_update_client(
+                client_id,
+                oid,
+                first_name=fn,
+                last_name=(request.form.get("last_name") or "").strip(),
+                phone=(request.form.get("phone") or "").strip(),
+                address=(request.form.get("address") or "").strip(),
+                document_id=(request.form.get("document_id") or "").strip(),
+                route=(request.form.get("route") or "").strip(),
+            ):
+                flash("No se pudo guardar.", "danger")
+                return redirect(url_for("edit_client", client_id=client_id))
+        else:
+            c["first_name"] = fn
+            c["last_name"] = (request.form.get("last_name") or "").strip()
+            c["phone"] = (request.form.get("phone") or "").strip()
+            c["address"] = (request.form.get("address") or "").strip()
+            c["document_id"] = (request.form.get("document_id") or "").strip()
+            c["route"] = (request.form.get("route") or "").strip()
         try:
-            full_nm = f"{c.get('first_name') or ''} {c.get('last_name') or ''}".strip()
+            full_nm = f"{fn} {(request.form.get('last_name') or '').strip()}".strip()
             log_action(
                 user["id"],
                 "editar cliente",
@@ -1738,17 +1908,27 @@ def edit_client(client_id):
 def delete_client(client_id):
     ensure_org()
     oid = session.get("org_id")
-    c = store.clients.get(client_id)
-    if not c or c.get("organization_id") != oid:
+    c = client_dict_by_id(client_id, oid)
+    if not c:
         flash("Cliente no encontrado.", "danger")
         return redirect(url_for("clients"))
     u = current_user()
 
     # Revertir movimientos financieros de todos los préstamos del cliente.
-    client_loans = [
-        (lid, L) for lid, L in list(store.loans.items())
-        if L.get("organization_id") == oid and L.get("client_id") == client_id
-    ]
+    if USE_DATABASE:
+        from credimapa_pg import get_loans
+
+        loans_map = get_loans([oid])
+        client_loans = [
+            (L["id"], L)
+            for L in loans_map.values()
+            if L.get("organization_id") == oid and L.get("client_id") == client_id
+        ]
+    else:
+        client_loans = [
+            (lid, L) for lid, L in list(store.loans.items())
+            if L.get("organization_id") == oid and L.get("client_id") == client_id
+        ]
     try:
         for lid, L in client_loans:
             _revert_loan_financials(lid, oid, u.get("id"))
@@ -1756,9 +1936,16 @@ def delete_client(client_id):
         flash(str(e), "danger")
         return redirect(url_for("client_detail", client_id=client_id))
 
-    store.clients.pop(client_id, None)
-    for lid, _ in client_loans:
-        store.loans.pop(lid, None)
+    if USE_DATABASE:
+        from credimapa_pg import delete_client_db
+
+        if not delete_client_db(client_id, oid, [lid for lid, _ in client_loans]):
+            flash("No se pudo eliminar el cliente en la base de datos.", "danger")
+            return redirect(url_for("client_detail", client_id=client_id))
+    else:
+        store.clients.pop(client_id, None)
+        for lid, _ in client_loans:
+            store.loans.pop(lid, None)
     try:
         full_nm = f"{c.get('first_name') or ''} {c.get('last_name') or ''}".strip()
         log_action(
@@ -1777,7 +1964,8 @@ def delete_client(client_id):
 @login_required
 def client_detail(client_id):
     ensure_org()
-    c = store.clients.get(client_id)
+    oid = session.get("org_id")
+    c = client_dict_by_id(client_id, oid)
     if not c:
         flash("No encontrado.", "danger")
         return redirect(url_for("clients"))

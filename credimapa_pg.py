@@ -12,7 +12,7 @@ from decimal import Decimal
 from flask import session as flask_session
 from sqlalchemy import (
     Column, Integer, String, Text, Numeric, Boolean, Date, DateTime,
-    ForeignKey, Index, create_engine, select, func, and_, text,
+    ForeignKey, Index, create_engine, select, func, and_, text, update,
 )
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import declarative_base, sessionmaker, scoped_session
@@ -582,8 +582,157 @@ def get_user_by_username(username):
     return get_usuario_by_username(get_session(), username)
 
 
+def list_tenant_usuarios(admin_id: int):
+    """Usuarios del tenant (sin duplicados; no incluye super_admin)."""
+    s = get_session()
+    rows = s.execute(select(Usuario).where(Usuario.admin_id == admin_id)).scalars().all()
+    return [r.to_dict() for r in rows]
+
+
+def username_exists(username: str) -> bool:
+    u = (username or "").strip()
+    if not u:
+        return False
+    return get_usuario_by_username(get_session(), u) is not None
+
+
+def create_tenant_usuario(
+    admin_id: int,
+    username: str,
+    password_hash: str,
+    role: str,
+    phone: str,
+    account_status: str,
+    fecha_inicio=None,
+    fecha_fin=None,
+) -> int:
+    s = get_session()
+    row = Usuario(
+        admin_id=admin_id,
+        username=(username or "").strip(),
+        password_hash=password_hash,
+        role=role,
+        phone=phone or "",
+        account_status=account_status,
+        fecha_inicio=fecha_inicio,
+        fecha_fin=fecha_fin,
+        subscription_end=fecha_fin,
+    )
+    s.add(row)
+    s.flush()
+    new_id = row.id
+    s.commit()
+    return new_id
+
+
+def _clear_usuario_fks(sess, uid: int) -> None:
+    sess.execute(update(Cliente).where(Cliente.created_by == uid).values(created_by=None))
+    sess.execute(update(Prestamo).where(Prestamo.created_by == uid).values(created_by=None))
+    sess.execute(update(Banco).where(Banco.user_id == uid).values(user_id=None))
+    sess.execute(update(Banco).where(Banco.collector_id == uid).values(collector_id=None))
+    sess.execute(update(Pago).where(Pago.created_by == uid).values(created_by=None))
+    sess.execute(update(Gasto).where(Gasto.user_id == uid).values(user_id=None))
+    sess.execute(update(Cierre).where(Cierre.user_id == uid).values(user_id=None))
+    sess.execute(update(Auditoria).where(Auditoria.user_id == uid).values(user_id=None))
+
+
+def delete_tenant_usuario(user_id: int, admin_id: int) -> bool:
+    s = get_session()
+    row = s.get(Usuario, user_id)
+    if not row or row.admin_id != admin_id or row.role == "super_admin":
+        return False
+    _clear_usuario_fks(s, user_id)
+    s.delete(row)
+    s.commit()
+    return True
+
+
 def get_clients(admin_ids=None):
     return get_clientes_dict(get_session(), admin_ids)
+
+
+def get_client(client_id: int):
+    """Un cliente como dict (equiv. a Cliente.query.get(id))."""
+    row = get_session().get(Cliente, client_id)
+    return row.to_dict() if row else None
+
+
+def create_client(
+    admin_id: int,
+    created_by,
+    first_name: str,
+    last_name: str = "",
+    document_id: str = "",
+    phone: str = "",
+    address: str = "",
+    route: str = "",
+) -> int:
+    """
+    Inserta cliente en PostgreSQL (equiv. a db.session.add(cliente); db.session.commit()).
+    """
+    s = get_session()
+    row = Cliente(
+        admin_id=admin_id,
+        first_name=(first_name or "").strip(),
+        last_name=((last_name or "").strip() or None),
+        document_id=((document_id or "").strip() or None),
+        phone=((phone or "").strip() or None),
+        address=((address or "").strip() or None),
+        route=((route or "").strip() or None),
+        created_by=created_by,
+    )
+    s.add(row)
+    s.flush()
+    new_id = row.id
+    s.commit()
+    if os.getenv("DEBUG_CLIENTS"):
+        n = s.scalar(
+            select(func.count()).select_from(Cliente).where(Cliente.admin_id == admin_id)
+        )
+        print(f"[DEBUG_CLIENTS] create_client committed id={new_id} admin_id={admin_id} org_total={n}")
+    return new_id
+
+
+def update_client(
+    client_id: int,
+    admin_id: int,
+    first_name: str,
+    last_name: str = "",
+    phone: str = "",
+    address: str = "",
+    document_id: str = "",
+    route: str = "",
+) -> bool:
+    s = get_session()
+    row = s.get(Cliente, client_id)
+    if not row or row.admin_id != admin_id:
+        return False
+    row.first_name = (first_name or "").strip()
+    row.last_name = ((last_name or "").strip() or None)
+    row.phone = ((phone or "").strip() or None)
+    row.address = ((address or "").strip() or None)
+    row.document_id = ((document_id or "").strip() or None)
+    row.route = ((route or "").strip() or None)
+    s.add(row)
+    s.commit()
+    return True
+
+
+def delete_prestamo_cascade(sess, loan_id: int) -> None:
+    """Elimina préstamo; FK ON DELETE CASCADE limpia pagos, atrasos, descuentos."""
+    sess.execute(Prestamo.__table__.delete().where(Prestamo.id == loan_id))
+
+
+def delete_client_db(client_id: int, admin_id: int, loan_ids: list) -> bool:
+    s = get_session()
+    row = s.get(Cliente, client_id)
+    if not row or row.admin_id != admin_id:
+        return False
+    for lid in loan_ids:
+        delete_prestamo_cascade(s, int(lid))
+    s.delete(row)
+    s.commit()
+    return True
 
 
 def get_loans(admin_ids=None):
