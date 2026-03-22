@@ -787,6 +787,59 @@ def get_top_clientes_by_loans(sess, admin_id: int, limit: int = 5) -> list[dict]
     ]
 
 
+def list_pagos_report_detalle(
+    sess,
+    admin_id: int,
+    d0: date,
+    d1: date,
+    *,
+    cobrador_id: int | None = None,
+    limit: int = 500,
+) -> list[dict]:
+    """Pagos con cliente y cobrador para reporte financiero detallado."""
+    q = (
+        select(
+            Pago.id,
+            Pago.pago_date,
+            Pago.loan_id,
+            Pago.amount,
+            Pago.interest,
+            Pago.capital,
+            Pago.created_by,
+            Cliente.first_name,
+            Cliente.last_name,
+            Usuario.username.label("cobrador_username"),
+        )
+        .select_from(Pago)
+        .join(Prestamo, Pago.loan_id == Prestamo.id)
+        .join(Cliente, Prestamo.client_id == Cliente.id)
+        .outerjoin(Usuario, Pago.created_by == Usuario.id)
+        .where(
+            Pago.admin_id == admin_id,
+            Pago.pago_date >= d0,
+            Pago.pago_date <= d1,
+            or_(Pago.status.is_(None), Pago.status != "ANULADO"),
+        )
+    )
+    if cobrador_id is not None:
+        q = q.where(Pago.created_by == cobrador_id)
+    rows = sess.execute(q.order_by(Pago.pago_date.desc(), Pago.id.desc()).limit(limit)).all()
+    return [
+        {
+            "id": r[0],
+            "pago_date": r[1],
+            "loan_id": r[2],
+            "amount": float(r[3] or 0),
+            "interest": float(r[4] or 0),
+            "capital": float(r[5] or 0),
+            "created_by": r[6],
+            "cliente_nombre": f"{(r[7] or '')} {(r[8] or '')}".strip() or "—",
+            "cobrador": (r[9] or "N/A") if r[9] else "N/A",
+        }
+        for r in rows
+    ]
+
+
 def list_pagos_cierre_semanal(
     sess,
     admin_id: int,

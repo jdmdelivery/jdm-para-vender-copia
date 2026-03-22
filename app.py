@@ -5428,6 +5428,9 @@ def reportes():
 
     hoy_filter = request.args.get("hoy") == "1"
     cobrador_id = request.args.get("cobrador_id", type=int) or request.form.get("cobrador_id", type=int)
+    tipo = (request.args.get("tipo") or request.form.get("tipo") or "total").strip() or "total"
+    if tipo not in ("total", "interes", "capital"):
+        tipo = "total"
 
     if hoy_filter:
         dt_from = today
@@ -5695,6 +5698,66 @@ def reportes():
     ]
     ranking = sorted(report_by_collector, key=lambda x: x["total_cobrado"], reverse=True)
 
+    # Detalle de pagos para reporte financiero (tipo: total, interes, capital)
+    report_rows = []
+    if USE_DATABASE:
+        try:
+            from credimapa_pg import list_pagos_report_detalle, session_scope
+            with session_scope() as sess:
+                pagos_detalle = list_pagos_report_detalle(
+                    sess, oid, dt_from, dt_to, cobrador_id=cobrador_id,
+                )
+            for p in pagos_detalle:
+                if tipo == "interes":
+                    monto = p.get("interest") or 0
+                elif tipo == "capital":
+                    monto = p.get("capital") or 0
+                else:
+                    monto = p.get("amount") or 0
+                report_rows.append({
+                    "fecha": p.get("pago_date"),
+                    "prestamo": f"#{p.get('loan_id')}",
+                    "cliente": p.get("cliente_nombre") or "—",
+                    "cobrador": p.get("cobrador") or "N/A",
+                    "monto": round(float(monto), 2),
+                })
+        except Exception:
+            pass
+    else:
+        loan_ids_tenant = {L.get("id") for L in loans_tenant}
+        clients_by_id = {c.get("id"): c for c in clients_tenant}
+        cobrador_by_id = {u.get("id"): u.get("username") or u.get("name") or "N/A" for u in cobradores_list}
+        for p in store.payments.values():
+            pd = p.get("date") or p.get("pago_date") or p.get("fecha")
+            if pd is None:
+                continue
+            d_val = pd if isinstance(pd, date) else datetime.strptime(str(pd)[:10], "%Y-%m-%d").date()
+            if not (dt_from <= d_val <= dt_to):
+                continue
+            loan_id = p.get("loan_id")
+            if loan_id not in loan_ids_tenant:
+                continue
+            if cobrador_id is not None and p.get("created_by") != cobrador_id:
+                continue
+            L = next((x for x in loans_tenant if x.get("id") == loan_id), {})
+            c = clients_by_id.get(L.get("client_id")) or {}
+            cliente_nombre = f"{(c.get('first_name') or '')} {(c.get('last_name') or '')}".strip() or "—"
+            cobrador_nm = cobrador_by_id.get(p.get("created_by")) or "N/A"
+            if tipo == "interes":
+                monto = float(p.get("interest") or p.get("interes") or 0)
+            elif tipo == "capital":
+                monto = float(p.get("capital") or 0)
+            else:
+                monto = float(p.get("amount") or p.get("monto") or 0)
+            report_rows.append({
+                "fecha": d_val,
+                "prestamo": f"#{loan_id}",
+                "cliente": cliente_nombre,
+                "cobrador": cobrador_nm,
+                "monto": round(monto, 2),
+            })
+        report_rows.sort(key=lambda x: (x.get("fecha") or date.min), reverse=True)
+
     banco_disp = get_bank_available(oid)
 
     # Serie labels (día o mes) dentro del rango
@@ -5940,13 +6003,20 @@ window.addEventListener('load', build);
   .rep-rank-3{color:#b45309}
 </style>
 """
-    _hoy_kw = {"hoy": 1, "cobrador_id": cobrador_id} if cobrador_id else {"hoy": 1}
+    def _rep_kw(extra=None):
+        d = {"tipo": tipo}
+        if cobrador_id:
+            d["cobrador_id"] = cobrador_id
+        if extra:
+            d.update(extra)
+        return d
+    _hoy_kw = _rep_kw({"hoy": 1})
     rep_hoy_url = url_for("reportes", **_hoy_kw)
     week_start = today - timedelta(days=today.weekday())
-    _range_kw = {"desde": week_start.isoformat(), "hasta": today.isoformat(), "cobrador_id": cobrador_id} if cobrador_id else {"desde": week_start.isoformat(), "hasta": today.isoformat()}
+    _range_kw = _rep_kw({"desde": week_start.isoformat(), "hasta": today.isoformat()})
     rep_semana_url = url_for("reportes", **_range_kw)
     month_start = date(today.year, today.month, 1)
-    _mes_kw = {"desde": month_start.isoformat(), "hasta": today.isoformat(), "cobrador_id": cobrador_id} if cobrador_id else {"desde": month_start.isoformat(), "hasta": today.isoformat()}
+    _mes_kw = _rep_kw({"desde": month_start.isoformat(), "hasta": today.isoformat()})
     rep_mes_url = url_for("reportes", **_mes_kw)
 
     cobrador_options = "".join(
@@ -5973,6 +6043,12 @@ window.addEventListener('load', build);
         + "<div class='rep-filter no-print'>"
         + "<form method='get' style='display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end'>"
         + cobrador_select
+        + "<div><label>Tipo reporte</label>"
+        + "<select class='rep-input' name='tipo'>"
+        + f"<option value='total'{' selected' if tipo == 'total' else ''}>Total cobrado</option>"
+        + f"<option value='interes'{' selected' if tipo == 'interes' else ''}>Interés ganado</option>"
+        + f"<option value='capital'{' selected' if tipo == 'capital' else ''}>Capital abonado</option>"
+        + "</select></div>"
         + "<div>"
         + "<label>Desde</label>"
         + f"<input class='rep-input' type='date' name='desde' value='{(dt_from.isoformat() if dt_from else '')}'>"
@@ -6070,6 +6146,23 @@ window.addEventListener('load', build);
         + (f"<tr><td colspan='3' style='opacity:.7'>Sin cobros en el rango</td></tr>" if not ranking else "")
         + "</table></div>"
         + "</div>"
+        + "<div class='rep-table-card' data-rep-anim='1' style='margin-top:14px'>"
+        + "<div class='rep-table-title'>Detalle de pagos — "
+        + ("Total cobrado" if tipo == "total" else "Interés ganado" if tipo == "interes" else "Capital abonado")
+        + "</div>"
+        + "<div class='table-scroll'>"
+        + "<table class='rep-table'><tr><th>Fecha</th><th>Préstamo</th><th>Cliente</th><th>Cobrador</th><th class='num'>Monto</th></tr>"
+        + "".join(
+            f"<tr><td>{(r['fecha'].strftime('%d/%m/%Y') if hasattr(r.get('fecha'), 'strftime') else html.escape(str(r.get('fecha') or '—')))}</td>"
+            f"<td>{html.escape(r.get('prestamo') or '—')}</td>"
+            f"<td>{html.escape(r.get('cliente') or '—')}</td>"
+            f"<td>{html.escape(r.get('cobrador') or 'N/A')}</td>"
+            f"<td class='num'>{fmt_money(r.get('monto') or 0)}</td></tr>"
+            for r in report_rows
+        )
+        + (f"<tr><td colspan='5' style='opacity:.7;text-align:center'>Sin pagos en el rango</td></tr>" if not report_rows else "")
+        + (f"<tr style='font-weight:900;background:rgba(16,185,129,.12)'><td colspan='4'>Total</td><td class='num'>{fmt_money(sum(r.get('monto') or 0 for r in report_rows))}</td></tr>" if report_rows else "")
+        + "</table></div></div>"
         + "<div class='rep-charts' style='margin-top:14px'>"
         + "<div class='rep-chart-card' data-rep-anim='1'>"
         + "<div class='rep-chart-title'>Ingresos vs Gastos (rango)</div>"
