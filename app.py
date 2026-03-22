@@ -5575,51 +5575,54 @@ def reportes():
             else:
                 cur = date(cur.year, cur.month + 1, 1)
 
-    ingresos_by_bucket = {}
-    for cr in store.cash_reports.values():
-        if (
-            cr.get("organization_id") == oid
-            and cr.get("movement_type") == "descuento_inicial"
-            and cr.get("date") is not None
-            and dt_from <= cr.get("date") <= dt_to
-        ):
-            ingresos_by_bucket[bkey(cr.get("date"))] = ingresos_by_bucket.get(bkey(cr.get("date")), 0) + float(
-                cr.get("amount") or 0
-            )
+    if not USE_DATABASE:
+        ingresos_by_bucket = {}
+        for cr in store.cash_reports.values():
+            if (
+                cr.get("organization_id") == oid
+                and cr.get("movement_type") == "descuento_inicial"
+                and cr.get("date") is not None
+                and dt_from <= cr.get("date") <= dt_to
+            ):
+                ingresos_by_bucket[bkey(cr.get("date"))] = ingresos_by_bucket.get(bkey(cr.get("date")), 0) + float(
+                    cr.get("amount") or 0
+                )
 
-    gastos_by_bucket = {}
-    for e in route_expenses:
-        d = e.get("created_at").date()
-        gastos_by_bucket[bkey(d)] = gastos_by_bucket.get(bkey(d), 0) + float(e.get("amount") or 0)
+        gastos_by_bucket = {}
+        for e in route_expenses:
+            d = e.get("created_at")
+            if d:
+                d = d.date() if hasattr(d, "date") else d
+                gastos_by_bucket[bkey(d)] = gastos_by_bucket.get(bkey(d), 0) + float(e.get("amount") or 0)
 
-    # Préstamos entregados vs cobros (pagos) por bucket.
-    prestamos_by_bucket = {}
-    for cr in store.cash_reports.values():
-        if (
-            cr.get("organization_id") == oid
-            and cr.get("movement_type") == "prestamo_entregado"
-            and cr.get("date") is not None
-            and dt_from <= cr.get("date") <= dt_to
-        ):
-            prestamos_by_bucket[bkey(cr.get("date"))] = prestamos_by_bucket.get(bkey(cr.get("date")), 0) + float(
-                cr.get("amount") or 0
-            )
+        prestamos_by_bucket = {}
+        for cr in store.cash_reports.values():
+            if (
+                cr.get("organization_id") == oid
+                and cr.get("movement_type") == "prestamo_entregado"
+                and cr.get("date") is not None
+                and dt_from <= cr.get("date") <= dt_to
+            ):
+                prestamos_by_bucket[bkey(cr.get("date"))] = prestamos_by_bucket.get(bkey(cr.get("date")), 0) + float(
+                    cr.get("amount") or 0
+                )
 
-    # Cobros: pagos de préstamos dentro del rango del tenant.
-    cobros_by_bucket = {}
-    def loan_org_ok(loan_id):
-        L = store.loans.get(loan_id) if loan_id is not None else None
-        return bool(L and L.get("organization_id") == oid)
+        cobros_by_bucket = {}
+        def _loan_org_ok(loan_id):
+            L = store.loans.get(loan_id) if loan_id is not None else None
+            return bool(L and L.get("organization_id") == oid)
 
-    for p in store.payments.values():
-        pd = p.get("date")
-        if pd is None:
-            continue
-        if not (dt_from <= pd <= dt_to):
-            continue
-        if not loan_org_ok(p.get("loan_id")):
-            continue
-        cobros_by_bucket[bkey(pd)] = cobros_by_bucket.get(bkey(pd), 0) + float(p.get("amount") or 0)
+        for p in store.payments.values():
+            pd = p.get("date")
+            if pd is None:
+                continue
+            if not (dt_from <= pd <= dt_to):
+                continue
+            if not _loan_org_ok(p.get("loan_id")):
+                continue
+            if cobrador_id is not None and p.get("created_by") != cobrador_id:
+                continue
+            cobros_by_bucket[bkey(pd)] = cobros_by_bucket.get(bkey(pd), 0) + float(p.get("amount") or 0)
 
     ingresos_series = build_series(ingresos_by_bucket, labels)
     gastos_series = build_series(gastos_by_bucket, labels)
@@ -6250,7 +6253,6 @@ def bank_legal_list():
         firmado = bool(L.get("signature_b64"))
         status_label = "Firmado" if firmado else "Pendiente"
         status_color = "#16a34a" if firmado else "#d97706"
-        nm = f"{client.get('first_name','')} {client.get('last_name') or ''}".strip() or f"Cliente #{client.get('id')}"
         rows.append(
             "<div class='legal-card' style='background:#ffffffb8;border-radius:18px;padding:12px;box-shadow:0 8px 22px rgba(0,0,0,.06);'>"
             f"<div style='display:flex;justify-content:space-between;gap:10px;align-items:flex-start;'>"
