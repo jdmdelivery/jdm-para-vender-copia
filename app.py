@@ -5961,7 +5961,7 @@ window.addEventListener('load', build);
         + "</select></div>"
     ) if cobradores_list else ""
 
-    html = (
+    report_html = (
         dashboard_css
         + "<div class='rep-wrap'>"
         + "<div class='rep-head'>"
@@ -6093,7 +6093,7 @@ window.addEventListener('load', build);
         + nav_subfooter()
         + "</div>"
     )
-    return page(html)
+    return page(report_html)
 
 
 @app.route("/reportes/cobradores", methods=["GET", "POST"])
