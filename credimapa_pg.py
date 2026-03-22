@@ -722,6 +722,31 @@ def list_pagos_cierre_semanal(
     return [r.to_dict() for r in rows]
 
 
+def sums_pagos_report_range(
+    sess,
+    admin_id: int,
+    d0: date,
+    d1: date,
+    *,
+    created_by: int | None = None,
+) -> tuple[float, float, float]:
+    """(SUM(amount), SUM(interest), SUM(capital)) en pagos; pago_date en [d0,d1]."""
+    q = select(
+        func.coalesce(func.sum(Pago.amount), 0),
+        func.coalesce(func.sum(Pago.interest), 0),
+        func.coalesce(func.sum(Pago.capital), 0),
+    ).where(
+        Pago.admin_id == admin_id,
+        Pago.pago_date >= d0,
+        Pago.pago_date <= d1,
+        or_(Pago.status.is_(None), Pago.status != "ANULADO"),
+    )
+    if created_by is not None:
+        q = q.where(Pago.created_by == created_by)
+    row = sess.execute(q).one()
+    return float(row[0] or 0), float(row[1] or 0), float(row[2] or 0)
+
+
 def sums_pagos_amount_interest_in_range(
     sess,
     admin_id: int,
@@ -1231,12 +1256,77 @@ def update_prestamo_simple(loan_id: int, admin_id: int, rate=None, remaining=Non
     return True
 
 
+def update_prestamo_edit(
+    loan_id: int,
+    admin_id: int,
+    *,
+    amount: float | None = None,
+    rate: float | None = None,
+    term_count: int | None = None,
+    installment_amount: float | None = None,
+    start_date: date | None = None,
+    total_interest: float | None = None,
+    total_to_pay: float | None = None,
+    remaining: float | None = None,
+    next_payment_date: date | None = None,
+) -> bool:
+    """Actualiza campos editables del préstamo (monto, tasa, cuotas, fecha inicio, etc.)."""
+    s = get_session()
+    row = s.get(Prestamo, loan_id)
+    if not row or row.admin_id != admin_id:
+        return False
+    if amount is not None:
+        row.amount = amount
+    if rate is not None:
+        row.rate = rate
+    if term_count is not None:
+        row.term_count = term_count
+    if installment_amount is not None:
+        row.installment_amount = installment_amount
+    if start_date is not None:
+        row.start_date = start_date
+    if total_interest is not None:
+        row.total_interest = total_interest
+    if total_to_pay is not None:
+        row.total_to_pay = total_to_pay
+    if remaining is not None:
+        row.remaining = remaining
+        row.remaining_capital = remaining
+    if next_payment_date is not None:
+        row.next_payment_date = next_payment_date
+    s.commit()
+    return True
+
+
 def delete_loan_row(loan_id: int, admin_id: int) -> bool:
     s = get_session()
     row = s.get(Prestamo, loan_id)
     if not row or row.admin_id != admin_id:
         return False
     delete_prestamo_cascade(s, loan_id)
+    s.commit()
+    return True
+
+
+def update_prestamo_legal_docs(
+    loan_id: int,
+    admin_id: int,
+    *,
+    id_photo_b64: str | None = None,
+    id_photo_back_b64: str | None = None,
+    signature_b64: str | None = None,
+) -> bool:
+    """Actualiza campos legales del préstamo (fotos ID, firma)."""
+    s = get_session()
+    row = s.get(Prestamo, loan_id)
+    if not row or row.admin_id != admin_id:
+        return False
+    if id_photo_b64 is not None:
+        row.id_photo_b64 = id_photo_b64
+    if id_photo_back_b64 is not None:
+        row.id_photo_back_b64 = id_photo_back_b64
+    if signature_b64 is not None:
+        row.signature_b64 = signature_b64
     s.commit()
     return True
 

@@ -113,8 +113,11 @@ def freq_interval_days(freq):
     - diario: 1
     - quincenal: 15
     - mensual: 30
+    - custom: 1 (pagos diarios según rango de fechas)
     """
     s = str(freq or "").strip().lower()
+    if "custom" in s:
+        return 1
     if "diar" in s:
         return 1
     if "quinc" in s:
@@ -127,6 +130,8 @@ def freq_interval_days(freq):
 def loan_frequency_label(freq):
     """Etiqueta para listados (ej. Quincenal, Semanal)."""
     s = str(freq or "").strip().lower()
+    if "custom" in s:
+        return "Personalizado"
     if "quinc" in s:
         return "Quincenal"
     if "seman" in s:
@@ -163,8 +168,8 @@ def loans_cobro_sabado_semanal(org_id, user, ref_date=None):
         npd = L.get("next_payment_date")
         if npd and npd <= prox_sab:
             cid = L.get("client_id")
-            c = store.clients.get(cid, {})
-            nm = f"{c.get('first_name','')} {c.get('last_name') or ''}".strip() or f"Cliente #{cid}"
+            c = client_dict_by_id(cid, org_id) or {}
+            nm = f"{c.get('first_name','')} {c.get('last_name') or ''}".strip() or (f"Cliente #{cid}" if cid else "Sin nombre")
             rows.append((npd, L, nm))
     rows.sort(key=lambda x: x[0] or date.max)
     return prox_sab, rows
@@ -2114,7 +2119,7 @@ def client_detail(client_id):
         </div>
         """
     )
-    loans = [L for L in store.loans.values() if L.get("client_id") == client_id]
+    loans = [L for L in loans_for_user(oid, user) if L.get("client_id") == client_id]
 
     def fmt_date(d):
         return d.strftime("%Y-%m-%d") if hasattr(d, "strftime") else str(d)
@@ -2125,10 +2130,8 @@ def client_detail(client_id):
     # Tabla de préstamos (alineada al formato de tu otro sistema).
     loan_rows = []
     for L in sorted(loans, key=lambda x: -x.get("id", 0)):
-        paid_interest = round(
-            sum(float(p.get("interest") or 0) for p in store.payments.values() if p.get("loan_id") == L.get("id")),
-            2,
-        )
+        pays = payments_for_loan(L.get("id"), oid)
+        paid_interest = round(sum(float(p.get("interest") or 0) for p in pays), 2)
         upfront_pct = float(L.get("upfront_percent") or 0.0)
         inicio = fmt_date_ddmmyyyy(L.get("start_date"))
 
@@ -2520,10 +2523,11 @@ def loans():
         )
 
     cards = []
+    can_edit = user.get("role") == "admin" or is_cartera_admin(user)
     for L in sorted(rows, key=lambda x: -x["id"]):
         cid = L.get("client_id")
-        cl = store.clients.get(cid, {})
-        nm_raw = f"{cl.get('first_name','')} {cl.get('last_name') or ''}".strip() or f"Cliente #{cid}"
+        cl = client_dict_by_id(cid, org_id) or {}
+        nm_raw = f"{cl.get('first_name','')} {cl.get('last_name') or ''}".strip() or "Sin nombre"
         nm = html.escape(nm_raw)
         freq = loan_frequency_label(L.get("frequency"))
         term_count = int(L.get("term_count") or 1)
@@ -2535,7 +2539,13 @@ def loans():
         sub = html.escape(f"Préstamo #{L['id']} - {freq}")
         amt = html.escape(fmt_money(L.get("remaining")))
         href = url_for("loan_detail", loan_id=L["id"])
+        edit_href = url_for("edit_loan", loan_id=L["id"])
+        edit_btn = (
+            f'<a class="loan-card-edit" href="{edit_href}" onclick="event.stopPropagation();">Editar</a>'
+            if can_edit else ""
+        )
         cards.append(
+            f'<div class="loan-card-wrap">'
             f'<a class="loan-card-link" href="{href}">'
             f'<div class="loan-card">'
             f'<div class="loan-card-ic" aria-hidden="true">💵</div>'
@@ -2546,6 +2556,8 @@ def loans():
             f"</div>"
             f'<div class="loan-card-amt">{amt}</div>'
             f"</div></a>"
+            f"{edit_btn}"
+            f"</div>"
         )
     cards_html = "".join(cards) if cards else '<p class="loans-empty">No hay préstamos en esta vista.</p>'
 
@@ -2619,7 +2631,15 @@ def loans():
   border-bottom: 2px solid rgba(22,163,74,.2);
 }}
 .loans-summary td {{ padding: 8px 6px; border-bottom: 1px solid rgba(148,163,184,.25); }}
+.loan-card-wrap {{ position: relative; margin-bottom: 12px; }}
 .loan-card-link {{ text-decoration: none !important; color: inherit; display: block; }}
+.loan-card-edit {{
+  position: absolute; top: 10px; right: 10px;
+  font-size: 12px; font-weight: 700; padding: 4px 10px;
+  border-radius: 8px; background: rgba(59,130,246,.15); color: #1d4ed8;
+  text-decoration: none !important; z-index: 2;
+}}
+.loan-card-edit:hover {{ background: rgba(59,130,246,.3); }}
 .loan-card {{
   display: flex;
   align-items: center;
@@ -2691,6 +2711,7 @@ def new_loan():
         upfront_percent = max(0.0, min(float(upfront_percent), 100.0))
         freq = request.form.get("frequency") or "semanal"
         start_str = (request.form.get("start_date") or "").strip()
+        end_str = (request.form.get("end_date") or "").strip()
         term_count = request.form.get("term_count", type=int) or 1
         if not client_id or amount is None or not start_str:
             flash("Complete cliente, monto y fecha.", "danger")
@@ -2707,22 +2728,38 @@ def new_loan():
         if rate < 0:
             flash("La tasa no puede ser negativa.", "danger")
             return redirect(url_for("new_loan"))
-        if term_count < 1:
-            flash("Cuotas inválidas.", "danger")
-            return redirect(url_for("new_loan"))
-        start_date = datetime.strptime(start_str, "%Y-%m-%d").date()
-        interval_days = freq_interval_days(freq)
-        next_payment_date = start_date + timedelta(days=interval_days)
+
+        if str(freq).strip().lower() == "custom":
+            if not end_str:
+                flash("Para frecuencia personalizada indique fecha de fin.", "danger")
+                return redirect(url_for("new_loan"))
+            start_date = datetime.strptime(start_str, "%Y-%m-%d").date()
+            end_date = datetime.strptime(end_str, "%Y-%m-%d").date()
+            days = (end_date - start_date).days
+            if days <= 0:
+                flash("Rango de fechas inválido. La fecha fin debe ser posterior a la fecha inicio.", "danger")
+                return redirect(url_for("new_loan"))
+            term_count = days
+            total_interest = round(amount * (rate / 100), 2)
+            total_to_pay = round(amount + total_interest, 2)
+            installment_amount = round(total_to_pay / days, 2)
+            interval_days = 1
+            next_payment_date = start_date
+        else:
+            if term_count < 1:
+                flash("Cuotas inválidas.", "danger")
+                return redirect(url_for("new_loan"))
+            start_date = datetime.strptime(start_str, "%Y-%m-%d").date()
+            interval_days = freq_interval_days(freq)
+            next_payment_date = start_date + timedelta(days=interval_days)
+            total_interest = round((amount * rate / 100) * term_count, 2)
+            total_to_pay = round(amount + total_interest, 2)
+            installment_amount = round(total_to_pay / max(term_count, 1), 2)
 
         discount_amount = round(amount * upfront_percent / 100.0, 2)
         monto_entregado = round(amount - discount_amount, 2)
         if monto_entregado < 0:
             monto_entregado = 0.0
-
-        total_interest = round((amount * rate / 100) * term_count, 2)
-        # Total a pagar = capital aprobado + interés (el descuento NO reduce lo que debe el cliente)
-        total_to_pay = round(amount + total_interest, 2)
-        installment_amount = round(total_to_pay / max(term_count, 1), 2)
 
         discount_cash_id = None
         disbursement_cash_id = None
@@ -2825,18 +2862,45 @@ def new_loan():
         flash("Préstamo creado.", "success")
         return redirect(url_for("loan_detail", loan_id=lid))
     opts = "".join(f"<option value='{c['id']}'{' selected' if request.args.get('client_id', type=int)==c['id'] else ''}>{c['first_name']}</option>" for c in clist)
+    today_iso = today_rd().isoformat()
     body = (
         f'<div class="card"><h2>Nuevo préstamo</h2>'
         f'<p style="margin-top:6px; opacity:.9;"><b>Banco disponible:</b> {fmt_money(get_bank_available(org_id))}</p>'
-        f'<form method="post">'
+        f'<form method="post" id="newLoanForm">'
         f'<label>Cliente</label><select name="client_id" required>{opts}</select>'
         f'<label>Monto</label><input name="amount" type="number" step="0.01" required>'
         f'<label>Tasa %</label><input name="rate" type="number" step="0.01" value="10">'
         f'<label>Descuento inicial (%)</label><input name="upfront_percent" type="number" step="0.01" value="0" min="0" max="100">'
-        f'<label>Frecuencia</label><select name="frequency"><option>semanal</option><option>diario</option><option>quincenal</option><option>mensual</option></select>'
-        f'<label>Inicio</label><input name="start_date" type="date" value="{today_rd().isoformat()}" required>'
+        f'<label>Frecuencia</label><select name="frequency" id="freqSelect">'
+        f'<option value="semanal">semanal</option><option value="diario">diario</option>'
+        f'<option value="quincenal">quincenal</option><option value="mensual">mensual</option>'
+        f'<option value="custom">Personalizado (por fecha)</option></select>'
+        f'<label>Fecha inicio</label><input name="start_date" type="date" value="{today_iso}" required>'
+        f'<div id="freqStandard">'
         f'<label>Cuotas</label><input name="term_count" type="number" value="10" min="1">'
+        f'</div>'
+        f'<div id="freqCustom" style="display:none">'
+        f'<p style="padding:10px;margin:10px 0;background:rgba(59,130,246,.1);border-radius:10px;font-size:13px;">'
+        f'Este préstamo será calculado según las fechas seleccionadas.</p>'
+        f'<label>Fecha fin</label><input name="end_date" type="date">'
+        f'</div>'
         f'<button class="btn btn-primary" type="submit">Crear</button></form></div>'
+        '<script>'
+        "(function(){"
+        "var sel=document.getElementById('freqSelect');"
+        "var std=document.getElementById('freqStandard');"
+        "var custom=document.getElementById('freqCustom');"
+        "function toggle(){"
+        "var isCustom=sel.value==='custom';"
+        "std.style.display=isCustom?'none':'block';"
+        "custom.style.display=isCustom?'block':'none';"
+        "var endInp=custom.querySelector('input[name=end_date]');"
+        "if(endInp)endInp.required=isCustom;"
+        "}"
+        "sel.addEventListener('change',toggle);"
+        "toggle();"
+        "})();"
+        '</script>'
     )
     return page(body)
 
@@ -2893,49 +2957,146 @@ def edit_loan(loan_id):
     oid = session.get("org_id")
     L = loan_dict_by_id(loan_id, oid)
     if not L:
-        flash("No encontrado.", "danger")
+        flash("Préstamo no encontrado.", "danger")
         return redirect(url_for("loans"))
     user = current_user()
     if user.get("role") != "admin" and not is_cartera_admin(user):
         flash("Solo admin puede editar préstamos.", "danger")
         return redirect(url_for("loan_detail", loan_id=loan_id))
-    if request.method == "POST":
-        new_rate = request.form.get("rate", type=float)
-        new_rem = request.form.get("remaining", type=float)
-        if USE_DATABASE:
-            from credimapa_pg import update_prestamo_simple
 
-            if not update_prestamo_simple(
+    pays = payments_for_loan(loan_id, oid)
+    pagos_cuotas = [p for p in pays if (p.get("type") or "").lower() == "cuota"]
+    has_payments = len(pagos_cuotas) > 0
+    allow_amount_edit = not has_payments
+
+    if request.method == "POST":
+        amount_raw = request.form.get("amount", type=float)
+        rate_raw = request.form.get("rate", type=float)
+        term_count_raw = request.form.get("term_count", type=int)
+        installment_raw = request.form.get("installment_amount", type=float)
+        start_str = (request.form.get("start_date") or "").strip()
+
+        amount = amount_raw if amount_raw is not None else float(L.get("amount") or 0)
+        rate = rate_raw if rate_raw is not None else float(L.get("rate") or 0)
+        term_count = term_count_raw if term_count_raw is not None else int(L.get("term_count") or 1)
+        if not allow_amount_edit:
+            amount = float(L.get("amount") or 0)
+        if amount <= 0:
+            flash("El monto debe ser mayor que 0.", "danger")
+            return redirect(url_for("edit_loan", loan_id=loan_id))
+        if rate < 0:
+            flash("La tasa no puede ser negativa.", "danger")
+            return redirect(url_for("edit_loan", loan_id=loan_id))
+        if term_count < 1:
+            flash("Cuotas inválidas.", "danger")
+            return redirect(url_for("edit_loan", loan_id=loan_id))
+        if not start_str:
+            flash("Fecha de inicio requerida.", "danger")
+            return redirect(url_for("edit_loan", loan_id=loan_id))
+
+        start_date = datetime.strptime(start_str, "%Y-%m-%d").date()
+        freq = L.get("frequency") or "semanal"
+        is_custom = str(freq).strip().lower() == "custom"
+        interval_days = freq_interval_days(freq)
+        if is_custom:
+            total_interest = round(amount * (rate / 100), 2)
+        else:
+            total_interest = round((amount * rate / 100) * term_count, 2)
+        total_to_pay = round(amount + total_interest, 2)
+        installment_amount = round(total_to_pay / max(term_count, 1), 2)
+        if installment_raw is not None and installment_raw > 0:
+            installment_amount = round(installment_raw, 2)
+
+        if has_payments:
+            capital_pagado = sum(float(p.get("capital") or 0) for p in pagos_cuotas)
+            remaining = round(amount - capital_pagado, 2)
+            remaining = max(0.0, remaining)
+            if is_custom:
+                next_payment_date = start_date + timedelta(days=len(pagos_cuotas))
+            else:
+                next_payment_date = start_date + timedelta(days=interval_days * (len(pagos_cuotas) + 1))
+        else:
+            remaining = amount
+            next_payment_date = start_date if is_custom else start_date + timedelta(days=interval_days)
+
+        if USE_DATABASE:
+            from credimapa_pg import update_prestamo_edit
+
+            if not update_prestamo_edit(
                 loan_id,
                 oid,
-                rate=new_rate if new_rate is not None else float(L.get("rate") or 0),
-                remaining=new_rem if new_rem is not None else float(L.get("remaining") or 0),
+                amount=amount,
+                rate=rate,
+                term_count=term_count,
+                installment_amount=installment_amount,
+                start_date=start_date,
+                total_interest=total_interest,
+                total_to_pay=total_to_pay,
+                remaining=remaining,
+                next_payment_date=next_payment_date,
             ):
                 flash("No se pudo guardar.", "danger")
                 return redirect(url_for("edit_loan", loan_id=loan_id))
-            L = loan_dict_by_id(loan_id, oid) or L
         else:
-            L["rate"] = new_rate or L.get("rate")
-            L["remaining"] = new_rem
+            L["amount"] = amount
+            L["rate"] = rate
+            L["term_count"] = term_count
+            L["installment_amount"] = installment_amount
+            L["start_date"] = start_date
+            L["total_interest"] = total_interest
+            L["total_to_pay"] = total_to_pay
+            L["remaining"] = remaining
+            L["remaining_capital"] = remaining
+            L["next_payment_date"] = next_payment_date
+
         try:
-            user = current_user()
-            cl = client_dict_by_id(L.get("client_id"), oid) if L else {}
-            client_nm = f"{cl.get('first_name') or ''} {cl.get('last_name') or ''}".strip() or f"Cliente #{L.get('client_id') if L else '—'}"
+            cl = client_dict_by_id(L.get("client_id"), oid) or {}
+            client_nm = f"{cl.get('first_name') or ''} {cl.get('last_name') or ''}".strip() or f"Cliente #{L.get('client_id') or '—'}"
             log_action(
                 user.get("id"),
                 "editar préstamo",
                 module="préstamos",
-                detail=f"#{loan_id} • saldo {fmt_money(L.get('remaining'))} • cliente {client_nm}",
+                detail=f"#{loan_id} • {fmt_money(amount)} • cliente {client_nm}",
             )
         except Exception:
             pass
-        flash("Actualizado.", "success")
+        flash("Préstamo actualizado correctamente.", "success")
         return redirect(url_for("loan_detail", loan_id=loan_id))
+
+    amount_val = L.get("amount")
+    rate_val = L.get("rate")
+    term_val = L.get("term_count")
+    inst_val = L.get("installment_amount")
+    start_val = L.get("start_date")
+    if hasattr(start_val, "strftime"):
+        start_str_val = start_val.strftime("%Y-%m-%d")
+    else:
+        start_str_val = str(start_val)[:10] if start_val else today_rd().isoformat()
+
+    amount_disabled = ' disabled' if not allow_amount_edit else ''
+    amount_title = ' (bloqueado: ya hay pagos)' if not allow_amount_edit else ''
+    amount_hidden = f'<input type="hidden" name="amount" value="{amount_val}">' if not allow_amount_edit else ''
+    warning_html = (
+        '<div class="alert alert-warning" style="padding:12px;margin-bottom:16px;border-radius:12px;'
+        'background:rgba(245,158,11,.15);border:1px solid rgba(245,158,11,.4);">'
+        '<strong>⚠️ Advertencia:</strong> Editar préstamo puede afectar cálculos existentes. '
+        'El monto no se puede modificar si ya hay pagos registrados.'
+        '</div>'
+    )
     body = (
-        f'<div class="card"><h2>Editar préstamo #{loan_id}</h2><form method="post">'
-        f'<label>Tasa</label><input name="rate" value="{L.get("rate")}" type="number" step="0.01">'
-        f'<label>Saldo</label><input name="remaining" value="{L.get("remaining")}" type="number" step="0.01">'
-        f'<button class="btn btn-primary" type="submit">Guardar</button></form></div>'
+        f'<div class="card"><h2>Editar préstamo #{loan_id}</h2>'
+        f'{warning_html}'
+        f'<form method="post">'
+        f'{amount_hidden}'
+        f'<label>Monto{amount_title}</label>'
+        f'<input name="amount" value="{amount_val}" type="number" step="0.01" required{amount_disabled}>'
+        f'<label>Tasa %</label><input name="rate" value="{rate_val}" type="number" step="0.01" required>'
+        f'<label>Cuotas</label><input name="term_count" value="{term_val}" type="number" min="1" required>'
+        f'<label>Cuota programada</label><input name="installment_amount" value="{inst_val}" type="number" step="0.01">'
+        f'<label>Fecha inicio</label><input name="start_date" type="date" value="{start_str_val}" required>'
+        f'<button class="btn btn-primary" type="submit">Guardar</button>'
+        f'<a class="btn btn-secondary" href="{url_for("loan_detail", loan_id=loan_id)}" style="margin-left:8px;">Cancelar</a>'
+        f'</form></div>'
     )
     return page(body)
 
@@ -3016,7 +3177,9 @@ def loan_detail(loan_id):
 
     # Nombre legible para frecuencia
     freq = str(L.get("frequency") or "").strip().lower()
-    if "quinc" in freq:
+    if "custom" in freq:
+        freq_label = "día (personalizado)"
+    elif "quinc" in freq:
         freq_label = "quincena"
     elif "seman" in freq:
         freq_label = "semana"
@@ -5187,11 +5350,18 @@ def reportes():
         except ValueError:
             return None
 
-    dt_from = parse_date(request.args.get("desde"))
-    dt_to = parse_date(request.args.get("hasta"))
-    if dt_from is None and dt_to is None:
-        dt_from = today - timedelta(days=29)
+    hoy_filter = request.args.get("hoy") == "1"
+    cobrador_id = request.args.get("cobrador_id", type=int) or request.form.get("cobrador_id", type=int)
+
+    if hoy_filter:
+        dt_from = today
         dt_to = today
+    else:
+        dt_from = parse_date(request.args.get("desde"))
+        dt_to = parse_date(request.args.get("hasta"))
+        if dt_from is None and dt_to is None:
+            dt_from = today
+            dt_to = today
 
     # Helpers para bucket por día o mes.
     days_span = (dt_to - dt_from).days if (dt_from and dt_to) else 0
@@ -5209,37 +5379,183 @@ def reportes():
     def build_series(map_amounts, labels):
         return [round(float(map_amounts.get(lb) or 0), 2) for lb in labels]
 
+    # Today summary (Total cobrado, Interés, Capital)
+    total_cobrado_hoy = 0.0
+    total_interes_hoy = 0.0
+    total_capital_hoy = 0.0
+    if USE_DATABASE:
+        from credimapa_pg import sums_pagos_report_range, session_scope
+
+        with session_scope() as sess:
+            total_cobrado_hoy, total_interes_hoy, total_capital_hoy = sums_pagos_report_range(
+                sess, oid, today, today, created_by=cobrador_id
+            )
+        total_cobrado_hoy = round(total_cobrado_hoy, 2)
+        total_interes_hoy = round(total_interes_hoy, 2)
+        total_capital_hoy = round(total_capital_hoy, 2)
+    else:
+        for p in store.payments.values():
+            pd = p.get("date")
+            if pd != today:
+                continue
+            L = store.loans.get(p.get("loan_id")) if p.get("loan_id") else None
+            if not L or L.get("organization_id") != oid:
+                continue
+            if cobrador_id is not None and p.get("created_by") != cobrador_id:
+                continue
+            total_cobrado_hoy += float(p.get("amount") or 0)
+            total_interes_hoy += float(p.get("interest") or 0)
+            total_capital_hoy += float(p.get("capital") or 0)
+        total_cobrado_hoy = round(total_cobrado_hoy, 2)
+        total_interes_hoy = round(total_interes_hoy, 2)
+        total_capital_hoy = round(total_capital_hoy, 2)
+
     # Alcance por tenant (org)
-    loans_tenant = [L for L in store.loans.values() if L.get("organization_id") == oid]
-    clients_tenant = [c for c in store.clients.values() if c.get("organization_id") == oid]
-    total_prestamos = len(loans_tenant)
-    total_clientes = len(clients_tenant)
+    if USE_DATABASE:
+        from credimapa_pg import (
+            get_loans,
+            get_clients,
+            list_pagos_cierre_semanal,
+            list_banco_cierre_by_type,
+            list_banco_cierre_gastos,
+            list_tenant_usuarios,
+            session_scope,
+        )
 
-    # Banco (actual)
+        loans_dict = get_loans([oid])
+        clients_dict = get_clients([oid])
+        loans_tenant = list(loans_dict.values())
+        clients_tenant = list(clients_dict.values())
+        total_prestamos = len(loans_tenant)
+        total_clientes = len(clients_tenant)
+
+        with session_scope() as sess:
+            pagos_list = list_pagos_cierre_semanal(
+                sess, oid, dt_from, dt_to,
+                restrict=(cobrador_id is not None), user_id=cobrador_id,
+            )
+            descuentos_list = list_banco_cierre_by_type(sess, oid, "descuento_inicial", dt_from, dt_to)
+            prestamos_ent_list = list_banco_cierre_by_type(sess, oid, "prestamo_entregado", dt_from, dt_to)
+            gastos_list = list_banco_cierre_gastos(sess, oid, dt_from, dt_to)
+            cobradores_list = list_tenant_usuarios(oid)
+
+        route_expenses = [
+            {**g, "created_at": g.get("created_at"), "amount": g.get("amount")}
+            for g in gastos_list
+        ]
+        gastos_ruta_total = round(sum(float(g.get("amount") or 0) for g in gastos_list), 2)
+        descuento_income_total = round(sum(float(d.get("amount") or 0) for d in descuentos_list), 2)
+
+        ingresos_by_bucket = {}
+        for d in descuentos_list:
+            md = d.get("mov_date") or d.get("date")
+            if md:
+                k = bkey(md) if isinstance(md, date) else bkey(datetime.strptime(str(md)[:10], "%Y-%m-%d").date())
+                ingresos_by_bucket[k] = ingresos_by_bucket.get(k, 0) + float(d.get("amount") or 0)
+
+        gastos_by_bucket = {}
+        for g in gastos_list:
+            md = g.get("mov_date") or g.get("date")
+            if md:
+                d = md if isinstance(md, date) else datetime.strptime(str(md)[:10], "%Y-%m-%d").date()
+                gastos_by_bucket[bkey(d)] = gastos_by_bucket.get(bkey(d), 0) + float(g.get("amount") or 0)
+
+        prestamos_by_bucket = {}
+        for p in prestamos_ent_list:
+            md = p.get("mov_date") or p.get("date")
+            if md:
+                d = md if isinstance(md, date) else datetime.strptime(str(md)[:10], "%Y-%m-%d").date()
+                prestamos_by_bucket[bkey(d)] = prestamos_by_bucket.get(bkey(d), 0) + float(p.get("amount") or 0)
+
+        loan_ids_tenant = {L.get("id") for L in loans_tenant}
+        cobros_by_bucket = {}
+        for p in pagos_list:
+            pd = p.get("pago_date") or p.get("date")
+            if pd is None:
+                continue
+            if p.get("loan_id") not in loan_ids_tenant:
+                continue
+            d = pd if isinstance(pd, date) else datetime.strptime(str(pd)[:10], "%Y-%m-%d").date()
+            cobros_by_bucket[bkey(d)] = cobros_by_bucket.get(bkey(d), 0) + float(p.get("amount") or 0)
+    else:
+        loans_tenant = [L for L in store.loans.values() if L.get("organization_id") == oid]
+        clients_tenant = [c for c in store.clients.values() if c.get("organization_id") == oid]
+        total_prestamos = len(loans_tenant)
+        total_clientes = len(clients_tenant)
+        cobradores_list = [
+            {"id": u.get("id"), "username": u.get("username") or u.get("name")}
+            for u in store.users.values()
+            if u.get("organization_id") == oid and u.get("role") in ("cobrador", "admin", "supervisor")
+        ]
+
+        route_expenses = [
+            e
+            for e in store.route_expenses.values()
+            if e.get("organization_id") == oid
+            and e.get("created_at") is not None
+            and (dt_from <= e.get("created_at").date() <= dt_to)
+        ]
+        gastos_ruta_total = round(sum(float(e.get("amount") or 0) for e in route_expenses), 2)
+
+        descuento_income_total = round(
+            sum(
+                float(cr.get("amount") or 0)
+                for cr in store.cash_reports.values()
+                if cr.get("organization_id") == oid
+                and cr.get("movement_type") == "descuento_inicial"
+                and cr.get("date") is not None
+                and (dt_from <= cr.get("date") <= dt_to)
+            ),
+            2,
+        )
+
+        ingresos_by_bucket = {}
+        for cr in store.cash_reports.values():
+            if (
+                cr.get("organization_id") == oid
+                and cr.get("movement_type") == "descuento_inicial"
+                and cr.get("date") is not None
+                and dt_from <= cr.get("date") <= dt_to
+            ):
+                ingresos_by_bucket[bkey(cr.get("date"))] = ingresos_by_bucket.get(bkey(cr.get("date")), 0) + float(
+                    cr.get("amount") or 0
+                )
+
+        gastos_by_bucket = {}
+        for e in route_expenses:
+            d = e.get("created_at").date()
+            gastos_by_bucket[bkey(d)] = gastos_by_bucket.get(bkey(d), 0) + float(e.get("amount") or 0)
+
+        prestamos_by_bucket = {}
+        for cr in store.cash_reports.values():
+            if (
+                cr.get("organization_id") == oid
+                and cr.get("movement_type") == "prestamo_entregado"
+                and cr.get("date") is not None
+                and dt_from <= cr.get("date") <= dt_to
+            ):
+                prestamos_by_bucket[bkey(cr.get("date"))] = prestamos_by_bucket.get(bkey(cr.get("date")), 0) + float(
+                    cr.get("amount") or 0
+                )
+
+        cobros_by_bucket = {}
+        def loan_org_ok(loan_id):
+            L = store.loans.get(loan_id) if loan_id is not None else None
+            return bool(L and L.get("organization_id") == oid)
+
+        for p in store.payments.values():
+            pd = p.get("date")
+            if pd is None:
+                continue
+            if not (dt_from <= pd <= dt_to):
+                continue
+            if not loan_org_ok(p.get("loan_id")):
+                continue
+            if cobrador_id is not None and p.get("created_by") != cobrador_id:
+                continue
+            cobros_by_bucket[bkey(pd)] = cobros_by_bucket.get(bkey(pd), 0) + float(p.get("amount") or 0)
+
     banco_disp = get_bank_available(oid)
-
-    # Gastos de ruta en rango por fecha
-    route_expenses = [
-        e
-        for e in store.route_expenses.values()
-        if e.get("organization_id") == oid
-        and e.get("created_at") is not None
-        and (dt_from <= e.get("created_at").date() <= dt_to)
-    ]
-    gastos_ruta_total = round(sum(float(e.get("amount") or 0) for e in route_expenses), 2)
-
-    # Descuentos iniciales en rango por fecha
-    descuento_income_total = round(
-        sum(
-            float(cr.get("amount") or 0)
-            for cr in store.cash_reports.values()
-            if cr.get("organization_id") == oid
-            and cr.get("movement_type") == "descuento_inicial"
-            and cr.get("date") is not None
-            and (dt_from <= cr.get("date") <= dt_to)
-        ),
-        2,
-    )
 
     # Serie labels (día o mes) dentro del rango
     labels = []
@@ -5443,7 +5759,27 @@ window.addEventListener('load', build);
   [data-rep-anim].in{opacity:1;transform: translateY(0)}
 </style>
 """
-    # Botones modernos con íconos.
+    _hoy_kw = {"hoy": 1, "cobrador_id": cobrador_id} if cobrador_id else {"hoy": 1}
+    rep_hoy_url = url_for("reportes", **_hoy_kw)
+    week_start = today - timedelta(days=today.weekday())
+    _range_kw = {"desde": week_start.isoformat(), "hasta": today.isoformat(), "cobrador_id": cobrador_id} if cobrador_id else {"desde": week_start.isoformat(), "hasta": today.isoformat()}
+    rep_semana_url = url_for("reportes", **_range_kw)
+    month_start = date(today.year, today.month, 1)
+    _mes_kw = {"desde": month_start.isoformat(), "hasta": today.isoformat(), "cobrador_id": cobrador_id} if cobrador_id else {"desde": month_start.isoformat(), "hasta": today.isoformat()}
+    rep_mes_url = url_for("reportes", **_mes_kw)
+
+    cobrador_options = "".join(
+        "<option value='%s'%s>%s</option>"
+        % (u.get("id"), " selected" if cobrador_id == u.get("id") else "", html.escape(u.get("username") or "Usuario"))
+        for u in cobradores_list
+    )
+    cobrador_select = (
+        "<div><label>Cobrador</label>"
+        + "<select class='rep-input' name='cobrador_id'>"
+        + f"<option value=''>Todos</option>{cobrador_options}"
+        + "</select></div>"
+    ) if cobradores_list else ""
+
     html = (
         dashboard_css
         + "<div class='rep-wrap'>"
@@ -5455,6 +5791,7 @@ window.addEventListener('load', build);
         + "<div class='rep-actions'>"
         + "<div class='rep-filter no-print'>"
         + "<form method='get' style='display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end'>"
+        + cobrador_select
         + "<div>"
         + "<label>Desde</label>"
         + f"<input class='rep-input' type='date' name='desde' value='{(dt_from.isoformat() if dt_from else '')}'>"
@@ -5468,11 +5805,23 @@ window.addEventListener('load', build);
         + "</span>Filtrar</button>"
         + "</form>"
         + "</div>"
+        + "<div class='rep-quick-btns' style='display:flex;gap:6px;flex-wrap:wrap'>"
+        + f"<a class='btn btn-primary btn-action' href='{rep_hoy_url}'>Reporte de hoy</a>"
+        + f"<a class='rep-badge-soft' href='{rep_hoy_url}'>Hoy</a>"
+        + f"<a class='rep-badge-soft' href='{rep_semana_url}'>Esta semana</a>"
+        + f"<a class='rep-badge-soft' href='{rep_mes_url}'>Este mes</a>"
+        + "</div>"
         + f"<a class='btn btn-secondary btn-action' href='{url_for('reportes_cobradores')}'>Por cobrador</a>"
         + f"<a class='btn btn-secondary btn-action' href='{url_for('dashboard')}'>Dashboard</a>"
         + "</div>"
         + "</div>"
         + "<div class='rep-grid'>"
+        + "<div class='rep-card tone-green' data-rep-anim='1'>"
+        + "<div class='rep-card-top'><div><div class='rep-k'>Total cobrado hoy</div><div class='rep-v'>" + fmt_money(total_cobrado_hoy) + "</div></div><div class='rep-ico'>💰</div></div></div>"
+        + "<div class='rep-card tone-blue' data-rep-anim='1'>"
+        + "<div class='rep-card-top'><div><div class='rep-k'>Interés ganado hoy</div><div class='rep-v'>" + fmt_money(total_interes_hoy) + "</div></div><div class='rep-ico'>📈</div></div></div>"
+        + "<div class='rep-card tone-purple' data-rep-anim='1'>"
+        + "<div class='rep-card-top'><div><div class='rep-k'>Capital cobrado hoy</div><div class='rep-v'>" + fmt_money(total_capital_hoy) + "</div></div><div class='rep-ico'>📋</div></div></div>"
         + "<div class='rep-card tone-green' data-rep-anim='1'>"
         + "<div class='rep-card-top'>"
         + "<div>"
@@ -5854,6 +6203,13 @@ def bank_legal():
     return redirect(url_for("bank_legal_list"))
 
 
+@app.route("/bank/legal/<int:prestamo_id>")
+@login_required
+def bank_legal_document(prestamo_id):
+    """Alias para /bank/legal/view/<id> — compatible con enlaces que usan /bank/legal/<id>."""
+    return redirect(url_for("view_legal_document", loan_id=prestamo_id))
+
+
 @app.route("/bank/legal/list")
 @login_required
 def bank_legal_list():
@@ -5871,9 +6227,26 @@ def bank_legal_list():
         pass
     rows = []
 
+    def _client_name(cid):
+        if cid is None:
+            return "—"
+        c = client_dict_by_id(cid, oid)
+        if not c:
+            return f"Cliente #{cid}"
+        return f"{c.get('first_name','')} {c.get('last_name') or ''}".strip() or f"Cliente #{cid}"
+
+    def _cobrador_name(uid):
+        if uid is None:
+            return "—"
+        if USE_DATABASE:
+            from credimapa_pg import get_user
+            u = get_user(uid)
+            return (u.get("name") or u.get("username") or "—") if u else "—"
+        return (store.users.get(uid, {}).get("name") or store.users.get(uid, {}).get("username") or "—")
+
     for L in sorted(loans_for_user(oid, user), key=lambda x: -x.get("id", 0))[:200]:
-        client = store.clients.get(L.get("client_id"), {})
-        cobrador = store.users.get(L.get("created_by"), {}).get("username") or "—"
+        nm = _client_name(L.get("client_id"))
+        cobrador = _cobrador_name(L.get("created_by"))
         firmado = bool(L.get("signature_b64"))
         status_label = "Firmado" if firmado else "Pendiente"
         status_color = "#16a34a" if firmado else "#d97706"
@@ -5881,13 +6254,13 @@ def bank_legal_list():
         rows.append(
             "<div class='legal-card' style='background:#ffffffb8;border-radius:18px;padding:12px;box-shadow:0 8px 22px rgba(0,0,0,.06);'>"
             f"<div style='display:flex;justify-content:space-between;gap:10px;align-items:flex-start;'>"
-            f"<div style='font-weight:900;line-height:1.2'>{nm}</div>"
+            f"<div style='font-weight:900;line-height:1.2'>{html.escape(nm)}</div>"
             f"<div style='font-weight:900;color:{status_color}'>{status_label}</div>"
             f"</div>"
             f"<div style='opacity:.85;margin-top:6px;font-size:12px;'>Cobrador: {cobrador}</div>"
             f"<div style='opacity:.85;margin-top:3px;font-size:12px;'>Prestamo: #{L.get('id')}</div>"
             f"<div style='margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;'>"
-            f"<a class='btn btn-secondary' style='padding:7px 12px' href='{url_for('view_legal_document', loan_id=L.get('id'))}'>Ver</a>"
+            f"<a class='btn btn-secondary' style='padding:7px 12px' href='{url_for('bank_legal_document', prestamo_id=L.get('id'))}'>Ver</a>"
             f"</div>"
             f"</div>"
         )
@@ -5911,8 +6284,8 @@ def bank_legal_list():
 def view_legal_document(loan_id):
     ensure_org()
     oid = session.get("org_id")
-    loan = store.loans.get(loan_id)
-    if not loan or loan.get("organization_id") != oid:
+    loan = loan_dict_by_id(loan_id, oid)
+    if not loan:
         flash("Préstamo no encontrado.", "danger")
         return redirect(url_for("bank_legal_list"))
     u = current_user()
@@ -5920,8 +6293,8 @@ def view_legal_document(loan_id):
         flash("Sin acceso.", "danger")
         return redirect(url_for("bank_legal_list"))
     try:
-        cl = store.clients.get(loan.get("client_id"), {})
-        client_nm = f"{cl.get('first_name') or ''} {cl.get('last_name') or ''}".strip() or "Cliente"
+        client = client_dict_by_id(loan.get("client_id"), oid) or {}
+        client_nm = f"{client.get('first_name') or ''} {client.get('last_name') or ''}".strip() or "Cliente"
         log_action(
             u.get("id"),
             "ver documento legal",
@@ -5931,8 +6304,13 @@ def view_legal_document(loan_id):
     except Exception:
         pass
 
-    client = store.clients.get(loan.get("client_id"), {})
-    cob_u = store.users.get(loan.get("created_by"), {})
+    client = client_dict_by_id(loan.get("client_id"), oid) or {}
+    uid_cob = loan.get("created_by")
+    if uid_cob and USE_DATABASE:
+        from credimapa_pg import get_user
+        cob_u = get_user(uid_cob) or {}
+    else:
+        cob_u = store.users.get(uid_cob, {}) if uid_cob else {}
     cobrador = cob_u.get("name") or cob_u.get("username") or "—"
 
     capital_aprobado = float(loan.get("amount") or 0)
@@ -6220,8 +6598,8 @@ def view_legal_document(loan_id):
 def upload_id_front(loan_id):
     ensure_org()
     oid = session.get("org_id")
-    loan = store.loans.get(loan_id)
-    if not loan or loan.get("organization_id") != oid:
+    loan = loan_dict_by_id(loan_id, oid)
+    if not loan:
         flash("Préstamo no encontrado.", "danger")
         return redirect(url_for("bank_legal_list"))
     u = current_user()
@@ -6239,15 +6617,21 @@ def upload_id_front(loan_id):
         flash("Archivo vacío.", "danger")
         return redirect(url_for("view_legal_document", loan_id=loan_id))
 
-    b64 = base64.b64encode(raw).decode("ascii")
-    loan["id_photo_b64"] = f"data:image/png;base64,{b64}"
+    b64_val = f"data:image/png;base64,{base64.b64encode(raw).decode('ascii')}"
+    if USE_DATABASE:
+        from credimapa_pg import update_prestamo_legal_docs
+        if not update_prestamo_legal_docs(loan_id, oid, id_photo_b64=b64_val):
+            flash("No se pudo guardar la foto.", "danger")
+            return redirect(url_for("view_legal_document", loan_id=loan_id))
+    else:
+        loan["id_photo_b64"] = b64_val
     try:
-        cl = store.clients.get(loan.get("client_id"), {})
+        cl = client_dict_by_id(loan.get("client_id"), oid) or {}
         client_nm = f"{cl.get('first_name') or ''} {cl.get('last_name') or ''}".strip() or f"Cliente #{loan.get('client_id')}"
         log_action(u.get("id"), "subir foto ID (frente)", module="documento legal", detail=f"Préstamo #{loan_id} • {client_nm}")
     except Exception:
         pass
-    flash("ID (frente) guardada en memoria.", "success")
+    flash("ID (frente) guardada.", "success")
     return redirect(url_for("view_legal_document", loan_id=loan_id))
 
 
@@ -6256,8 +6640,8 @@ def upload_id_front(loan_id):
 def upload_id_back(loan_id):
     ensure_org()
     oid = session.get("org_id")
-    loan = store.loans.get(loan_id)
-    if not loan or loan.get("organization_id") != oid:
+    loan = loan_dict_by_id(loan_id, oid)
+    if not loan:
         flash("Préstamo no encontrado.", "danger")
         return redirect(url_for("bank_legal_list"))
     u = current_user()
@@ -6275,15 +6659,21 @@ def upload_id_back(loan_id):
         flash("Archivo vacío.", "danger")
         return redirect(url_for("view_legal_document", loan_id=loan_id))
 
-    b64 = base64.b64encode(raw).decode("ascii")
-    loan["id_photo_back_b64"] = f"data:image/png;base64,{b64}"
+    b64_val = f"data:image/png;base64,{base64.b64encode(raw).decode('ascii')}"
+    if USE_DATABASE:
+        from credimapa_pg import update_prestamo_legal_docs
+        if not update_prestamo_legal_docs(loan_id, oid, id_photo_back_b64=b64_val):
+            flash("No se pudo guardar la foto.", "danger")
+            return redirect(url_for("view_legal_document", loan_id=loan_id))
+    else:
+        loan["id_photo_back_b64"] = b64_val
     try:
-        cl = store.clients.get(loan.get("client_id"), {})
+        cl = client_dict_by_id(loan.get("client_id"), oid) or {}
         client_nm = f"{cl.get('first_name') or ''} {cl.get('last_name') or ''}".strip() or f"Cliente #{loan.get('client_id')}"
         log_action(u.get("id"), "subir foto ID (atrás)", module="documento legal", detail=f"Préstamo #{loan_id} • {client_nm}")
     except Exception:
         pass
-    flash("ID (atrás) guardada en memoria.", "success")
+    flash("ID (atrás) guardada.", "success")
     return redirect(url_for("view_legal_document", loan_id=loan_id))
 
 
@@ -6295,8 +6685,8 @@ def sign_legal_document(loan_id):
     if request.method == "POST":
         ensure_org()
         oid = session.get("org_id")
-        loan = store.loans.get(loan_id)
-        if not loan or loan.get("organization_id") != oid:
+        loan = loan_dict_by_id(loan_id, oid)
+        if not loan:
             flash("Préstamo no encontrado.", "danger")
             return redirect(url_for("bank_legal_list"))
 
@@ -6310,14 +6700,20 @@ def sign_legal_document(loan_id):
             flash("Firma inválida.", "danger")
             return redirect(url_for("view_legal_document", loan_id=loan_id))
 
-        loan["signature_b64"] = sig
+        if USE_DATABASE:
+            from credimapa_pg import update_prestamo_legal_docs
+            if not update_prestamo_legal_docs(loan_id, oid, signature_b64=sig):
+                flash("No se pudo guardar la firma.", "danger")
+                return redirect(url_for("view_legal_document", loan_id=loan_id))
+        else:
+            loan["signature_b64"] = sig
         try:
-            cl = store.clients.get(loan.get("client_id"), {})
+            cl = client_dict_by_id(loan.get("client_id"), oid) or {}
             client_nm = f"{cl.get('first_name') or ''} {cl.get('last_name') or ''}".strip() or f"Cliente #{loan.get('client_id')}"
             log_action(u.get("id"), "firmar documento legal", module="documento legal", detail=f"Préstamo #{loan_id} • {client_nm}")
         except Exception:
             pass
-        flash("Firma guardada en memoria.", "success")
+        flash("Firma guardada.", "success")
         return redirect(url_for("loan_detail", loan_id=loan_id))
 
     # GET: redirigir a la vista completa del contrato.
@@ -7911,8 +8307,8 @@ def bank_ranking():
     rows = ""
     for days_late, rem, L in scored[:50]:
         cid = L.get("client_id")
-        c = store.clients.get(cid, {})
-        nm = f"{c.get('first_name','')} {c.get('last_name') or ''}".strip() or f"#{cid}"
+        c = client_dict_by_id(cid, org_id) or {}
+        nm = f"{c.get('first_name','')} {c.get('last_name') or ''}".strip() or (f"Cliente #{cid}" if cid else "Sin nombre")
         rows += (
             f"<tr><td>{nm}</td><td>#{L['id']}</td><td>{days_late} d</td><td>{fmt_money(rem)}</td>"
             f"<td><a class='btn btn-secondary' href='{url_for('loan_detail', loan_id=L['id'])}'>Ver</a></td></tr>"
@@ -7960,18 +8356,38 @@ def credit_history():
 @login_required
 def client_scores():
     ensure_org()
+    user = current_user()
     org_id = session.get("org_id")
+    clientes_list = clients_for_user(org_id, user)
+    loans_list = loans_for_user(org_id, user)
+    client_ids_from_loans = {L.get("client_id") for L in loans_list if L.get("client_id")}
+    seen = set()
     rows = []
-    for c in store.clients.values():
-        if c.get("organization_id") != org_id:
+    for c in clientes_list:
+        cid = c.get("id")
+        if cid in seen:
             continue
-        sd = calc_client_score(c["id"], org_id)
+        seen.add(cid)
+        sd = calc_client_score(cid, org_id)
         mc = calc_max_credito(sd["prestamos_pagados"], sd["score"])
-        rows.append(f"<tr><td>{c['first_name']}</td><td>{sd['score']}</td><td>{fmt_money(mc)}</td></tr>")
+        nm = f"{c.get('first_name', '')} {c.get('last_name') or ''}".strip() or f"Cliente #{cid}"
+        rows.append(f"<tr><td>{html.escape(nm)}</td><td>{sd['score']}</td><td>{fmt_money(mc)}</td></tr>")
+    for cid in client_ids_from_loans:
+        if cid in seen:
+            continue
+        c = client_dict_by_id(cid, org_id)
+        if not c:
+            continue
+        seen.add(cid)
+        sd = calc_client_score(cid, org_id)
+        mc = calc_max_credito(sd["prestamos_pagados"], sd["score"])
+        nm = f"{c.get('first_name', '')} {c.get('last_name') or ''}".strip() or f"Cliente #{cid}"
+        rows.append(f"<tr><td>{html.escape(nm)}</td><td>{sd['score']}</td><td>{fmt_money(mc)}</td></tr>")
     t = "".join(rows)
     return page(
-        f'<div class="card"><h2>⭐ Score de clientes</h2><div class="table-scroll">'
-        f'<table><tr><th>Cliente</th><th>Score</th><th>Crédito sug.</th></tr>{t}</table></div>{nav_subfooter()}</div>'
+        f'<div class="card"><h2>⭐ Score de clientes</h2><p style="opacity:.9;margin:0 0 12px 0;">Clientes con sugerencia de crédito según historial de préstamos.</p>'
+        f'<div class="table-scroll"><table><tr><th>Cliente</th><th>Score</th><th>Crédito sug.</th></tr>'
+        f"{t or '<tr><td colspan=3 style=\"text-align:center;opacity:.85\">Sin clientes</td></tr>'}</table></div>{nav_subfooter()}</div>"
     )
 
 
