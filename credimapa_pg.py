@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import os
 from contextlib import contextmanager
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, time, timedelta
 from decimal import Decimal
 
 from rd_time import today_rd, utc_now_for_db
@@ -14,7 +14,7 @@ from rd_time import today_rd, utc_now_for_db
 from flask import session as flask_session
 from sqlalchemy import (
     Column, Integer, String, Text, Numeric, Boolean, Date, DateTime,
-    ForeignKey, Index, create_engine, select, func, and_, or_, text, update,
+    ForeignKey, Index, create_engine, select, func, and_, or_, text, update, case,
 )
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import declarative_base, sessionmaker, scoped_session
@@ -701,6 +701,92 @@ def list_banco_cierre_gastos(
     return [r.to_dict() for r in rows]
 
 
+def list_banco_all(
+    sess,
+    admin_id: int,
+    *,
+    d0: date | None = None,
+    d1: date | None = None,
+    user_id: int | None = None,
+    limit: int = 1000,
+) -> list[dict]:
+    """Todos los movimientos del banco para el tenant, ordenados por created_at asc (para saldo)."""
+    q = select(Banco).where(Banco.admin_id == admin_id)
+    if d0 is not None:
+        q = q.where(Banco.mov_date >= d0)
+    if d1 is not None:
+        q = q.where(Banco.mov_date <= d1)
+    if user_id is not None:
+        q = q.where(Banco.user_id == user_id)
+    q = q.order_by(Banco.created_at.asc(), Banco.id.asc()).limit(limit)
+    rows = sess.execute(q).scalars().all()
+    return [r.to_dict() for r in rows]
+
+
+def banco_daily_balance_data(sess, admin_id: int, d0: date, d1: date, limit: int = 365) -> list[tuple]:
+    """(mov_date, cumulative_sum) ordenado por fecha ASC para gráfico de saldo diario."""
+    q = (
+        select(Banco.mov_date, func.sum(Banco.amount).label("total"))
+        .where(Banco.admin_id == admin_id, Banco.mov_date >= d0, Banco.mov_date <= d1)
+        .group_by(Banco.mov_date)
+        .order_by(Banco.mov_date.asc())
+        .limit(limit)
+    )
+    rows = sess.execute(q).all()
+    base = get_starting_bank(sess, admin_id)
+    cum = float(base or 0)
+    result = []
+    for r in rows:
+        cum += float(r[1] or 0)
+        result.append((r[0], round(cum, 2)))
+    return result
+
+
+def banco_ingresos_gastos_by_date(sess, admin_id: int, d0: date, d1: date, limit: int = 90) -> list[dict]:
+    """Por fecha: {date: (ingresos, gastos)}."""
+    q = (
+        select(
+            Banco.mov_date,
+            func.sum(case((Banco.amount > 0, Banco.amount), else_=0)).label("ingresos"),
+            func.sum(case((Banco.amount < 0, func.abs(Banco.amount)), else_=0)).label("gastos"),
+        )
+        .where(Banco.admin_id == admin_id, Banco.mov_date >= d0, Banco.mov_date <= d1)
+        .group_by(Banco.mov_date)
+        .order_by(Banco.mov_date.asc())
+        .limit(limit)
+    )
+    rows = sess.execute(q).all()
+    return [{"date": r[0], "ingresos": round(float(r[1] or 0), 2), "gastos": round(float(r[2] or 0), 2)} for r in rows]
+
+
+def get_top_clientes_by_loans(sess, admin_id: int, limit: int = 5) -> list[dict]:
+    """Top clientes por suma de montos de préstamos (client_id, total, cliente_info)."""
+    sub = (
+        select(
+            Prestamo.client_id,
+            func.sum(Prestamo.amount).label("total"),
+        )
+        .where(Prestamo.admin_id == admin_id)
+        .group_by(Prestamo.client_id)
+        .subquery()
+    )
+    q = (
+        select(sub.c.client_id, sub.c.total, Cliente.first_name, Cliente.last_name)
+        .join(Cliente, Cliente.id == sub.c.client_id)
+        .order_by(sub.c.total.desc())
+        .limit(limit)
+    )
+    rows = sess.execute(q).all()
+    return [
+        {
+            "client_id": r[0],
+            "total": round(float(r[1] or 0), 2),
+            "nombre": f"{(r[2] or '')} {(r[3] or '')}".strip() or "—",
+        }
+        for r in rows
+    ]
+
+
 def list_pagos_cierre_semanal(
     sess,
     admin_id: int,
@@ -731,20 +817,23 @@ def sums_pagos_report_range(
     created_by: int | None = None,
 ) -> tuple[float, float, float]:
     """(SUM(amount), SUM(interest), SUM(capital)) en pagos; pago_date en [d0,d1]."""
-    q = select(
-        func.coalesce(func.sum(Pago.amount), 0),
-        func.coalesce(func.sum(Pago.interest), 0),
-        func.coalesce(func.sum(Pago.capital), 0),
-    ).where(
-        Pago.admin_id == admin_id,
-        Pago.pago_date >= d0,
-        Pago.pago_date <= d1,
-        or_(Pago.status.is_(None), Pago.status != "ANULADO"),
-    )
-    if created_by is not None:
-        q = q.where(Pago.created_by == created_by)
-    row = sess.execute(q).one()
-    return float(row[0] or 0), float(row[1] or 0), float(row[2] or 0)
+    try:
+        q = select(
+            func.coalesce(func.sum(Pago.amount), 0),
+            func.coalesce(func.sum(Pago.interest), 0),
+            func.coalesce(func.sum(Pago.capital), 0),
+        ).where(
+            Pago.admin_id == admin_id,
+            Pago.pago_date >= d0,
+            Pago.pago_date <= d1,
+            or_(Pago.status.is_(None), Pago.status != "ANULADO"),
+        )
+        if created_by is not None:
+            q = q.where(Pago.created_by == created_by)
+        row = sess.execute(q).one()
+        return float(row[0] or 0), float(row[1] or 0), float(row[2] or 0)
+    except Exception:
+        return 0.0, 0.0, 0.0
 
 
 def sums_pagos_amount_interest_in_range(
@@ -997,6 +1086,34 @@ def get_pagos_admin_list(sess, admin_ids=None):
         q = q.where(PagoAdmin.admin_id.in_(list(admin_ids)))
     rows = sess.execute(q).scalars().all()
     return [r.to_dict() for r in rows]
+
+
+def list_auditoria(
+    sess,
+    admin_id: int | None = None,
+    *,
+    user_id: int | None = None,
+    action_like: str | None = None,
+    d_from: date | datetime | None = None,
+    d_to: date | datetime | None = None,
+    limit: int = 600,
+) -> list[dict]:
+    """Lista auditoría con filtros opcionales."""
+    q = select(Auditoria)
+    if admin_id is not None:
+        q = q.where(Auditoria.admin_id == admin_id)
+    if user_id is not None:
+        q = q.where(Auditoria.user_id == user_id)
+    if action_like:
+        q = q.where(Auditoria.action.ilike(f"%{action_like}%"))
+    if d_from is not None:
+        dt_from = d_from if isinstance(d_from, datetime) else datetime.combine(d_from, datetime.min.time())
+        q = q.where(Auditoria.created_at >= dt_from)
+    if d_to is not None:
+        dt_to = d_to if isinstance(d_to, datetime) else datetime.combine(d_to, time(23, 59, 59, 999999))
+        q = q.where(Auditoria.created_at <= dt_to)
+    rows = sess.execute(q.order_by(Auditoria.created_at.desc()).limit(limit)).scalars().all()
+    return [_to_dict(r) for r in rows]
 
 
 def save_auditoria(sess, data: dict) -> int:

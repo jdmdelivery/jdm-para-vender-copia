@@ -283,9 +283,14 @@ body.theme-dark .premium-btn{background:rgba(15,23,42,.65);color:#e5e7eb}
 {% endif %}
 <div class="topbar-title">{{ app_brand }}</div>
 {% if user %}
-<div style="position:absolute;right:14px;top:50%;transform:translateY(-50%);font-size:10px;opacity:.92;text-align:right;line-height:1.25">
-  <div>Hora RD</div>
-  <div style="font-weight:800">{{ time_rd_label }}</div>
+<div style="position:absolute;right:14px;top:50%;transform:translateY(-50%);display:flex;align-items:center;gap:14px">
+  {% if nav_balance %}
+  <div style="font-weight:900;font-size:13px;color:#16a34a">{{ nav_balance }}</div>
+  {% endif %}
+  <div style="font-size:10px;opacity:.92;text-align:right;line-height:1.25">
+    <div>Hora RD</div>
+    <div style="font-weight:800">{{ time_rd_label }}</div>
+  </div>
 </div>
 {% endif %}
 </header>
@@ -513,8 +518,10 @@ def log_action(user_id, action, detail="", module=""):
         except Exception:
             pass
 
+        oid = session.get("org_id")
         data = {
             "user_id": user_id,
+            "admin_id": oid,
             "user_name": user_name,
             "role": role_group,
             "raw_role": raw_role,
@@ -599,15 +606,24 @@ def evaluate_loan(score, prestamos_activos):
 
 
 def page(body, user=None):
+    u = user if user is not None else current_user()
+    nav_balance = ""
+    if u and session.get("org_id") is not None:
+        try:
+            bal = get_bank_available(session.get("org_id"))
+            nav_balance = f"RD$ {bal:,.2f}" if bal is not None else "RD$ 0.00"
+        except Exception:
+            nav_balance = "RD$ —"
     return render_template_string(
         TPL_LAYOUT,
         body=body,
-        user=user if user is not None else current_user(),
+        user=u,
         app_brand=APP_BRAND,
         flashes=get_flashed_messages(with_categories=True),
         theme=get_theme(),
         time_rd_label=format_dt_rd(get_current_time_rd()),
         time_rd_zone="America/Santo_Domingo",
+        nav_balance=nav_balance,
     )
 
 
@@ -769,7 +785,20 @@ def apply_cash_movement(movement_type, amount, note, user_id=None, org_id=None, 
     """
     if USE_DATABASE:
         from credimapa_pg import add_banco_movement as _db_add
-        return _db_add(movement_type, amount, note, user_id, org_id, collector_id)
+        rid = _db_add(movement_type, amount, note, user_id, org_id, collector_id)
+        try:
+            oid = org_id if org_id is not None else session.get("org_id")
+            if oid:
+                nuevo_balance = get_bank_available(oid)
+                log_action(
+                    user_id or (current_user() or {}).get("id"),
+                    "movimiento banco",
+                    module="banco",
+                    detail=f"{movement_type} | RD$ {float(amount or 0):,.2f} | balance: RD$ {float(nuevo_balance or 0):,.2f}",
+                )
+        except Exception:
+            pass
+        return rid
     oid = bank_org_id(org_id)
     amt = float(amount or 0)
     if abs(amt) < 1e-9:
@@ -901,10 +930,13 @@ def compute_financial_kpis(org_id, user):
     interes_hoy = sum(float(p.get("interest") or 0) for p in ok if p.get("date") == today)
 
     atrasados = 0
+    clientes_atrasados = set()
     for x in activos:
         npd = x.get("next_payment_date")
-        if npd and npd < today:
+        rem = float(x.get("remaining") or 0)
+        if npd and npd < today and rem > 0:
             atrasados += 1
+            clientes_atrasados.add(x.get("client_id"))
 
     if USE_DATABASE:
         from credimapa_pg import get_users
@@ -924,6 +956,7 @@ def compute_financial_kpis(org_id, user):
         "cobrado_hoy": cobrado_hoy,
         "interes_hoy": interes_hoy,
         "atrasados": atrasados,
+        "clientes_atrasados": len(clientes_atrasados),
         "n_prestamos": len(L),
         "n_clientes": len(clients_for_user(org_id, user)),
         "n_cobradores": n_cobradores,
@@ -1277,7 +1310,9 @@ def dashboard():
         f'<div class="daily-card g"><span class="dk">Cobrado hoy</span><span class="dv">{fmt_money(k["cobrado_hoy"])}</span></div>'
         f'<div class="daily-card g"><span class="dk">Interés hoy</span><span class="dv">{fmt_money(k["interes_hoy"])}</span></div>'
         f'<a class="daily-card r" href="{url_for("bank_late")}" style="text-decoration:none;color:inherit;display:block;cursor:pointer">'
-        f'<span class="dk">⚠️ Atrasados</span><span class="dv">{k["atrasados"]}</span></a>'
+        f'<span class="dk">⚠️ Préstamos en atraso</span><span class="dv">{k["atrasados"]}</span></a>'
+        f'<a class="daily-card r" href="{url_for("bank_late")}" style="text-decoration:none;color:inherit;display:block;cursor:pointer">'
+        f'<span class="dk">👤 Clientes en atraso</span><span class="dv">{k.get("clientes_atrasados", k["atrasados"])}</span></a>'
     )
 
     def op_tile(href, icon, title, subtitle="", badge=""):
@@ -1361,7 +1396,7 @@ body.theme-dark .dash-h2 {{ color: #86efac; }}
 @media(min-width:600px){{ .fin-mini{{ flex: 1 1 calc(25% - 8px); }} }}
 .fin-mini-k {{ display:block; font-size: 10px; font-weight: 700; opacity: .95; text-transform: uppercase; }}
 .fin-mini-v {{ display:block; font-size: 14px; font-weight: 800; margin-top: 4px; }}
-.daily-row {{ display: grid; grid-template-columns: repeat(3,1fr); gap: 8px; margin-bottom: 8px; }}
+.daily-row {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(140px,1fr)); gap: 8px; margin-bottom: 8px; }}
 .daily-card {{
   border-radius: 14px;
   padding: 12px 8px;
@@ -1990,6 +2025,15 @@ def delete_client(client_id):
         return redirect(url_for("clients"))
     u = current_user()
 
+    # Prevenir eliminar si tiene préstamos activos (remaining > 0)
+    activos_con_saldo = [
+        (lid, L) for lid, L in client_loans
+        if float(L.get("remaining") or 0) > 0
+    ]
+    if activos_con_saldo:
+        flash("No se puede eliminar: el cliente tiene préstamos activos con saldo pendiente.", "danger")
+        return redirect(url_for("client_detail", client_id=client_id))
+
     # Revertir movimientos financieros de todos los préstamos del cliente.
     if USE_DATABASE:
         from credimapa_pg import get_loans
@@ -2146,7 +2190,7 @@ def client_detail(client_id):
 
         del_form = (
             f"<form method='post' action='{url_for('delete_loan', loan_id=L['id'])}' "
-            f"style='margin:0' onsubmit=\"return confirm('¿Eliminar préstamo #{L['id']}? Esto ajustará el banco automáticamente.');\">"
+            f"style='margin:0' onsubmit=\"return confirm('¿Seguro que deseas eliminar este préstamo? Se revertirán los movimientos financieros.');\">"
             f"<button class='btn btn-danger btn-action' type='submit'>"
             f"<span class='btn-ic' aria-hidden='true'>"
             f"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' width='18' height='18' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'>"
@@ -2344,7 +2388,7 @@ def client_detail(client_id):
                 <span class="btn-ic" aria-hidden="true">
                   <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z"/></svg>
                 </span>Editar</a>
-              <form method="post" action="{url_for("delete_client", client_id=client_id)}" style="margin:0" onsubmit="return confirm('¿Eliminar cliente? Esto eliminará el cliente, sus préstamos y ajustará el banco automáticamente.');">
+              <form method="post" action="{url_for("delete_client", client_id=client_id)}" style="margin:0" onsubmit="return confirm('¿Seguro que deseas eliminar este cliente? Se revertirán los movimientos financieros.');">
                 <button class="btn btn-danger btn-action" type="submit">
                   <span class="btn-ic" aria-hidden="true">
                     <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/></svg>
@@ -3964,28 +4008,47 @@ def audit():
     d_to = parse_d(q_to)
 
     filtered = []
-    for a in store.audit_log:
-        au = store.users.get(a.get("user_id"), {})
-        if u.get("role") != "super_admin" and au.get("organization_id") != oid:
-            continue
+    if USE_DATABASE:
+        try:
+            from credimapa_pg import list_auditoria, list_tenant_usuarios, get_users, session_scope
+            with session_scope() as sess:
+                filtered = list_auditoria(
+                    sess,
+                    admin_id=oid,
+                    user_id=q_uid,
+                    action_like=q_action if q_action else None,
+                    d_from=d_from,
+                    d_to=d_to,
+                    limit=600,
+                )
+            # Cobrador/cajero solo ve su propio historial
+            if not is_adminish and u.get("id"):
+                filtered = [a for a in filtered if a.get("user_id") == u.get("id")]
+        except Exception:
+            filtered = []
+    else:
+        for a in store.audit_log:
+            au = store.users.get(a.get("user_id"), {})
+            if u.get("role") != "super_admin" and au.get("organization_id") != oid:
+                continue
 
-        # Seguridad: prestamista solo ve su propio historial.
-        if not is_adminish and a.get("user_id") != u.get("id"):
-            continue
+            # Seguridad: prestamista solo ve su propio historial.
+            if not is_adminish and a.get("user_id") != u.get("id"):
+                continue
 
-        if q_uid is not None and a.get("user_id") != q_uid:
-            continue
-        if q_action and q_action not in str(a.get("action") or "").lower() and q_action not in str(a.get("module") or "").lower():
-            continue
+            if q_uid is not None and a.get("user_id") != q_uid:
+                continue
+            if q_action and q_action not in str(a.get("action") or "").lower() and q_action not in str(a.get("module") or "").lower():
+                continue
 
-        created_dt = a.get("created_at")
-        created_date = created_dt.date() if hasattr(created_dt, "date") else None
-        if d_from and (not created_date or created_date < d_from):
-            continue
-        if d_to and (not created_date or created_date > d_to):
-            continue
+            created_dt = a.get("created_at")
+            created_date = created_dt.date() if hasattr(created_dt, "date") else None
+            if d_from and (not created_date or created_date < d_from):
+                continue
+            if d_to and (not created_date or created_date > d_to):
+                continue
 
-        filtered.append(a)
+            filtered.append(a)
 
     filtered.sort(key=lambda x: x.get("created_at") or datetime.min, reverse=True)
     filtered = filtered[:600]
@@ -4072,10 +4135,23 @@ def audit():
     user_filter_html = ""
     if is_adminish:
         # Opciones por usuario (en el tenant actual)
-        opts = "".join(
-            f"<option value='{uid}'{' selected' if q_uid == uid else ''}>{html.escape(uobj.get('username') or uobj.get('name') or str(uid))}</option>"
-            for uid, uobj in store.users.items()
-            if u.get("role") == "super_admin" or uobj.get("organization_id") == oid
+        if USE_DATABASE:
+            try:
+                from credimapa_pg import list_tenant_usuarios, get_users
+                if u.get("role") == "super_admin":
+                    users_src = [{"id": k, **(v or {})} for k, v in get_users().items()]
+                else:
+                    users_src = list_tenant_usuarios(oid)
+            except Exception:
+                users_src = []
+        else:
+            users_src = [
+                {"id": uid, **uobj} for uid, uobj in store.users.items()
+                if u.get("role") == "super_admin" or uobj.get("organization_id") == oid
+            ]
+        opts = "<option value=''>Todos</option>" + "".join(
+            f"<option value='{uobj.get('id')}'{' selected' if q_uid == uobj.get('id') else ''}>{html.escape(uobj.get('username') or uobj.get('name') or str(uobj.get('id', '')))}</option>"
+            for uobj in (users_src if isinstance(users_src, list) else list(users_src))
         )
         user_filter_html = f"<select name='user_id' class='audit-input' style='min-width:190px'>{opts}</select>"
     else:
@@ -5384,18 +5460,23 @@ def reportes():
     total_interes_hoy = 0.0
     total_capital_hoy = 0.0
     if USE_DATABASE:
-        from credimapa_pg import sums_pagos_report_range, session_scope
+        try:
+            from credimapa_pg import sums_pagos_report_range, session_scope
 
-        with session_scope() as sess:
-            total_cobrado_hoy, total_interes_hoy, total_capital_hoy = sums_pagos_report_range(
-                sess, oid, today, today, created_by=cobrador_id
-            )
-        total_cobrado_hoy = round(total_cobrado_hoy, 2)
-        total_interes_hoy = round(total_interes_hoy, 2)
-        total_capital_hoy = round(total_capital_hoy, 2)
+            with session_scope() as sess:
+                total_cobrado_hoy, total_interes_hoy, total_capital_hoy = sums_pagos_report_range(
+                    sess, oid, today, today, created_by=cobrador_id
+                )
+            total_cobrado_hoy = round(float(total_cobrado_hoy or 0), 2)
+            total_interes_hoy = round(float(total_interes_hoy or 0), 2)
+            total_capital_hoy = round(float(total_capital_hoy or 0), 2)
+        except Exception as e:
+            total_cobrado_hoy = 0.0
+            total_interes_hoy = 0.0
+            total_capital_hoy = 0.0
     else:
         for p in store.payments.values():
-            pd = p.get("date")
+            pd = p.get("date") or p.get("pago_date") or p.get("fecha")
             if pd != today:
                 continue
             L = store.loans.get(p.get("loan_id")) if p.get("loan_id") else None
@@ -5403,8 +5484,8 @@ def reportes():
                 continue
             if cobrador_id is not None and p.get("created_by") != cobrador_id:
                 continue
-            total_cobrado_hoy += float(p.get("amount") or 0)
-            total_interes_hoy += float(p.get("interest") or 0)
+            total_cobrado_hoy += float(p.get("amount") or p.get("monto") or 0)
+            total_interes_hoy += float(p.get("interest") or p.get("interes") or 0)
             total_capital_hoy += float(p.get("capital") or 0)
         total_cobrado_hoy = round(total_cobrado_hoy, 2)
         total_interes_hoy = round(total_interes_hoy, 2)
@@ -5412,71 +5493,86 @@ def reportes():
 
     # Alcance por tenant (org)
     if USE_DATABASE:
-        from credimapa_pg import (
-            get_loans,
-            get_clients,
-            list_pagos_cierre_semanal,
-            list_banco_cierre_by_type,
-            list_banco_cierre_gastos,
-            list_tenant_usuarios,
-            session_scope,
-        )
-
-        loans_dict = get_loans([oid])
-        clients_dict = get_clients([oid])
-        loans_tenant = list(loans_dict.values())
-        clients_tenant = list(clients_dict.values())
-        total_prestamos = len(loans_tenant)
-        total_clientes = len(clients_tenant)
-
-        with session_scope() as sess:
-            pagos_list = list_pagos_cierre_semanal(
-                sess, oid, dt_from, dt_to,
-                restrict=(cobrador_id is not None), user_id=cobrador_id,
+        try:
+            from credimapa_pg import (
+                get_loans,
+                get_clients,
+                list_pagos_cierre_semanal,
+                list_banco_cierre_by_type,
+                list_banco_cierre_gastos,
+                list_tenant_usuarios,
+                session_scope,
             )
-            descuentos_list = list_banco_cierre_by_type(sess, oid, "descuento_inicial", dt_from, dt_to)
-            prestamos_ent_list = list_banco_cierre_by_type(sess, oid, "prestamo_entregado", dt_from, dt_to)
-            gastos_list = list_banco_cierre_gastos(sess, oid, dt_from, dt_to)
-            cobradores_list = list_tenant_usuarios(oid)
 
-        route_expenses = [
-            {**g, "created_at": g.get("created_at"), "amount": g.get("amount")}
-            for g in gastos_list
-        ]
-        gastos_ruta_total = round(sum(float(g.get("amount") or 0) for g in gastos_list), 2)
-        descuento_income_total = round(sum(float(d.get("amount") or 0) for d in descuentos_list), 2)
+            loans_dict = get_loans([oid]) if oid else {}
+            clients_dict = get_clients([oid]) if oid else {}
+            loans_tenant = list(loans_dict.values()) if loans_dict else []
+            clients_tenant = list(clients_dict.values()) if clients_dict else []
+            total_prestamos = len(loans_tenant)
+            total_clientes = len(clients_tenant)
 
-        ingresos_by_bucket = {}
-        for d in descuentos_list:
-            md = d.get("mov_date") or d.get("date")
-            if md:
-                k = bkey(md) if isinstance(md, date) else bkey(datetime.strptime(str(md)[:10], "%Y-%m-%d").date())
-                ingresos_by_bucket[k] = ingresos_by_bucket.get(k, 0) + float(d.get("amount") or 0)
+            with session_scope() as sess:
+                pagos_list = list_pagos_cierre_semanal(
+                    sess, oid, dt_from, dt_to,
+                    restrict=(cobrador_id is not None), user_id=cobrador_id,
+                )
+                descuentos_list = list_banco_cierre_by_type(sess, oid, "descuento_inicial", dt_from, dt_to)
+                prestamos_ent_list = list_banco_cierre_by_type(sess, oid, "prestamo_entregado", dt_from, dt_to)
+                gastos_list = list_banco_cierre_gastos(sess, oid, dt_from, dt_to)
+                cobradores_list = list_tenant_usuarios(oid) if oid else []
 
-        gastos_by_bucket = {}
-        for g in gastos_list:
-            md = g.get("mov_date") or g.get("date")
-            if md:
-                d = md if isinstance(md, date) else datetime.strptime(str(md)[:10], "%Y-%m-%d").date()
-                gastos_by_bucket[bkey(d)] = gastos_by_bucket.get(bkey(d), 0) + float(g.get("amount") or 0)
+            route_expenses = [
+                {**g, "created_at": g.get("created_at"), "amount": g.get("amount")}
+                for g in gastos_list
+            ]
+            gastos_ruta_total = round(sum(float(g.get("amount") or 0) for g in gastos_list), 2)
+            descuento_income_total = round(sum(float(d.get("amount") or 0) for d in descuentos_list), 2)
 
-        prestamos_by_bucket = {}
-        for p in prestamos_ent_list:
-            md = p.get("mov_date") or p.get("date")
-            if md:
-                d = md if isinstance(md, date) else datetime.strptime(str(md)[:10], "%Y-%m-%d").date()
-                prestamos_by_bucket[bkey(d)] = prestamos_by_bucket.get(bkey(d), 0) + float(p.get("amount") or 0)
+            ingresos_by_bucket = {}
+            for d in descuentos_list:
+                md = d.get("mov_date") or d.get("date")
+                if md:
+                    k = bkey(md) if isinstance(md, date) else bkey(datetime.strptime(str(md)[:10], "%Y-%m-%d").date())
+                    ingresos_by_bucket[k] = ingresos_by_bucket.get(k, 0) + float(d.get("amount") or 0)
 
-        loan_ids_tenant = {L.get("id") for L in loans_tenant}
-        cobros_by_bucket = {}
-        for p in pagos_list:
-            pd = p.get("pago_date") or p.get("date")
-            if pd is None:
-                continue
-            if p.get("loan_id") not in loan_ids_tenant:
-                continue
-            d = pd if isinstance(pd, date) else datetime.strptime(str(pd)[:10], "%Y-%m-%d").date()
-            cobros_by_bucket[bkey(d)] = cobros_by_bucket.get(bkey(d), 0) + float(p.get("amount") or 0)
+            gastos_by_bucket = {}
+            for g in gastos_list:
+                md = g.get("mov_date") or g.get("date")
+                if md:
+                    d_val = md if isinstance(md, date) else datetime.strptime(str(md)[:10], "%Y-%m-%d").date()
+                    gastos_by_bucket[bkey(d_val)] = gastos_by_bucket.get(bkey(d_val), 0) + float(g.get("amount") or 0)
+
+            prestamos_by_bucket = {}
+            for p in prestamos_ent_list:
+                md = p.get("mov_date") or p.get("date")
+                if md:
+                    d_val = md if isinstance(md, date) else datetime.strptime(str(md)[:10], "%Y-%m-%d").date()
+                    prestamos_by_bucket[bkey(d_val)] = prestamos_by_bucket.get(bkey(d_val), 0) + float(p.get("amount") or 0)
+
+            loan_ids_tenant = {L.get("id") for L in loans_tenant}
+            cobros_by_bucket = {}
+            for p in pagos_list:
+                pd = p.get("pago_date") or p.get("date")
+                if pd is None:
+                    continue
+                if p.get("loan_id") not in loan_ids_tenant:
+                    continue
+                amt = float(p.get("amount") or p.get("monto") or 0)
+                d_val = pd if isinstance(pd, date) else datetime.strptime(str(pd)[:10], "%Y-%m-%d").date()
+                cobros_by_bucket[bkey(d_val)] = cobros_by_bucket.get(bkey(d_val), 0) + amt
+        except Exception:
+            loans_tenant = []
+            clients_tenant = []
+            total_prestamos = 0
+            total_clientes = 0
+            cobradores_list = []
+            pagos_list = []
+            gastos_ruta_total = 0.0
+            descuento_income_total = 0.0
+            ingresos_by_bucket = {}
+            gastos_by_bucket = {}
+            prestamos_by_bucket = {}
+            cobros_by_bucket = {}
     else:
         loans_tenant = [L for L in store.loans.values() if L.get("organization_id") == oid]
         clients_tenant = [c for c in store.clients.values() if c.get("organization_id") == oid]
@@ -5554,6 +5650,50 @@ def reportes():
             if cobrador_id is not None and p.get("created_by") != cobrador_id:
                 continue
             cobros_by_bucket[bkey(pd)] = cobros_by_bucket.get(bkey(pd), 0) + float(p.get("amount") or 0)
+
+    # Pagos en rango para reporte por cobrador
+    if USE_DATABASE:
+        pagos_in_range = pagos_list
+    else:
+        loan_ids_tenant = {L.get("id") for L in loans_tenant}
+        pagos_in_range = []
+        for p in store.payments.values():
+            pd = p.get("date") or p.get("pago_date") or p.get("fecha")
+            if pd is None:
+                continue
+            d_val = pd if isinstance(pd, date) else datetime.strptime(str(pd)[:10], "%Y-%m-%d").date()
+            if not (dt_from <= d_val <= dt_to):
+                continue
+            if p.get("loan_id") not in loan_ids_tenant:
+                continue
+            if cobrador_id is not None and p.get("created_by") != cobrador_id:
+                continue
+            pagos_in_range.append({
+                "created_by": p.get("created_by"),
+                "amount": float(p.get("amount") or p.get("monto") or 0),
+                "interest": float(p.get("interest") or p.get("interes") or 0),
+                "capital": float(p.get("capital") or 0),
+            })
+
+    # Reporte por cobrador y ranking
+    cobrador_sums = {}
+    cobrador_names = {u.get("id"): (u.get("username") or u.get("nombre") or u.get("name") or "Usuario") for u in cobradores_list}
+    for p in pagos_in_range:
+        amt = float(p.get("amount") or p.get("monto") or 0)
+        inte = float(p.get("interest") or p.get("interes") or 0)
+        cap = float(p.get("capital") or 0)
+        uid = p.get("created_by")
+        key = uid if uid is not None else 0
+        if key not in cobrador_sums:
+            cobrador_sums[key] = {"nombre": cobrador_names.get(uid) or "Sin asignar", "total_cobrado": 0.0, "total_interes": 0.0, "total_capital": 0.0}
+        cobrador_sums[key]["total_cobrado"] += amt
+        cobrador_sums[key]["total_interes"] += inte
+        cobrador_sums[key]["total_capital"] += cap
+    report_by_collector = [
+        {"nombre": v["nombre"], "total_cobrado": round(v["total_cobrado"], 2), "total_interes": round(v["total_interes"], 2), "total_capital": round(v["total_capital"], 2)}
+        for v in cobrador_sums.values()
+    ]
+    ranking = sorted(report_by_collector, key=lambda x: x["total_cobrado"], reverse=True)
 
     banco_disp = get_bank_available(oid)
 
@@ -5645,6 +5785,7 @@ const cobros = COBROS;
 function build(){
   const incomeCtx = document.getElementById('chartIngresosGastos');
   const loansCtx = document.getElementById('chartPrestamosCobros');
+  const dailyCtx = document.getElementById('chartIngresoDiario');
   if(incomeCtx){
     new Chart(incomeCtx, {
       type: 'line',
@@ -5693,6 +5834,29 @@ function build(){
           backgroundColor: 'rgba(16,185,129,.25)',
           borderColor: 'rgba(16,185,129,1)',
           borderWidth: 1
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: { legend: { display: true } },
+        scales: { y: { beginAtZero: true, ticks: { callback: (v)=>money(v) } } }
+      }
+    });
+  }
+  if(dailyCtx){
+    new Chart(dailyCtx, {
+      type: 'line',
+      data: {
+        labels: labels,
+        datasets: [{
+          label: 'Dinero cobrado',
+          data: cobros,
+          borderColor: 'rgba(16,185,129,1)',
+          backgroundColor: 'rgba(16,185,129,.2)',
+          tension: 0.3,
+          fill: true,
+          pointRadius: 3
         }]
       },
       options: {
@@ -5759,7 +5923,21 @@ window.addEventListener('load', build);
   body.theme-dark .rep-badge-soft{background:rgba(2,6,23,.35)}
 
   [data-rep-anim]{opacity:0;transform: translateY(10px);transition: opacity .35s ease, transform .35s ease}
-  [data-rep-anim].in{opacity:1;transform: translateY(0)}
+
+  .rep-tables{display:grid;grid-template-columns:1fr;gap:12px;margin-top:14px}
+  @media(min-width:720px){.rep-tables{grid-template-columns:1fr 1fr}}
+  .rep-table-card{background:rgba(255,255,255,.92);border:1px solid rgba(148,163,184,.25);border-radius:18px;box-shadow:0 10px 24px rgba(0,0,0,.06);padding:14px}
+  body.theme-dark .rep-table-card{background:rgba(15,23,42,.92);border-color:rgba(148,163,184,.18)}
+  .rep-table-title{font-weight:1000;margin:0 0 10px 0;font-size:14px}
+  .rep-table{table:border-collapse:collapse;width:100%;font-size:13px}
+  .rep-table th,.rep-table td{padding:8px 10px;text-align:left}
+  .rep-table th{font-weight:900;opacity:.9;border-bottom:1px solid rgba(148,163,184,.3)}
+  .rep-table td{border-bottom:1px solid rgba(148,163,184,.15)}
+  .rep-table td.num{text-align:right;font-weight:800}
+  .rep-rank-1,.rep-rank-2,.rep-rank-3{font-weight:1000}
+  .rep-rank-1{color:#f59e0b}
+  .rep-rank-2{color:#94a3b8}
+  .rep-rank-3{color:#b45309}
 </style>
 """
     _hoy_kw = {"hoy": 1, "cobrador_id": cobrador_id} if cobrador_id else {"hoy": 1}
@@ -5820,11 +5998,11 @@ window.addEventListener('load', build);
         + "</div>"
         + "<div class='rep-grid'>"
         + "<div class='rep-card tone-green' data-rep-anim='1'>"
-        + "<div class='rep-card-top'><div><div class='rep-k'>Total cobrado hoy</div><div class='rep-v'>" + fmt_money(total_cobrado_hoy) + "</div></div><div class='rep-ico'>💰</div></div></div>"
+        + "<div class='rep-card-top'><div><div class='rep-k'>Total cobrado hoy</div><div class='rep-v'>" + fmt_money(total_cobrado_hoy or 0) + "</div></div><div class='rep-ico'>💰</div></div></div>"
         + "<div class='rep-card tone-blue' data-rep-anim='1'>"
-        + "<div class='rep-card-top'><div><div class='rep-k'>Interés ganado hoy</div><div class='rep-v'>" + fmt_money(total_interes_hoy) + "</div></div><div class='rep-ico'>📈</div></div></div>"
+        + "<div class='rep-card-top'><div><div class='rep-k'>Interés ganado hoy</div><div class='rep-v'>" + fmt_money(total_interes_hoy or 0) + "</div></div><div class='rep-ico'>📈</div></div></div>"
         + "<div class='rep-card tone-purple' data-rep-anim='1'>"
-        + "<div class='rep-card-top'><div><div class='rep-k'>Capital cobrado hoy</div><div class='rep-v'>" + fmt_money(total_capital_hoy) + "</div></div><div class='rep-ico'>📋</div></div></div>"
+        + "<div class='rep-card-top'><div><div class='rep-k'>Capital cobrado hoy</div><div class='rep-v'>" + fmt_money(total_capital_hoy or 0) + "</div></div><div class='rep-ico'>📋</div></div></div>"
         + "<div class='rep-card tone-green' data-rep-anim='1'>"
         + "<div class='rep-card-top'>"
         + "<div>"
@@ -5871,7 +6049,28 @@ window.addEventListener('load', build);
         + "</div>"
         + "</div>"
         + "</div>"
-        + "<div class='rep-charts'>"
+        + "<div class='rep-tables' data-rep-anim='1'>"
+        + "<div class='rep-table-card'>"
+        + "<div class='rep-table-title'>Reporte por cobrador</div>"
+        + "<table class='rep-table'><tr><th>Nombre</th><th class='num'>Total cobrado</th><th class='num'>Interés</th><th class='num'>Capital</th></tr>"
+        + "".join(
+            f"<tr><td>{html.escape(r['nombre'])}</td><td class='num'>{fmt_money(r['total_cobrado'])}</td>"
+            f"<td class='num'>{fmt_money(r['total_interes'])}</td><td class='num'>{fmt_money(r['total_capital'])}</td></tr>"
+            for r in report_by_collector
+        )
+        + (f"<tr><td colspan='4' style='opacity:.7'>Sin cobros en el rango</td></tr>" if not report_by_collector else "")
+        + "</table></div>"
+        + "<div class='rep-table-card'>"
+        + "<div class='rep-table-title'>Ranking de cobradores</div>"
+        + "<table class='rep-table'><tr><th>#</th><th>Nombre</th><th class='num'>Total cobrado</th></tr>"
+        + "".join(
+            f"<tr><td><span class='rep-rank-{i}'>{i}</span></td><td>{html.escape(r['nombre'])}</td><td class='num'>{fmt_money(r['total_cobrado'])}</td></tr>"
+            for i, r in enumerate(ranking[:10], 1)
+        )
+        + (f"<tr><td colspan='3' style='opacity:.7'>Sin cobros en el rango</td></tr>" if not ranking else "")
+        + "</table></div>"
+        + "</div>"
+        + "<div class='rep-charts' style='margin-top:14px'>"
         + "<div class='rep-chart-card' data-rep-anim='1'>"
         + "<div class='rep-chart-title'>Ingresos vs Gastos (rango)</div>"
         + "<div class='rep-canvas-wrap'><canvas id='chartIngresosGastos'></canvas></div>"
@@ -5879,6 +6078,10 @@ window.addEventListener('load', build);
         + "<div class='rep-chart-card' data-rep-anim='1'>"
         + "<div class='rep-chart-title'>Préstamos vs Cobros (rango)</div>"
         + "<div class='rep-canvas-wrap'><canvas id='chartPrestamosCobros'></canvas></div>"
+        + "</div>"
+        + "<div class='rep-chart-card' data-rep-anim='1' style='grid-column:1/-1'>"
+        + "<div class='rep-chart-title'>Ingreso diario (cobros)</div>"
+        + "<div class='rep-canvas-wrap'><canvas id='chartIngresoDiario'></canvas></div>"
         + "</div>"
         + "</div>"
         + charts_js
@@ -8242,7 +8445,7 @@ def bank_late():
     rows = []
     for days_late, L, cuota_n, npd in rows_pack[:400]:
         cid = L.get("client_id")
-        c = store.clients.get(cid, {})
+        c = client_dict_by_id(cid, org_id) or {}
         nm = f"{c.get('first_name','')} {c.get('last_name') or ''}".strip() or f"Cliente #{cid}"
         phone = (c.get("phone") or "").strip() or "—"
         due_s = npd.strftime("%d/%m/%Y")
@@ -8505,6 +8708,74 @@ def bank_resumen():
         ),
         2,
     )
+
+    # Charts + Top clientes
+    today = today_rd()
+    d0 = today - timedelta(days=90)
+    daily_labels, daily_balances = [], []
+    ing_labels, ing_vals, gas_vals = [], [], []
+    top_clientes = []
+    if USE_DATABASE:
+        try:
+            from credimapa_pg import banco_daily_balance_data, banco_ingresos_gastos_by_date, get_top_clientes_by_loans, session_scope
+            with session_scope() as sess:
+                daily_data = banco_daily_balance_data(sess, oid, d0, today)
+                daily_labels = [str(d[0]) for d in daily_data]
+                daily_balances = [d[1] for d in daily_data]
+                ig_data = banco_ingresos_gastos_by_date(sess, oid, d0, today)
+                ing_labels = [str(x["date"]) for x in ig_data]
+                ing_vals = [x["ingresos"] for x in ig_data]
+                gas_vals = [x["gastos"] for x in ig_data]
+                top_clientes = get_top_clientes_by_loans(sess, oid, 5)
+        except Exception:
+            pass
+    else:
+        # Store: aggregate from cash_reports
+        by_date = {}
+        for cr in store.cash_reports.values():
+            if cr.get("organization_id") != oid:
+                continue
+            d = cr.get("date") or (cr.get("created_at").date() if hasattr(cr.get("created_at"), "date") else None)
+            if not d or not (d0 <= d <= today):
+                continue
+            key = str(d)
+            if key not in by_date:
+                by_date[key] = {"ing": 0, "gas": 0, "net": 0}
+            amt = float(cr.get("amount") or 0)
+            by_date[key]["net"] += amt
+            if amt > 0:
+                by_date[key]["ing"] += amt
+            else:
+                by_date[key]["gas"] += abs(amt)
+        sorted_dates = sorted(by_date.keys())
+        base = float(getattr(store, "starting_banks", {}).get(oid, 0) or 0)
+        cum = base
+        cum_by_date = {}
+        for d in sorted_dates:
+            cum += by_date[d]["net"]
+            cum_by_date[d] = round(cum, 2)
+        daily_labels = sorted_dates[-60:]
+        daily_balances = [cum_by_date.get(d, base) for d in daily_labels]
+        ing_labels = sorted_dates[-30:]
+        ing_vals = [by_date.get(d, {}).get("ing", 0) for d in ing_labels]
+        gas_vals = [by_date.get(d, {}).get("gas", 0) for d in ing_labels]
+        # Top clientes from store
+        client_totals = {}
+        for L in store.loans.values():
+            if L.get("organization_id") != oid:
+                continue
+            cid = L.get("client_id")
+            if cid:
+                client_totals[cid] = client_totals.get(cid, 0) + float(L.get("amount") or 0)
+        sorted_clients = sorted(client_totals.items(), key=lambda x: -x[1])[:5]
+        for cid, tot in sorted_clients:
+            c = store.clients.get(cid, {})
+            top_clientes.append({
+                "client_id": cid,
+                "total": round(tot, 2),
+                "nombre": f"{(c.get('first_name') or '')} {(c.get('last_name') or '')}".strip() or "—",
+            })
+
     body = (
         f"""
 <div class="card" style="padding:16px;">
@@ -8605,8 +8876,51 @@ def bank_resumen():
     </div>
   </div>
 
+  <div class="res-daily-title" style="margin-top:20px;">Gráficos</div>
+  <div style="display:grid;grid-template-columns:1fr;gap:16px;margin:12px 0">
+    <div style="background:rgba(255,255,255,.9);border-radius:16px;padding:14px;border:1px solid rgba(148,163,184,.2)">
+      <div style="font-weight:900;margin-bottom:8px;font-size:13px">Saldo diario</div>
+      <div style="height:220px"><canvas id="chartSaldoDiario"></canvas></div>
+    </div>
+    <div style="background:rgba(255,255,255,.9);border-radius:16px;padding:14px;border:1px solid rgba(148,163,184,.2)">
+      <div style="font-weight:900;margin-bottom:8px;font-size:13px">Ingresos vs Gastos</div>
+      <div style="height:220px"><canvas id="chartIngresosGastos"></canvas></div>
+    </div>
+  </div>
+
+  <div class="res-daily-title" style="margin-top:20px;">Top 5 clientes (por préstamos)</div>
+  <div style="margin:12px 0;display:flex;flex-wrap:wrap;gap:10px">
+    {"".join(f'<div style="background:linear-gradient(135deg,#0d9488,#14b8a6);color:#fff;border-radius:14px;padding:10px 14px;min-width:140px"><div style="font-size:11px;opacity:.9">#{i}</div><div style="font-weight:900;font-size:14px">{html.escape(tc["nombre"][:20])}</div><div style="font-size:13px;margin-top:4px">{fmt_money(tc["total"])}</div></div>' for i, tc in enumerate(top_clientes, 1))}
+    {"" if top_clientes else '<div style="opacity:.7;font-weight:800">Sin datos</div>'}
+  </div>
+
   <div style="margin-top:14px;">{nav_subfooter()}</div>
 </div>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script>
+(function(){{
+  const fmt = v => 'RD$ ' + Number(v||0).toLocaleString('es-DO',{{minimumFractionDigits:2}});
+  const dailyLabels = {json.dumps(daily_labels)};
+  const dailyBalances = {json.dumps(daily_balances)};
+  const ingLabels = {json.dumps(ing_labels)};
+  const ingVals = {json.dumps(ing_vals)};
+  const gasVals = {json.dumps(gas_vals)};
+  if(dailyLabels.length && document.getElementById('chartSaldoDiario')){{
+    new Chart(document.getElementById('chartSaldoDiario'), {{
+      type:'line',
+      data:{{labels:dailyLabels,datasets:[{{label:'Saldo',data:dailyBalances,borderColor:'#0d9488',backgroundColor:'rgba(13,148,136,.15)',fill:true,tension:0.3,pointRadius:2}}]}},
+      options:{{responsive:true,maintainAspectRatio:false,scales:{{y:{{beginAtZero:true,ticks:{{callback:v=>fmt(v)}}}}}}}}
+    }});
+  }}
+  if(ingLabels.length && document.getElementById('chartIngresosGastos')){{
+    new Chart(document.getElementById('chartIngresosGastos'), {{
+      type:'bar',
+      data:{{labels:ingLabels,datasets:[{{label:'Ingresos',data:ingVals,backgroundColor:'rgba(22,163,74,.5)'}},{{label:'Gastos',data:gasVals,backgroundColor:'rgba(239,68,68,.5)'}}]}},
+      options:{{responsive:true,maintainAspectRatio:false,scales:{{y:{{beginAtZero:true,ticks:{{callback:v=>fmt(v)}}}}}}}}
+    }});
+  }}
+}})();
+</script>
 """
     )
     return page(body)
@@ -9358,7 +9672,8 @@ def historial_depositos():
     oid = session.get("org_id")
     u = current_user()
     restrict = user_is_cobrador_limited(u)
-    # Filtro por rango de fechas (query params)
+    tipo_filter = request.args.get("tipo", "").strip()  # "", "ingreso", "egreso"
+
     def parse_date(raw):
         raw = (raw or "").strip()
         if not raw:
@@ -9371,37 +9686,89 @@ def historial_depositos():
     dt_from = parse_date(request.args.get("desde"))
     dt_to = parse_date(request.args.get("hasta"))
 
-    def in_range(d_at):
-        if d_at is None:
-            return False
-        d = d_at.date() if hasattr(d_at, "date") else None
-        if d is None:
-            return False
-        if dt_from and d < dt_from:
-            return False
-        if dt_to and d > dt_to:
-            return False
-        return True
+    if USE_DATABASE:
+        try:
+            from credimapa_pg import list_banco_all, session_scope
+            with session_scope() as sess:
+                raw_list = list_banco_all(
+                    sess, oid,
+                    d0=dt_from, d1=dt_to,
+                    user_id=u.get("id") if restrict else None,
+                )
+            movimientos_asc = []
+            for m in raw_list:
+                d = dict(m)
+                amt = float(d.get("amount") or 0)
+                d["tipo_visual"] = "ingreso" if amt >= 0 else "egreso"
+                d["created_at"] = d.get("created_at")
+                d["mov_date"] = d.get("mov_date") or d.get("date")
+                movimientos_asc.append(d)
+        except Exception:
+            movimientos_asc = []
+    else:
+        movimientos_asc = []
+        for cr in store.cash_reports.values():
+            if cr.get("organization_id") != oid:
+                continue
+            if restrict and cr.get("user_id") != u.get("id"):
+                continue
+            d_at = cr.get("created_at") or cr.get("date")
+            if dt_from or dt_to:
+                d_val = d_at.date() if hasattr(d_at, "date") else (d_at if isinstance(d_at, date) else None)
+                if d_val is None:
+                    continue
+                if dt_from and d_val < dt_from:
+                    continue
+                if dt_to and d_val > dt_to:
+                    continue
+            amt = float(cr.get("amount") or 0)
+            movimientos_asc.append({
+                "id": cr.get("id"),
+                "amount": amt,
+                "movement_type": cr.get("movement_type") or "movimiento",
+                "note": cr.get("note"),
+                "created_at": d_at,
+                "mov_date": cr.get("date") or (d_at.date() if hasattr(d_at, "date") else None),
+                "tipo_visual": "ingreso" if amt >= 0 else "egreso",
+            })
+        movimientos_asc.sort(key=lambda x: (x.get("created_at") or datetime.min, x.get("id") or 0))
 
-    deposit_list = [
-        d
-        for d in store.deposit_history
-        if d.get("organization_id") == oid and (not restrict or d.get("user_id") == u.get("id"))
-    ]
-    if dt_from or dt_to:
-        deposit_list = [d for d in deposit_list if in_range(d.get("at"))]
-    deposit_list = list(reversed(deposit_list[-200:]))  # últimos 200 (vista)
+    # Running balance (ASC order)
+    saldo = 0.0
+    for m in movimientos_asc:
+        saldo += float(m.get("amount") or 0)
+        m["saldo"] = round(saldo, 2)
 
-    total_depositado = round(
-        sum(float(d.get("amount") or 0) for d in deposit_list),
-        2,
-    )
-    n_depositos = len(deposit_list)
+    # Reverse for display (newest first)
+    movimientos = list(reversed(movimientos_asc))
+
+    # Apply tipo filter
+    if tipo_filter == "ingreso":
+        movimientos = [m for m in movimientos if m.get("tipo_visual") == "ingreso"]
+    elif tipo_filter == "egreso":
+        movimientos = [m for m in movimientos if m.get("tipo_visual") == "egreso"]
 
     def fmt_dt(dt):
         if not dt:
             return "—"
+        if hasattr(dt, "date"):
+            dt = dt
         return format_dt_rd(dt) if isinstance(dt, datetime) else str(dt)
+
+    def tipo_label(mt):
+        labels = {
+            "deposito_banco": "Depósito banco",
+            "pago_prestamo": "Pago préstamo",
+            "descuento_inicial": "Descuento inicial",
+            "prestamo_entregado": "Préstamo entregado",
+            "reverso_pago_prestamo": "Reverso pago",
+            "reverso_adelanto": "Reverso adelanto",
+            "entrega_cobrador": "Entrega cobrador",
+            "devolucion_capital": "Devolución capital",
+            "gasto": "Gasto",
+            "gasto_ruta": "Gasto ruta",
+        }
+        return labels.get(mt, (mt or "").replace("_", " ").title())
 
     style_block = """
 <style>
@@ -9448,6 +9815,10 @@ def historial_depositos():
   }
   body.theme-dark .dep-input{background: rgba(2,6,23,.55);color:#e5e7eb}
   .dep-btn{display:inline-flex;align-items:center;gap:8px}
+  .dep-tipo-btn{padding:8px 12px;border-radius:10px;font-weight:800;font-size:12px;text-decoration:none;border:1px solid rgba(148,163,184,.3)}
+  .dep-tipo-btn.active{background:rgba(59,130,246,.2);border-color:rgba(59,130,246,.5);color:#1d4ed8}
+  .dep-tipo-btn:not(.active){background:rgba(248,250,252,.8);color:#475569}
+  body.theme-dark .dep-tipo-btn:not(.active){background:rgba(2,6,23,.5);color:#94a3b8}
 
   .dep-table{width:100%;border-collapse:separate;border-spacing:0;font-size:13px}
   .dep-table th{
@@ -9462,6 +9833,7 @@ def historial_depositos():
     padding:12px 10px;border-bottom:1px solid rgba(148,163,184,.16);
     vertical-align: middle;
   }
+  .dep-table td.num{text-align:right}
   .dep-row{transition: transform .12s ease, background .12s ease}
   .dep-row:hover{background: rgba(236,253,245,.5); transform: translateY(-1px)}
   body.theme-dark .dep-row:hover{background: rgba(16,185,129,.10)}
@@ -9469,6 +9841,8 @@ def historial_depositos():
   .dep-amt{font-weight:1000; font-size:15px; white-space:nowrap}
   .dep-amt.pos{color:#047857}
   .dep-amt.neg{color:#dc2626}
+  .dep-saldo{font-weight:900;font-size:13px;color:#0f172a}
+  body.theme-dark .dep-saldo{color:#e5e7eb}
 
   .dep-empty{
     padding:18px; border-radius:16px;
@@ -9484,74 +9858,87 @@ def historial_depositos():
 </style>
 """
 
+    saldo_final = round(movimientos_asc[-1]["saldo"], 2) if movimientos_asc else 0.0
+    n_movs = len(movimientos)
+
+    def _tipo_url(t):
+        params = {"desde": dt_from.isoformat() if dt_from else "", "hasta": dt_to.isoformat() if dt_to else ""}
+        if t:
+            params["tipo"] = t
+        return url_for("historial_depositos", **{k: v for k, v in params.items() if v})
+
+    tipo_links = (
+        f"<a class='dep-tipo-btn{" active" if not tipo_filter else ""}' href='{_tipo_url("")}'>Todos</a>"
+        + f"<a class='dep-tipo-btn{" active" if tipo_filter == "ingreso" else ""}' href='{_tipo_url("ingreso")}'>💰 Solo ingresos</a>"
+        + f"<a class='dep-tipo-btn{" active" if tipo_filter == "egreso" else ""}' href='{_tipo_url("egreso")}'>💸 Solo egresos</a>"
+    )
+
     rows = ""
-    for d in deposit_list:
-        amt = float(d.get("amount") or 0)
-        cls = "pos" if amt >= 0 else "neg"
+    for m in movimientos:
+        amt = float(m.get("amount") or 0)
+        tv = m.get("tipo_visual") or ("ingreso" if amt >= 0 else "egreso")
+        cls = "pos" if tv == "ingreso" else "neg"
+        icon = "💰" if tv == "ingreso" else "💸"
+        amt_str = f"+{fmt_money(amt)}" if tv == "ingreso" else fmt_money(amt)
         rows += (
             "<tr class='dep-row'>"
-            f"<td>{fmt_dt(d.get('at'))}</td>"
-            f"<td class='dep-amt {cls}'>{fmt_money(amt)}</td>"
-            f"<td>{html.escape(str(d.get('note') or '—'))}</td>"
+            f"<td>{fmt_dt(m.get('mov_date') or m.get('created_at'))}</td>"
+            f"<td>{icon} {html.escape(tipo_label(m.get('movement_type')))}</td>"
+            f"<td>{html.escape(str(m.get('note') or '—'))}</td>"
+            f"<td class='dep-amt {cls} num'>{amt_str}</td>"
+            f"<td class='dep-saldo num'>{fmt_money(m.get('saldo') or 0)}</td>"
             "</tr>"
         )
 
-    if not rows:
-        rows_html = "<tr><td colspan='3'><div class='dep-empty'>💰 No hay depósitos registrados</div></td></tr>"
-    else:
-        rows_html = rows
+    rows_html = rows if rows else "<tr><td colspan='5'><div class='dep-empty'>No hay movimientos en el rango</div></td></tr>"
 
     body = (
         style_block
         + "<div class='dep-wrap'>"
         + "<div class='dep-head'>"
         + "<div>"
-        + "<h2 class='dep-title'>🏦 Historial de depósitos</h2>"
-        + "<div class='dep-sub'>Gestión de dinero, filtros por fecha y resumen instantáneo.</div>"
+        + "<h2 class='dep-title'>🏦 Historial de movimientos</h2>"
+        + "<div class='dep-sub'>Libro mayor: todos los movimientos del banco con saldo automático.</div>"
         + "</div>"
         + "<div class='dep-filter no-print'>"
         + "<form method='get' style='display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;justify-content:flex-end'>"
-        + "<div>"
-        + "<label>Desde</label>"
-        + f"<input class='dep-input' type='date' name='desde' value='{(dt_from.isoformat() if dt_from else '')}'>"
-        + "</div>"
-        + "<div>"
-        + "<label>Hasta</label>"
-        + f"<input class='dep-input' type='date' name='hasta' value='{(dt_to.isoformat() if dt_to else '')}'>"
-        + "</div>"
-        + "<button class='btn btn-primary dep-btn' type='submit'>"
-        + "<span class='btn-ic' aria-hidden='true'>"
-        + "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' width='18' height='18' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M21 10c0 7-9 14-9 14S3 17 3 10a9 9 0 0 1 18 0Z'/><circle cx='12' cy='10' r='3'/></svg>"
-        + "</span>Filtrar</button>"
+        + "<input type='hidden' name='tipo' value='" + html.escape(tipo_filter) + "'>"
+        + "<div><label>Desde</label>"
+        + f"<input class='dep-input' type='date' name='desde' value='{(dt_from.isoformat() if dt_from else '')}'></div>"
+        + "<div><label>Hasta</label>"
+        + f"<input class='dep-input' type='date' name='hasta' value='{(dt_to.isoformat() if dt_to else '')}'></div>"
+        + "<button class='btn btn-primary dep-btn' type='submit'>Filtrar</button>"
         + "</form>"
         + "</div>"
         + "</div>"
+
+        + "<div style='display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px' data-anim='1'>" + tipo_links + "</div>"
 
         + "<div class='dep-grid'>"
         + "<div class='dep-card' data-anim='1'>"
         + "<div style='display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap'>"
         + "<div style='display:flex;gap:10px;align-items:center'>"
         + "<div style='width:34px;height:34px;border-radius:14px;background:rgba(16,185,129,.12);border:1px solid rgba(16,185,129,.30);display:flex;align-items:center;justify-content:center;color:#047857'>💰</div>"
-        + "<div><div style='font-weight:1000;font-size:14px'>Resumen</div><div style='opacity:.85;font-weight:800;font-size:12px'>Últimos depósitos (memoria)</div></div>"
+        + "<div><div style='font-weight:1000;font-size:14px'>Resumen</div><div style='opacity:.85;font-weight:800;font-size:12px'>Movimientos y saldo</div></div>"
         + "</div>"
         + "<div style='display:flex;gap:10px;flex-wrap:wrap'>"
         + "<div class='dep-mini'>"
-        + "<div class='dep-mini-k'>Total depositado</div>"
-        + f"<div class='dep-mini-v'>{fmt_money(total_depositado)}</div>"
-        + "<div class='dep-mini-small'>Monto neto en el rango</div>"
+        + "<div class='dep-mini-k'>Saldo final</div>"
+        + f"<div class='dep-mini-v'>{fmt_money(saldo_final)}</div>"
+        + "<div class='dep-mini-small'>Después del rango</div>"
         + "</div>"
         + "<div class='dep-mini'>"
-        + "<div class='dep-mini-k'>Cantidad</div>"
-        + f"<div class='dep-mini-v'>{n_depositos}</div>"
-        + "<div class='dep-mini-small'>Depósitos encontrados</div>"
+        + "<div class='dep-mini-k'>Movimientos</div>"
+        + f"<div class='dep-mini-v'>{n_movs}</div>"
+        + "<div class='dep-mini-small'>En la vista</div>"
         + "</div>"
         + "</div>"
         + "</div>"
         + "<div style='height:10px'></div>"
         + "<div class='table-scroll'>"
         + "<table class='dep-table'>"
-        + "<thead><tr><th style='width:42%'>Fecha</th><th style='width:22%'>Monto</th><th>Nota</th></tr></thead>"
-        + "<tbody>" + (rows_html if rows_html else "") + "</tbody>"
+        + "<thead><tr><th>Fecha</th><th>Tipo</th><th>Nota</th><th class='num'>Monto</th><th class='num'>Saldo</th></tr></thead>"
+        + "<tbody>" + rows_html + "</tbody>"
         + "</table>"
         + "</div>"
         + "</div>"
@@ -9559,15 +9946,11 @@ def historial_depositos():
         + "<div class='dep-card' data-anim='1'>"
         + "<div style='font-weight:1000;margin-bottom:8px'>Accesos</div>"
         + "<div style='display:flex;gap:10px;flex-wrap:wrap'>"
-        + f"<a class='btn btn-secondary btn-action' href='{url_for('dashboard')}'><span class='btn-ic' aria-hidden='true'>"
-        + "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' width='18' height='18' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M3 12h18'/><path d='M5 6h14'/><path d='M5 18h14'/></svg>"
-        + "</span>Dashboard</a>"
-        + f"<a class='btn btn-primary btn-action' href='{url_for('bank_home')}'><span class='btn-ic' aria-hidden='true'>"
-        + "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' width='18' height='18' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M3 10h18'/><path d='M5 10v10'/><path d='M9 10v10'/><path d='M15 10v10'/><path d='M19 10v10'/><path d='M4 20h16'/><path d='M21 10 12 3 3 10'/></svg>"
-        + "</span>Banco</a>"
+        + f"<a class='btn btn-secondary btn-action' href='{url_for('dashboard')}'>Dashboard</a>"
+        + f"<a class='btn btn-primary btn-action' href='{url_for('bank_home')}'>Banco</a>"
         + "</div>"
         + "<div style='margin-top:12px;opacity:.88;font-weight:800;font-size:13px'>Sugerencia</div>"
-        + "<div style='margin-top:8px;opacity:.85;font-weight:700;font-size:12px;line-height:1.35'>Usa el filtro por fecha para imprimir o validar el cierre de caja del periodo.</div>"
+        + "<div style='margin-top:8px;opacity:.85;font-weight:700;font-size:12px;line-height:1.35'>Usa el filtro por fecha y tipo (ingresos/egresos) para analizar el flujo de caja.</div>"
         + "</div>"
         + "</div>"
 
